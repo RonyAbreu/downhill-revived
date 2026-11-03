@@ -81,7 +81,7 @@ void host_putenv_s(const char *name, const char *value)
 }
 
 /* ---- memory protection and access faults ----
-   Guest RAM is one plain allocation here (guest_memory_switch.c): no page protection, so the
+   Guest memory is heap mapped into the stack region (guest_memory_switch.c): no page protection, so the
    deferred store-image reads that need it are off (host_fault_guard refuses, graphics.c reads at
    once). */
 int host_mem_protect(uint32_t at, uint32_t size, int protection)

@@ -27,7 +27,7 @@ extern uintptr_t guest_base;
 #endif
 
 #ifdef __SWITCH__
-/* The Switch has one flat guest block and no aliased RAM views (host64/guest_memory_switch.c):
+/* The Switch has no aliased RAM views, only canonical RAM is mapped (host64/guest_memory_switch.c):
    a RAM mirror address folds onto canonical RAM here, with memory_access.h's rules (the full
    views at 0x28000000 and 0x38000000; the low views from 4 MiB into 0x00000000, 0x20000000 and
    0x30000000). */
