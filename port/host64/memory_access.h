@@ -46,8 +46,8 @@ host64_memory_address_full(uint8_t *base, uint64_t address, uint64_t size) {
        Bounds checks remain in wasm2c, against the ORIGINAL guest address. */
     if (host64_alias_crossing(address,size)) {
 #ifdef __SWITCH__
-        /* No OS views there (guest_memory_switch.c): this span reaches past the window's edge
-           into unmapped address space and faults. Counted first, so a crash report's run shows it. */
+        /* No OS views there (guest_memory_switch.c): this span reaches past the window's edge,
+           where it faults or reads zeros. Counted, so a run shows whether it ever happens. */
         extern unsigned long long host64_switch_alias_crossings;
         host64_switch_alias_crossings++;
 #endif
