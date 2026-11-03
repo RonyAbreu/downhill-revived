@@ -350,8 +350,10 @@ static void host_start(void)
     SDL_AudioSpec spec;
     SDL_AudioStream *stream;
     const char *stretch = getenv("DHD_SND_STRETCH");
+#ifndef __SWITCH__  /* there headless only stands for no renderer yet (switch_main.c, NX1): sound plays */
     if (getenv("DHD_HEADLESS"))
         return;
+#endif
     out.target = (unsigned)host_env_ms("DHD_SND_LATENCY_MS", 70, 20, 400) * (SND_RATE / 1000);
     out.stretch = !(stretch && *stretch == '0');
     out.trace = getenv("DHD_SND_HOST_TRACE") != NULL;
