@@ -17,7 +17,7 @@ enum { REJOIN_ATTEMPTS = 5 };
 /* Online play is not offered on phones yet (finding 143): their speed and the touch controls come
    first. Android builds refuse every connection here, whatever asks (the menu, DHD_NET_*, a
    dhd.ini server), and the core hides ONLINE (host_service_net_offered). */
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__SWITCH__)  /* the Switch: no network client yet (finding 144) */
 #define NET_OFFERED 0
 #else
 #define NET_OFFERED 1

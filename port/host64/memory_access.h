@@ -45,6 +45,12 @@ host64_memory_address_full(uint8_t *base, uint64_t address, uint64_t size) {
        spans retain the original full barrier; never fold only their first byte.
        Bounds checks remain in wasm2c, against the ORIGINAL guest address. */
     if (host64_alias_crossing(address,size)) {
+#ifdef __SWITCH__
+        /* No OS views there (guest_memory_switch.c): this span reads the flat block's own bytes
+           beyond the window's edge. Counted, so a run shows whether it ever happens. */
+        extern unsigned long long host64_switch_alias_crossings;
+        host64_switch_alias_crossings++;
+#endif
         uint8_t *p = base + address;
 #if defined(__clang__) || defined(__GNUC__)
         __asm__ volatile("" : "+r"(p) : : "memory");

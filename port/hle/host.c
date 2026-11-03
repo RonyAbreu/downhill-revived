@@ -37,15 +37,17 @@
 #include <mach/mach.h>  /* thread_info: the bench's thread times */
 #endif
 #include <errno.h>
-#include <poll.h>
 #include <pthread.h>
-#include <setjmp.h>
 #include <signal.h>
-#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/ucontext.h>
 #include <unistd.h>
+#ifndef __SWITCH__  /* Horizon has no signals, pipes or ucontext (host_switch.c, finding 144) */
+#include <poll.h>
+#include <setjmp.h>
+#include <sys/ioctl.h>
+#include <sys/ucontext.h>
+#endif
 #endif
 
 #include "ps2asm.h"
@@ -75,7 +77,13 @@
 #define CTX_IP(c) ((uintptr_t)(c)->uc_mcontext.gregs[REG_RIP])
 #define CTX_SP(c) ((uintptr_t)(c)->uc_mcontext.gregs[REG_RSP])
 #endif
+#ifdef __SWITCH__
+/* The registers libnx's exception handler hands host_switch.c (ThreadExceptionDump), in the
+   aarch64 ucontext's shape, so the macros above read it. */
+typedef struct { struct { unsigned long long regs[31], sp, pc; } uc_mcontext; } CONTEXT;
+#else
 typedef ucontext_t CONTEXT;
+#endif
 #endif
 
 /* Where the game thread is: its registers, the code addresses on its stack (no frame
@@ -102,6 +110,13 @@ static int host_readable(const void *p, size_t n)
         if (!ReadProcessMemory(GetCurrentProcess(), (const char *)p + at, sink, part, &got) || got != part) return 0;
     }
     return 1;
+}
+#elif defined(__SWITCH__)
+/* Whether [p, p + n) can be read: the kernel's own map (svcQueryMemory, host_switch.c). */
+static int host_readable(const void *p, size_t n)
+{
+    int switch_readable(const void *p, size_t n);
+    return switch_readable(p, n);
 }
 #else
 /* Whether [p, p + n) can be read (peek, safe_vprint, snapshot): a fault guard
@@ -358,6 +373,22 @@ static LONG WINAPI crashed(EXCEPTION_POINTERS *e)
     log_settle();
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#elif defined(__SWITCH__)
+/* A CPU exception (libnx's __libnx_exception_handler, host_switch.c) ends the program with the
+   same words the other crash reports have. */
+void host_switch_crashed(const char *name, uintptr_t address, const void *ctx)
+{
+    const CONTEXT *c = (const CONTEXT *)ctx;
+    extern char __start__[];  /* where the NRO is loaded: offsets for aarch64-none-elf-addr2line -e dhd.elf */
+    fprintf(stderr, "crash: %s at %016llX in thread ?\n", name, (unsigned long long)address);
+    fprintf(stderr, "  pc dhd.elf+0x%llx lr dhd.elf+0x%llx\n",
+            (unsigned long long)(CTX_IP(c) - (uintptr_t)__start__),
+            (unsigned long long)(CTX_X(c)[30] - (uintptr_t)__start__));
+    fflush(stderr);
+    report(c);  /* the handler runs on its own stack: no unwinding from here */
+    peek();
+    fflush(stderr);
+}
 #else
 /* Fatal signals end the process with the same words the Windows crash report has. */
 static void crashed(int sig, siginfo_t *info, void *ctx)
@@ -486,6 +517,14 @@ static int SDLCALL watchdog(void *seconds)
     atomic_store(&dump_pending, 1);
     return 0;
 }
+#elif defined(__SWITCH__)
+/* No signals to stop the game thread with: DHD_DUMP only says so. */
+static int SDLCALL watchdog(void *seconds)
+{
+    (void)seconds;
+    fprintf(stderr, "dump: DHD_DUMP needs signals; not on the Switch\n");
+    return 0;
+}
 #else
 /* The game thread reports itself in a SIGUSR1 handler (no cross-thread
    register read exists here); a watchdog thread only rings the bell. */
@@ -592,6 +631,8 @@ void host_thread_name(const char *name)
     if (MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, 64)) SetThreadDescription(GetCurrentThread(), wide);
 #elif defined(__APPLE__)
     pthread_setname_np(name);  /* the calling thread's own */
+#elif defined(__SWITCH__)
+    /* libnx's threads have no names */
 #else
     /* Linux and Android: the main thread's name is the process's own (ps, top, pgrep, a desktop's
        system monitor), so that thread keeps "dhd" (a crash report then says thread dhd) */
@@ -670,6 +711,8 @@ double host_current_thread_cpu(void)
     if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return 0;
     return (((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
             ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime)) * 1e-7;
+#elif defined(__SWITCH__)
+    return 0;  /* newlib here has no CPU-time clocks */
 #else
     struct timespec t;
     if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t)) return 0;
@@ -684,6 +727,8 @@ double host_process_cpu(void)
     if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
     return (((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
             ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime)) * 1e-7;
+#elif defined(__SWITCH__)
+    return 0;  /* newlib here has no CPU-time clocks */
 #else
     struct timespec t;
     if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t)) return 0;
@@ -702,6 +747,11 @@ void host_init(void)
                     DUPLICATE_SAME_ACCESS);  /* the watches, DHD_DUMP and the freeze log */
     if (getenv("DHD_WATCH") || state_trace_watch_spec())
         AddVectoredExceptionHandler(1, watch_hit);
+#elif defined(__SWITCH__)
+    const char *dump = getenv("DHD_DUMP");  /* crashes: host_switch.c's exception handler */
+    game_thread = pthread_self();
+    game_thread_set = 1;
+    host_thread_name("game");
 #else
     struct sigaction sa, dump_sa;
     const char *dump = getenv("DHD_DUMP");
@@ -735,7 +785,27 @@ void host_init(void)
     SDL_DetachThread(SDL_CreateThread(freeze_watch, "freeze watch", NULL));
 }
 
-#ifndef _WIN32
+#ifdef __SWITCH__
+/* The log on the Switch: no pipes, so stdout and stderr write straight into dhd.log on the SD
+   card, a line at a time. */
+void host_log_drain(void)
+{
+    fflush(stdout);
+    fflush(stderr);
+}
+
+static void log_start(const char *path)
+{
+    FILE *f = fopen(path, "w");  /* a new log; then both streams append to it */
+    if (!f) return;
+    fclose(f);
+    if (!freopen(path, "a", stderr)) return;
+    freopen(path, "a", stdout);
+    setvbuf(stderr, NULL, _IOLBF, 0);
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    atexit(host_log_drain);
+}
+#elif !defined(_WIN32)
 /* The log on Linux, macOS and Android: stdout and stderr write into a pipe and a thread copies its
    lines to dhd.log (and on Android to logcat, tag DownhillRevived), so a slow write to the disk
    holds up only that thread, as on Windows. host_log_drain: the lines still in the pipe reach the
@@ -862,6 +932,8 @@ static void console_open(const char *path)
     SetStdHandle(STD_OUTPUT_HANDLE, (HANDLE)_get_osfhandle(_fileno(stdout)));
     if (opened) log_start();
 }
+#elif defined(__SWITCH__)
+static void console_open(const char *path) { log_start(path); }
 #else
 /* A terminal, or the tools' pipe or file, keeps the log; else dhd.log at path. */
 static void console_open(const char *path)

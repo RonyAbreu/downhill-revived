@@ -26,8 +26,24 @@ extern uintptr_t guest_base;
 #define GUEST_BASE ((uintptr_t)0)
 #endif
 
+#ifdef __SWITCH__
+/* The Switch has one flat guest block and no aliased RAM views (host64/guest_memory_switch.c):
+   a RAM mirror address folds onto canonical RAM here, with memory_access.h's rules (the full
+   views at 0x28000000 and 0x38000000; the low views from 4 MiB into 0x00000000, 0x20000000 and
+   0x30000000). */
+static inline uint32_t guest_fold(uint32_t a)
+{
+    if ((a & ~0x11ffffffu) == 0x28000000u) a &= ~0x30000000u;
+    if ((a & 0x1ffffffu) >= 0x400000u &&
+        (a < 0x02000000u || (a >= 0x20400000u && a < 0x22000000u) || (a >= 0x30400000u && a < 0x32000000u)))
+        a = 0x08000000u + (a & 0x1ffffffu);
+    return a;
+}
+#define GUEST(addr) ((void *)(GUEST_BASE + (uintptr_t)guest_fold((uint32_t)(addr))))
+#else
 /* Host pointer of a 32-bit guest address. */
 #define GUEST(addr) ((void *)(GUEST_BASE + (uintptr_t)(uint32_t)(addr)))
+#endif
 
 /* Guest address of a host pointer (or of a host address held in an integer). The result is
    32 bits: on a 64-bit host it is only meaningful for pointers that point into guest memory. */

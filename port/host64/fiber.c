@@ -8,7 +8,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#else
+#elif !defined(__SWITCH__)
 #define _GNU_SOURCE
 #include <sys/mman.h>
 #include <unistd.h>
@@ -48,6 +48,12 @@ static char *stack_map(size_t size) {
     return p;
 }
 static void stack_unmap(char *p,size_t size) { (void)size; VirtualFree(p,0,MEM_RELEASE); }
+#elif defined(__SWITCH__)
+/* Horizon reprotects only heap memory and a homebrew cannot place mappings: a plain allocation,
+   its guard page left accessible (the guard only ever reported an overflow; finding 144). */
+static size_t os_page(void) { return HOST64_PAGE; }
+static char *stack_map(size_t size) { return aligned_alloc(HOST64_PAGE,size); }
+static void stack_unmap(char *p,size_t size) { (void)size; free(p); }
 #else
 static size_t os_page(void) { return (size_t)sysconf(_SC_PAGESIZE); }
 static char *stack_map(size_t size) {

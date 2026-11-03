@@ -72,6 +72,7 @@ class Target:
         self.fiber = fiber  # the fiber switch's adapter, port/host64/fiber_<fiber>.c (the CPU and its ABI)
         self.flags, self.wabt, self.simde = list(flags), Path(os.environ.get('WABT_DIR') or wabt), simde
         self.windows, self.android, self.mac = key == 'win-x64', key == 'android-arm64', key == 'macos-arm64'
+        self.switch = key == 'switch-arm64'  # Nintendo Switch homebrew (finding 144): devkitA64's GCC, libnx
         self.posix = not self.windows
 
 
@@ -90,6 +91,10 @@ TARGETS = {t.key: t for t in (
     Target('android-arm64', 'aarch64-linux-android', 'build/android', 'libmain.so', 'arm64', jobs=2, outputs=8,
            flags=['--target=aarch64-linux-android%d' % ANDROID_API, '-march=armv8.2-a', '-mtune=cortex-a78',
                   '-fPIC', '-fomit-frame-pointer']),
+    # Nintendo Switch (finding 144): the Tegra X1's Cortex-A57s; devkitPro's flags for libnx
+    # (switch_rules: -mtp=soft, -fPIE). No Rust: render_stubs.c and rust_shims.c stand in.
+    Target('switch-arm64', None, 'build/host64-switch', 'dhd.nro', 'arm64', jobs=8, outputs=8,
+           flags=['-march=armv8-a+crc+crypto', '-mtune=cortex-a57', '-mtp=soft', '-fPIE', '-D__SWITCH__']),
 )}
 # Off Windows: the POSIX host instead of the Win32 one
 POSIX_UNITS = {'port/host/host_win32.c': 'port/host/host_posix.c'}
@@ -99,15 +104,24 @@ ANDROID_UNITS = ['port/host/android_main.c', 'port/host/android_perf.c', 'port/h
 # Android: only SDL's entry leaves the library; everything else may be garbage-collected
 # (--gc-sections), as /opt:ref does for dhd64.exe.
 ANDROID_EXPORTS = '{\n  global: SDL_main;\n  local: *;\n};\n'
+# The Switch: its host in place of the POSIX one, its start, and C stand-ins for the Rust library
+SWITCH_HOST = {'port/host/host_win32.c': 'port/host/host_switch.c'}
+SWITCH_UNITS = ['port/host/switch_main.c', 'port/switch/render_stubs.c', 'port/switch/rust_shims.c']
+DEVKITPRO = Path(os.environ.get('DEVKITPRO') or '/opt/devkitpro')
 
 
 def host_units(t):
     if t.windows:
         return list(HOST_UNITS)
+    if t.switch:
+        return [SWITCH_HOST.get(u, u) for u in HOST_UNITS if u not in WINDOWS_ONLY] + SWITCH_UNITS
     return [POSIX_UNITS.get(u, u) for u in HOST_UNITS if u not in WINDOWS_ONLY] + (ANDROID_UNITS if t.android else [])
 
 
 def glue(t):
+    if t.switch:  # one flat guest block (guest_memory_switch.c holds guest_memory.c's part too)
+        return [SOURCE / n for n in ('guest_memory_switch.c', 'fiber.c', 'fiber_%s.c' % t.fiber, 'fp_mode.c',
+                                     'bridge.c', 'diagnostics.c', 'launcher.c')]
     return [SOURCE / n for n in ('guest_memory.c', 'guest_memory_%s.c' % ('win32' if t.windows else 'posix'),
                                  'fiber.c', 'fiber_%s.c' % t.fiber, 'fp_mode.c', 'bridge.c', 'diagnostics.c',
                                  'launcher.c')]
@@ -153,6 +167,8 @@ def fiber_test(t, a, cc, wabt, out, env):
 def rust_library(t, work):
     """The Rust library's report (rustgs.build): here, or for linux-x64 in WSL without cargo, from
     rustgs.py on the Windows side (WSL's interop, python.exe)."""
+    if t.switch:  # no Rust on Horizon: port/switch/render_stubs.c and rust_shims.c
+        return {'lib': None, 'native_static_libs': []}
     import rustgs  # cargo through rustgs only (its flags, version gate, checks and cache)
     if t.key != 'linux-x64' or shutil.which('cargo') or not shutil.which('python.exe'):
         try:
@@ -266,6 +282,9 @@ def main():
         cc, ar = tools / 'clang.exe', tools / 'llvm-ar.exe'
         if not cc.exists():
             p.error('no NDK clang at %s' % cc)
+    elif t.switch:
+        bin_ = DEVKITPRO / 'devkitA64/bin'
+        ndk, tools, cc, ar = None, None, bin_ / 'aarch64-none-elf-gcc', bin_ / 'aarch64-none-elf-ar'
     elif t.posix:
         ndk, tools, cc, ar = None, None, 'clang', 'ar'
     if a.fiber_test:
@@ -354,6 +373,15 @@ def main():
             common += ['/clang:' + m for m in prefix_maps]
             if a.debug:
                 common += ['/clang:-gline-tables-only', '/clang:-gcodeview']
+        elif t.switch:
+            # devkitA64's GCC: -frounding-math for clang's -ffp-model=strict (no FP-mode-changing
+            # optimisations; the FPCR is the EE's at times), gcc_compat.h for clang's builtins
+            common = [cc, *t.flags, '-c', '-O3', '-frounding-math', '-ffp-contract=off',
+                      '-ftrivial-auto-var-init=zero', '-fno-strict-aliasing', '-ffunction-sections',
+                      '-fdata-sections', '-fwrapv', '-w', '-include', ROOT/'port/switch/gcc_compat.h',
+                      *defines, *includes, '-isystem', DEVKITPRO/'libnx/include',
+                      '-isystem', DEVKITPRO/'portlibs/switch/include', *prefix_maps]
+            common += ['-g'] if a.debug else []
         else:
             # one section per function and datum, as the Windows build's /Gy: the link
             # garbage-collects what nothing references (/opt:ref there)
@@ -370,10 +398,13 @@ def main():
             extra = ['-I'+str(Path(sdl_include).resolve())] if rel.startswith('port/') else []  # threads, locks, timers
             if rel.endswith('vu0_interp.c'):
                 extra += ['-DPS2_VU_AOT']
-            if rel.endswith('gs/gpu_rust.c'):
-                extra += ['-I'+str(ROOT/'port/render/include')]  # dhd_render.h
-            if rel.endswith('host64/launcher.c') and t.android:
+            if rel.endswith('gs/gpu_rust.c') or (t.switch and (rel.startswith('port/switch/') or
+                                                                rel.endswith('host/switch_main.c'))):
+                extra += ['-I'+str(ROOT/'port/render/include')]  # dhd_render.h, dhd_settings.h
+            if rel.endswith('host64/launcher.c') and (t.android or t.switch):
                 extra += ['-Dmain=dhd_launcher_main']  # SDL_main (android_main.c) calls it
+            if t.switch and rel.endswith('wasm-rt-impl.c'):
+                extra += ['-isystem', str(ROOT/'port/switch/include')]  # its unused <sys/mman.h>
             if 'libmpeg2/' in rel:
                 extra += ['-I'+str(ROOT/'port/third_party/libmpeg2')]
             obj = objdir/(rel.replace('/', '_') + suffix)
@@ -454,6 +485,21 @@ def main():
             exe = lib_dir/t.exe
             run([tools/'llvm-strip.exe', '--strip-unneeded', '-o', exe, debug])
             run([tools/'llvm-strip.exe', '--strip-unneeded', '-o', lib_dir/'libSDL3.so', sdl_lib])
+        elif t.switch:
+            # devkitA64's link with libnx's specs, then the homebrew loader's .nro with its NACP
+            import re
+            elf = out/'dhd.elf'
+            rsp = work/'link.rsp'
+            rsp.write_text('\n'.join('"%s"' % str(x) for x in objects + [library, sdl_lib]))
+            run([cc, '-specs=' + str(DEVKITPRO/'libnx/switch.specs'), *t.flags[:4], '-Wl,--gc-sections',
+                 '-Wl,-Map,' + str(out/'dhd.map'), '@'+str(rsp), *sdl_libs,
+                 '-L' + str(DEVKITPRO/'portlibs/switch/lib'), '-L' + str(DEVKITPRO/'libnx/lib'),
+                 '-lnx', '-lm', '-o', elf], timeout=1800)
+            v = re.search(r'DHD_VERSION\s+"([^"]+)"', (ROOT/'port/include/version.h').read_text())
+            nacp = work/'dhd.nacp'
+            run([DEVKITPRO/'tools/bin/nacptool', '--create', 'Downhill Revived', 'Downhill Revived (Switch port)',
+                 v.group(1) if v else '0.0.0', nacp])
+            run([DEVKITPRO/'tools/bin/elf2nro', elf, exe, '--nacp=' + str(nacp)])
         elif t.mac:
             # ld64: -dead_strip as --gc-sections; no -rdynamic (exporting every symbol keeps the
             # module-side code of fps.c alive, which names guest data the host does not have); -S: no
@@ -471,7 +517,7 @@ def main():
         host_summary = 'reused host library' if a.host_library else f'{len(host_objects)} {t.key} host objects'
         print(f'PASS: {len(rows)} generated imports; {host_summary}; {exe} ({exe.stat().st_size / 1048576:.1f} MB)',
               flush=True)
-        if a.run and not t.android:
+        if a.run and not t.android and not t.switch:
             if a.fake:
                 (work/'fixture.txt').write_bytes(b'host64-proof')
             env.update(DHD_HEADLESS='1', DHD_SND_OFF='1')
