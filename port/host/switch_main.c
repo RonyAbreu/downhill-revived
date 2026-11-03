@@ -33,6 +33,29 @@ void switch_shutdown(void)
     }
 }
 
+/* Started from the album (applet mode) the program gets a few hundred MiB, and guest memory alone
+   is 2 GiB (guest_memory_switch.c): say so on the screen and end, instead of failing later. */
+static int applet_mode_refused(void)
+{
+    AppletType type = appletGetAppletType();
+    if (type == AppletType_Application || type == AppletType_SystemApplication) return 0;
+    consoleInit(NULL);
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    PadState pad;
+    padInitializeDefault(&pad);
+    printf("\n  Downhill Revived needs the memory of a game.\n\n"
+           "  Start it from a game instead of the album: hold R while\n"
+           "  starting any game, then pick dhd.nro in the Homebrew Menu.\n\n"
+           "  Press + to exit.\n");
+    while (appletMainLoop()) {
+        padUpdate(&pad);
+        if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
+        consoleUpdate(NULL);
+    }
+    consoleExit(NULL);
+    return 1;
+}
+
 static int file_exists(const char *path)
 {
     struct stat st;
@@ -52,9 +75,15 @@ int main(int argc, char **argv)
     char *slash = strrchr(dir, '/');
     if (slash) slash[1] = 0;
     mkdir(dir, 0777);
-
-    if (appletGetAppletType() != AppletType_Application && appletGetAppletType() != AppletType_SystemApplication)
-        fprintf(stderr, "switch: started from the album (applet mode): too little memory; hold R while starting a game\n");
+    int refused = applet_mode_refused();  /* on the screen: before stdout goes to dhd.log */
+    /* dhd.log before anything else prints, as android_main.c does: a failure this early is logged too */
+    void host_console_init(void);
+    host_console_init();
+    if (refused) {
+        fprintf(stderr, "switch: started from the album (applet mode): too little memory\n");
+        switch_shutdown();
+        return 1;
+    }
 
     /* The disc: dhd.ini's iso, else game.iso beside the .nro (DHD_ISO, as on the other targets). */
     char ini[1100], iso[1100];
