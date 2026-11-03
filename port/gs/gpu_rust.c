@@ -411,7 +411,8 @@ int gs_gpu_capture(Gs *g, uint32_t *pixels)
 
 _Static_assert(GS_WINDOW_WIN32 == DHDR_WINDOW_WIN32 && GS_WINDOW_XLIB == DHDR_WINDOW_XLIB &&
                GS_WINDOW_WAYLAND == DHDR_WINDOW_WAYLAND && GS_WINDOW_ANDROID == DHDR_WINDOW_ANDROID &&
-               GS_WINDOW_METAL_LAYER == DHDR_WINDOW_METAL_LAYER, "gpu.h's window kinds are dhd_render.h's");
+               GS_WINDOW_METAL_LAYER == DHDR_WINDOW_METAL_LAYER && GS_WINDOW_SWITCH == DHDR_WINDOW_SWITCH,
+               "gpu.h's window kinds are dhd_render.h's");
 
 /* A surface on the window (present.c's SDL window: its HWND, X11 or Wayland window, ANativeWindow
    or CAMetalLayer): frame latency 1, Immediate unless DHD_TEARING=0, else Mailbox, else Fifo; Fifo

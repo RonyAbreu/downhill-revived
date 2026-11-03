@@ -98,6 +98,8 @@ pub const DHDR_WINDOW_XLIB: u32 = 3;
 pub const DHDR_WINDOW_WAYLAND: u32 = 4;
 pub const DHDR_WINDOW_ANDROID: u32 = 5;
 pub const DHDR_WINDOW_METAL_LAYER: u32 = 6;
+/// The Switch's C renderer (port/switch/render_gl.c) only; this crate refuses it.
+pub const DHDR_WINDOW_SWITCH: u32 = 7;
 
 pub const DHDR_PRESENT_NO_TEARING: u32 = 1;
 pub const DHDR_PRESENT_VSYNC: u32 = 2;

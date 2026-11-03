@@ -52,6 +52,10 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #define WINDOW_FLAGS SDL_WINDOW_METAL  /* the renderer draws into an SDL Metal view's layer */
 #define FIXED_SCREEN 0
 static SDL_MetalView metal_view;
+#elif defined(__SWITCH__)
+#define WINDOW_FLAGS SDL_WINDOW_OPENGL  /* the C renderer (port/switch/render_gl.c) draws with OpenGL */
+#define FIXED_SCREEN 1  /* the whole screen, docked or handheld */
+void switch_gl_attributes(void);  /* render_gl.c: the window's OpenGL configuration */
 #else
 #define WINDOW_FLAGS 0
 #define FIXED_SCREEN 0
@@ -72,6 +76,9 @@ static void window_target(void *unused)
 #elif defined(__ANDROID__)
     target.kind = GS_WINDOW_ANDROID;
     target.a = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+#elif defined(__SWITCH__)
+    target.kind = GS_WINDOW_SWITCH;
+    target.a = (uintptr_t)sdl_window;  /* render_gl.c makes its OpenGL context on it */
 #elif defined(__APPLE__)
     if (!metal_view) metal_view = SDL_Metal_CreateView(sdl_window);
     target.kind = GS_WINDOW_METAL_LAYER;
@@ -95,7 +102,7 @@ static void window_target(void *unused)
    make_window's hints; SDL_SetWindowIcon would give the title bar one 512-pixel picture scaled
    down) and the APK's. Elsewhere nothing else gives the window one (Linux) or it is the bundle's
    own picture (macOS): port/res/icon.png, embedded by build_host64.py. */
-#if defined(_WIN32) || defined(__ANDROID__)
+#if defined(_WIN32) || defined(__ANDROID__) || defined(__SWITCH__)  /* the Switch: the .nro's own icon */
 static void window_icon(void) {}
 #else
 #include "dhd_icon.inc"  /* dhd_icon_png: port/res/icon.png's bytes */
@@ -244,6 +251,9 @@ static void make_window(void *arg)
     if (start_minimised()) flags |= SDL_WINDOW_MINIMIZED;
     if (FIXED_SCREEN) flags = SDL_WINDOW_FULLSCREEN;
     flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY | WINDOW_FLAGS;
+#ifdef __SWITCH__
+    switch_gl_attributes();
+#endif
     sdl_window = SDL_CreateWindow("Downhill Revived", s->w, s->h, flags);  /* s->w x s->h: the client area */
     if (!sdl_window) {
         fprintf(stderr, "gs: SDL window (%s)\n", SDL_GetError());

@@ -128,15 +128,17 @@ DHDR_FN(dhdr_exact_stats)   void dhdr_exact_stats(const DhdrExact *x, DhdrExactS
 
 typedef struct DhdrSurface DhdrSurface;
 enum { DHDR_WINDOW_WIN32 = 1, DHDR_WINDOW_WEB_CANVAS = 2, DHDR_WINDOW_XLIB = 3, DHDR_WINDOW_WAYLAND = 4,
-       DHDR_WINDOW_ANDROID = 5, DHDR_WINDOW_METAL_LAYER = 6 };   /* 2: dhdr_web_surface only; each native build
-                                                                   takes its platform's: Windows 1, Linux 3 and 4,
-                                                                   Android 5, Apple 6 (others refused: NULL) */
+       DHDR_WINDOW_ANDROID = 5, DHDR_WINDOW_METAL_LAYER = 6,
+       DHDR_WINDOW_SWITCH = 7 };     /* 2: dhdr_web_surface only; each native build takes its platform's:
+                                        Windows 1, Linux 3 and 4, Android 5, Apple 6, the Switch's C
+                                        renderer 7 (port/switch/render_gl.c; others refused: NULL) */
 typedef struct DhdrWindow {
     uint32_t kind;                   /* DHDR_WINDOW_* */
     uint32_t reserved;               /* 0 */
     uint64_t a, b;                   /* WIN32: a = HWND, b = HINSTANCE; XLIB: a = Display *, b = Window;
                                         WAYLAND: a = wl_display *, b = wl_surface *; ANDROID: a =
-                                        ANativeWindow *; METAL_LAYER: a = CAMetalLayer * */
+                                        ANativeWindow *; METAL_LAYER: a = CAMetalLayer *;
+                                        SWITCH: a = SDL_Window * (OpenGL) */
 } DhdrWindow;
 enum { DHDR_PRESENT_NO_TEARING = 1, DHDR_PRESENT_VSYNC = 2 };   /* DHD_TEARING=0; VSYNC forces Fifo (DHD_INTERP) */
 enum { DHDR_SURFACE_COPY_SRC = 1 };

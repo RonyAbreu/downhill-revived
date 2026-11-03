@@ -12,4 +12,4 @@ VENV=build/port/venv-switch
 export DEVKITPRO=/opt/devkitpro
 exec "$VENV/bin/python" port/tools/build_host64.py --target switch-arm64 build/wasm/dhd_core.wasm \
   --sdl-lib "$SDL/lib/libSDL3.a" --sdl-include "$SDL/include" \
-  --sdl-libs "-lEGL -lglapi -ldrm_nouveau -lstdc++ -lpthread" "$@"
+  --sdl-libs "-lglad -lEGL -lglapi -ldrm_nouveau -lstdc++ -lpthread" "$@"

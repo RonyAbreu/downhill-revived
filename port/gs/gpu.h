@@ -15,7 +15,8 @@ const char *gs_gpu_backend_name(const Gs *g);
    handles (WIN32: a = HWND, b = HINSTANCE; XLIB: a = Display *, b = Window; WAYLAND: a = wl_display *,
    b = wl_surface *; ANDROID: a = ANativeWindow *; METAL_LAYER: a = CAMetalLayer *), and the
    function that tells its drawable size in pixels (0 x 0 while minimised; any thread). */
-enum { GS_WINDOW_WIN32 = 1, GS_WINDOW_XLIB = 3, GS_WINDOW_WAYLAND = 4, GS_WINDOW_ANDROID = 5, GS_WINDOW_METAL_LAYER = 6 };
+enum { GS_WINDOW_WIN32 = 1, GS_WINDOW_XLIB = 3, GS_WINDOW_WAYLAND = 4, GS_WINDOW_ANDROID = 5, GS_WINDOW_METAL_LAYER = 6,
+       GS_WINDOW_SWITCH = 7 };
 typedef struct GsWindow {
     unsigned kind;
     uint64_t a, b;

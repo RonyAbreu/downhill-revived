@@ -4,9 +4,9 @@
    The disc image is dhd.ini's `iso`, else game.iso beside the .nro. Then the shared start,
    dhd_launcher_main (port/host64/launcher.c, built with main renamed).
 
-   Milestone NX1 has no renderer (port/switch/render_stubs.c): the game runs headless unless
-   DHD_HEADLESS is set to 0 in dhd.ini. With nxlink (`nxlink -s dhd.nro`), stdout and stderr also
-   go to the PC. */
+   The renderer is port/switch/render_gl.c (OpenGL; NX2 step 1 shows the movies only); dhd.ini's
+   DHD_HEADLESS = 1 runs without a window, as the tools do. With nxlink (`nxlink -s dhd.nro`),
+   stdout and stderr also go to the PC. */
 #include <switch.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,9 +95,9 @@ int main(int argc, char **argv)
                              "as game.iso, or name it in dhd.ini: iso = ...)\n", iso);
     }
     char headless[8];
-    if (!getenv("DHD_HEADLESS") && !(dhd_settings_read(ini, "DHD_HEADLESS", headless, sizeof headless) &&
-                                     !strcmp(headless, "0")))
-        setenv("DHD_HEADLESS", "1", 1);  /* NX1: no renderer yet */
+    if (!getenv("DHD_HEADLESS") && dhd_settings_read(ini, "DHD_HEADLESS", headless, sizeof headless) &&
+        strcmp(headless, "0"))
+        setenv("DHD_HEADLESS", "1", 1);
     setenv("DHD_DEFER_READS", "0", 0);    /* no page protection (host_switch.c) */
     /* SETTINGS without the window rows: one screen, as on a phone */
     setenv("DHD_PC_SETTINGS_ROWS", "DHD_SCALE,DHD_ASPECT,DHD_PRESENT_FILTER,DHD_WIDESCREEN,DHD_SKIP_MOVIES,DHD_VIBRATION,"
