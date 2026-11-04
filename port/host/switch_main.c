@@ -4,7 +4,8 @@
    The disc image is dhd.ini's `iso`, else game.iso beside the .nro. Then the shared start,
    dhd_launcher_main (port/host64/launcher.c, built with main renamed).
 
-   The renderer is port/switch/render_gl.c (OpenGL; NX2 step 1 shows the movies only); dhd.ini's
+   The renderer is OpenGL (port/switch/render_gl.c, render_native.c; NX2 phase 2 step 1: flat
+   untextured GS geometry with DHD_RENDER=native, else the movies only); dhd.ini's
    DHD_HEADLESS = 1 runs without a window, as the tools do. With nxlink (`nxlink -s dhd.nro`),
    stdout and stderr also go to the PC. */
 #include <switch.h>

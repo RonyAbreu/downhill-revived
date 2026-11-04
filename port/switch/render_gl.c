@@ -21,6 +21,7 @@
 #include <string.h>
 #include "dhd_render.h"
 #include "dhd_render_ext.h"
+#include "render_gl_ext.h"
 
 struct DhdrSurface {
     SDL_Window *window;
@@ -36,6 +37,10 @@ struct DhdrSurface {
 struct DhdrExact { int unused; };
 
 static char adapter[160] = "";
+/* render_native.c's own GL calls (building surfaces, drawing a picture) run before any
+   dhdr_native_present call: this single-window game has one surface, so that is the one to
+   make current (render_gl_ext.h). */
+static DhdrSurface *g_active_surface;
 
 /* present.c, after SDL's video starts and before the window: the window's EGL configuration. */
 void switch_gl_attributes(void)
@@ -195,12 +200,17 @@ DhdrSurface *dhdr_surface_create(const DhdrWindow *w, uint32_t present_flags)
     if (!s) return NULL;
     s->window = (SDL_Window *)(uintptr_t)w->a;
     s->interval = present_flags & (DHDR_PRESENT_NO_TEARING | DHDR_PRESENT_VSYNC) ? 1 : 0;
+    g_active_surface = s;
     return s;
 }
+
+int dhdr_gl_make_current(DhdrSurface *s) { return current(s); }
+DhdrSurface *dhdr_gl_active_surface(void) { return g_active_surface; }
 
 void dhdr_surface_destroy(DhdrSurface *s)
 {
     if (!s) return;
+    if (g_active_surface == s) g_active_surface = NULL;
     if (s->gl && current(s)) {
         glDeleteTextures(1, &s->texture);
         glDeleteVertexArrays(1, &s->vao);
