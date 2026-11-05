@@ -54,14 +54,30 @@ typedef struct NativeSurface {
     GLuint depth_attached;     /* the depth texture on this colour surface's framebuffer, or 0 */
 } NativeSurface;
 
-/* One draw pipeline and its uniforms (native.wgsl's Native block, which GL has as loose
-   uniforms): the two differ only in the texture they sample, so they share every location name.
-   `texels` reads a decoded texture's R32UI words (native_pixel_u), `sampled` a replacement's
-   RGBA8 mips (native_pixel). An untextured draw uses `texels` with the texture bit cleared. */
+/* The draw pipelines. The Rust renderer specialises its fragment stage with WebGPU's
+   specialisation constants (native.wgsl's native_spec), so the paths a draw does not take cost
+   it nothing; OpenGL has no such thing, and the first measurement on hardware (finding 144, step
+   3) showed why that matters: with everything decided at run time, 57 draws of a 640 x 448
+   picture took 107 ms, and the cost tracked the pixel count almost exactly (four times the
+   pixels, about a quarter of the rate). So the variants are separate compilations of one source
+   instead, keyed by PROGRAM_* below and linked the first time a draw asks for one.
+
+   TEXELS: a decoded texture's R32UI words (native_pixel_u) rather than a replacement's sampled
+   RGBA8 mips (native_pixel); an untextured draw takes a TEXELS program with the texture bit
+   cleared. BILINEAR: the four-texel mix, which a point-sampled draw should not pay for.
+   ALPHA_TEST: the `discard`, whose mere presence in the source makes a driver give up early
+   depth rejection for the draws that have no alpha test at all. */
+enum {
+    PROGRAM_TEXELS = 1, PROGRAM_BILINEAR = 2, PROGRAM_ALPHA_TEST = 4,
+    PROGRAM_COUNT = 8
+};
+
 typedef struct DrawProgram {
     GLuint id;
+    int tried;                 /* linked, or tried and failed: never built again */
     GLint u_target_size, u_flags, u_scale, u_atst, u_aref, u_fog;
     GLint u_alpha_scale, u_texa_alpha, u_tex_offset, u_tex_size, u_wrap, u_region, u_alpha_div;
+    GLint u_texels_size;       /* the GL texture's own size, so the shader never asks for it */
     /* What the program already holds. A GS picture is thousands of draws whose state mostly
        repeats, and a uniform the program already has is a driver call for nothing; `held` says
        the fields below are what was last sent to this program (uniforms are per program, so
@@ -69,11 +85,11 @@ typedef struct DrawProgram {
     int held;
     float h_target[2], h_fog[4], h_alpha_scale, h_texa_alpha, h_alpha_div;
     uint32_t h_flags, h_scale, h_atst, h_aref, h_tex_size[2], h_wrap[2], h_region[4];
-    int32_t h_tex_offset[2];
+    int32_t h_tex_offset[2], h_texels_size[2];
 } DrawProgram;
 
 struct DhdrNative {
-    DrawProgram texels, sampled;
+    DrawProgram programs[PROGRAM_COUNT];
     GLuint scanout_program;
     GLint u_da, u_db, u_ds;
     GLuint present_program;
@@ -118,17 +134,18 @@ static const char *native_vertex_source =
 
 /* native_pixel (and native_pixel_u with TEXELS): texture_uv, the texel fetch or the replacement
    sample, combine() and the output, the same arithmetic as native.wgsl. The uniform block is
-   loose uniforms here, and native_spec is always 0 (the generic pipeline: no specialisation
-   constants in GL), so draw_flags() is `flags`, wrap_mode() is `wrap`, alpha_test() is `atst`
-   and texture_sized() is false — load_texels asks the texture for its size, and bilinear_u's
-   one-gather fast path, which needs texture_sized(), is never taken: its four loads are.
+   loose uniforms here. native_spec is always 0, so draw_flags() is `flags`, wrap_mode() is
+   `wrap` and alpha_test() is `atst`; what the Rust path puts in specialisation constants is
+   here either a uniform or one of the PROGRAM_* compilations. texture_sized() is effectively
+   true: the host passes the GL texture's own size in `texels_size`, so the shader never calls
+   textureSize (a driver query, four times over for a bilinear fetch). bilinear_u's one-gather
+   fast path is still not taken; its four loads are.
 
    gl_FragCoord is declared origin_upper_left so that, with the vertex stage's Y flip, it counts
    GS pixels from the top exactly as WGSL's @builtin(position) does (fetch's flag-1024 snap).
 
-   Blending, depth and sampling a surface or a conversion stay step 3: the host clears the
-   texture bit of a draw it cannot give a texture to, so such a draw comes out flat as it did in
-   step 1. */
+   Sampling a surface or a conversion is still missing: the host clears the texture bit of a draw
+   it cannot give a texture to, so such a draw comes out flat as it did in step 1. */
 static const char *native_fragment_source =
     "layout(origin_upper_left) in vec4 gl_FragCoord;\n"
     "in vec4 v_stqf;\n"
@@ -151,6 +168,7 @@ static const char *native_fragment_source =
     "uniform uvec4 region;\n"
     "#ifdef TEXELS\n"
     "uniform usampler2D native_texels;\n"
+    "uniform ivec2 texels_size;\n"
     "#else\n"
     "uniform sampler2D native_texture;\n"
     "#endif\n"
@@ -174,7 +192,7 @@ static const char *native_fragment_source =
     "}\n"
     "#ifdef TEXELS\n"
     "uint load_texels(ivec2 xy) {\n"
-    "    ivec2 size = textureSize(native_texels, 0);\n"
+    "    ivec2 size = texels_size;\n"
     "    uint w = texelFetch(native_texels, clamp(xy, ivec2(0), size - 1), 0).x;\n"
     "    return (all(greaterThanEqual(xy, ivec2(0))) && all(lessThan(xy, size))) ? w : 0u;\n"
     "}\n"
@@ -195,14 +213,17 @@ static const char *native_fragment_source =
     "        uv += across * corner.x + down * corner.y;\n"
     "    }\n"
     "    uv *= float(E);\n"
-    "    if ((flags & 32u) != 0u) {\n"
-    "        uv -= 0.5;\n"
-    "        ivec2 b = ivec2(floor(uv));\n"
-    "        vec2 f = uv - floor(uv);\n"
-    "        return mix(mix(texel_u(b), texel_u(b + ivec2(1, 0)), f.x),\n"
-    "                   mix(texel_u(b + ivec2(0, 1)), texel_u(b + ivec2(1, 1)), f.x), f.y);\n"
-    "    }\n"
+    /* BILINEAR is the draw's flag 32, decided when the program was linked: a point-sampled draw
+       does not carry the other three fetches, nor a branch over them. */
+    "#ifdef BILINEAR\n"
+    "    uv -= 0.5;\n"
+    "    ivec2 b = ivec2(floor(uv));\n"
+    "    vec2 f = uv - floor(uv);\n"
+    "    return mix(mix(texel_u(b), texel_u(b + ivec2(1, 0)), f.x),\n"
+    "               mix(texel_u(b + ivec2(0, 1)), texel_u(b + ivec2(1, 1)), f.x), f.y);\n"
+    "#else\n"
     "    return texel_u(ivec2(floor(uv)));\n"
+    "#endif\n"
     "}\n"
     "#else\n"
     /* A replacement (flag 2048): the mips sampled, region clamp applied half a texel inside. */
@@ -232,6 +253,10 @@ static const char *native_fragment_source =
     "        color = vec4(rgb, a);\n"
     "    }\n"
     "    if ((flags & 16u) != 0u) { color = vec4(floor(mix(fog.rgb, color.rgb, v_stqf.w)), color.a); }\n"
+    /* ALPHA_TEST is the draw's flag 64. The `discard` is left out of the source entirely when
+       the draw has no alpha test, because a driver that can see one anywhere in the stage gives
+       up early depth rejection for every pixel, test or no test. */
+    "#ifdef ALPHA_TEST\n"
     "    if ((flags & 64u) != 0u) {\n"
     "        uint a = uint(color.a);\n"
     "        bool passed = atst == 1u || (atst == 2u && a < aref) || (atst == 3u && a <= aref) ||\n"
@@ -239,6 +264,7 @@ static const char *native_fragment_source =
     "                      (atst == 7u && a != aref);\n"
     "        if (passed == ((flags & 128u) != 0u)) discard;\n"
     "    }\n"
+    "#endif\n"
     "    if ((flags & 512u) != 0u) { color = vec4(floor(color.rgb * color.a / 128.0), color.a); }\n"
     "    return color;\n"
     "}\n"
@@ -378,6 +404,7 @@ static int gl_ready(void)
 static int find_draw_uniforms(DrawProgram *d, const char *sampler_name, GLint unit)
 {
     if (!d->id) return 0;
+    d->u_texels_size = glGetUniformLocation(d->id, "texels_size");
     d->u_target_size = glGetUniformLocation(d->id, "target_size");
     d->u_flags = glGetUniformLocation(d->id, "flags");
     d->u_scale = glGetUniformLocation(d->id, "nscale");
@@ -396,18 +423,32 @@ static int find_draw_uniforms(DrawProgram *d, const char *sampler_name, GLint un
     return 1;
 }
 
+/* The PROGRAM_* variant, linked the first time a draw asks for it (a picture uses two or three
+   of the eight, and linking them all at the start would cost a second of startup for nothing).
+   NULL when it could not be built; the caller then skips the draw. */
+static DrawProgram *draw_program(DhdrNative *n, unsigned key)
+{
+    DrawProgram *d = &n->programs[key & (PROGRAM_COUNT - 1)];
+    if (d->tried) return d->id ? d : NULL;
+    d->tried = 1;
+    char defines[128];
+    snprintf(defines, sizeof defines, "#version 430 core\n%s%s%s",
+             (key & PROGRAM_TEXELS) ? "#define TEXELS 1\n" : "",
+             (key & PROGRAM_BILINEAR) ? "#define BILINEAR 1\n" : "",
+             (key & PROGRAM_ALPHA_TEST) ? "#define ALPHA_TEST 1\n" : "");
+    d->id = link_program(native_vertex_source, defines, native_fragment_source, NULL);
+    if (!d->id) return NULL;
+    find_draw_uniforms(d, (key & PROGRAM_TEXELS) ? "native_texels" : "native_texture", 0);
+    return d;
+}
+
 static int ensure_gl_objects(DhdrNative *n)
 {
     if (n->ready) return 1;
     if (!gl_ready()) return 0;
-    n->texels.id = link_program(native_vertex_source, "#version 430 core\n#define TEXELS 1\n",
-                                native_fragment_source, NULL);
-    n->sampled.id = link_program(native_vertex_source, "#version 430 core\n", native_fragment_source, NULL);
     n->scanout_program = link_program(NULL, NULL, NULL, scanout_source);
     n->present_program = link_program(present_vertex_source, NULL, present_fragment_source, NULL);
-    if (!n->texels.id || !n->sampled.id || !n->scanout_program || !n->present_program) return 0;
-    find_draw_uniforms(&n->texels, "native_texels", 0);
-    find_draw_uniforms(&n->sampled, "native_texture", 0);
+    if (!n->scanout_program || !n->present_program) return 0;
     n->u_da = glGetUniformLocation(n->scanout_program, "da");
     n->u_db = glGetUniformLocation(n->scanout_program, "db");
     n->u_ds = glGetUniformLocation(n->scanout_program, "ds");
@@ -449,8 +490,8 @@ void dhdr_native_destroy(DhdrNative *n)
         glDeleteBuffers(1, &n->vbo);
         glDeleteBuffers(1, &n->ibo);
         glDeleteVertexArrays(1, &n->vao);
-        glDeleteProgram(n->texels.id);
-        glDeleteProgram(n->sampled.id);
+        for (int i = 0; i < PROGRAM_COUNT; i++)
+            if (n->programs[i].id) glDeleteProgram(n->programs[i].id);
         glDeleteProgram(n->scanout_program);
         glDeleteProgram(n->present_program);
         dhdr_tex_shutdown();
@@ -826,18 +867,29 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
            and one whose texture could not be uploaded, loses its texture bit and comes out flat,
            as every textured draw did in step 1. */
         uint32_t flags = k->constants.flags;
-        DrawProgram *d = &n->texels;
+        unsigned key = PROGRAM_TEXELS;
         GLuint texture = 0, sampler = 0;
+        uint32_t tw_texels = 1, th_texels = 1;
         if ((flags & 2048u) && k->replacement && (texture = dhdr_tex_gl(k->replacement))) {
-            d = &n->sampled;
+            key = 0;    /* the sampled path: the sampler does the filtering, so no BILINEAR */
             sampler = dhdr_tex_sampler((flags >> 5 & 1) | (unsigned)(k->constants.wrap[0] != 0) << 1 |
                                        (unsigned)(k->constants.wrap[1] != 0) << 2);
         } else if (!(flags & 2048u) && k->texture_surface < 0 && k->convert < 0 && k->texture &&
                    (texture = dhdr_tex_gl(k->texture))) {
-            /* a decoded texture: n->texels, nothing to change */
+            dhdr_tex_size(k->texture, &tw_texels, &th_texels, NULL);
+            if (flags & 32u) key |= PROGRAM_BILINEAR;
         } else {
             texture = dhdr_tex_dummy_texels();
             flags &= ~(1u | 2048u);
+        }
+        if (flags & 64u) key |= PROGRAM_ALPHA_TEST;
+        DrawProgram *d = draw_program(n, key);
+        if (!d) continue;
+        if (d->u_texels_size >= 0 &&
+            (d->h_texels_size[0] != (int32_t)tw_texels || d->h_texels_size[1] != (int32_t)th_texels)) {
+            if (bound_program != d->id) { glUseProgram(d->id); bound_program = d->id; program_changes++; }
+            glUniform2i(d->u_texels_size, (GLint)tw_texels, (GLint)th_texels);
+            d->h_texels_size[0] = (int32_t)tw_texels; d->h_texels_size[1] = (int32_t)th_texels;
         }
         if (bound_program != d->id) {
             glUseProgram(d->id);

@@ -547,7 +547,20 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   GREATER-with-writes draw wants. PNG is still a refusal
   (`render_stubs.c`), so texture packs and the button icons do not load; the sharp font, which
   is no PNG, does.
-- **NX3, speed (open).** Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and
+- **NX3, speed (measured, in progress).** `DHD_GL_TIMES` (render_native.c) prints the render
+  thread's time by phase every five seconds. First measurement on hardware, menus at scale 1:
+  `draws 107.62 ms (57 draws, 2 program changes, 52 texture binds), scanout 0.05 ms, collect
+  0.00 ms | uploads 0.0 (0.00 ms, 0 KiB)`. So neither the compute scanout nor texture churn
+  costs anything worth naming, and the whole field goes into the draws — about 1.9 ms each for
+  57 of them. The cost tracks the pixel count (scale 2 is four times the pixels and about a
+  quarter of the rate, 3.1 against 11.9 fields/s), so it is the fragment stage, not the driver's
+  per-call work. What came of that: the GL texture's size is a uniform rather than a
+  `textureSize` query made four times over per bilinear fetch, and the fragment stage is
+  compiled per variant (`PROGRAM_TEXELS`, `PROGRAM_BILINEAR`, `PROGRAM_ALPHA_TEST`, linked on
+  first use) in place of the specialisation constants WebGPU gives the Rust path — a point
+  sampled draw no longer carries three extra fetches, and a draw with no alpha test no longer
+  carries a `discard` that costs every pixel its early depth rejection.
+- **NX3, the rest (open).** Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and
   reapplied after dock/HOME/sleep, deferring to sys-clk; then profiling on hardware and the work
   of findings 107/112/127, plus NEON paths and thread placement over the four A57 cores. An
   overclocked Switch is about 0.6x the Unisoc T612 of findings 126/127 single-thread, 0.35x at
