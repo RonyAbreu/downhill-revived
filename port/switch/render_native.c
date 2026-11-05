@@ -68,8 +68,8 @@ typedef struct NativeSurface {
    ALPHA_TEST: the `discard`, whose mere presence in the source makes a driver give up early
    depth rejection for the draws that have no alpha test at all. */
 enum {
-    PROGRAM_TEXELS = 1, PROGRAM_BILINEAR = 2, PROGRAM_ALPHA_TEST = 4,
-    PROGRAM_COUNT = 8
+    PROGRAM_TEXELS = 1, PROGRAM_BILINEAR = 2, PROGRAM_ALPHA_TEST = 4, PROGRAM_SCALE_ONE = 8,
+    PROGRAM_COUNT = 16
 };
 
 typedef struct DrawProgram {
@@ -179,7 +179,20 @@ static const char *native_fragment_source =
     "    if (mode == 2u) return uint(clamp(c, int(low), int(high)));\n"
     "    return (uint(c) & low) | high;\n"
     "}\n"
-    /* The texture pixel holding GS texel c (S the texture's scale, E the draw's). */
+    /* The texture pixel holding GS texel c (S the texture's scale, E the draw's).
+
+       SCALE_ONE is S == E == 1, which is every draw that reads a decoded texture or a
+       replacement: render.rs's scale word only carries another S when the draw samples a
+       surface. The general form below costs two integer divisions a texel, and a GPU has no
+       integer divide -- each is a long sequence -- so a bilinear fetch was paying eight of them
+       per pixel. With S and E one they all fold away: whole is c, sub is zero, stp is one. */
+    "#ifdef SCALE_ONE\n"
+    "ivec2 texel_xy(ivec2 c) {\n"
+    "    uvec2 at = uvec2(wrap_coordinate(c.x, wrap.x, tex_size.x, region.x, region.y),\n"
+    "                     wrap_coordinate(c.y, wrap.y, tex_size.y, region.z, region.w));\n"
+    "    return tex_offset + ivec2(at);\n"
+    "}\n"
+    "#else\n"
     "ivec2 texel_xy(ivec2 c) {\n"
     "    uint S = (nscale >> 8) & 255u;\n"
     "    uint E = (nscale >> 16) & 255u;\n"
@@ -190,6 +203,7 @@ static const char *native_fragment_source =
     "                     wrap_coordinate(whole.y, wrap.y, tex_size.y, region.z, region.w));\n"
     "    return (tex_offset + ivec2(at)) * int(S) + sub * int(stp) + int(stp / 2u);\n"
     "}\n"
+    "#endif\n"
     "#ifdef TEXELS\n"
     "uint load_texels(ivec2 xy) {\n"
     "    ivec2 size = texels_size;\n"
@@ -207,12 +221,20 @@ static const char *native_fragment_source =
     "vec4 fetch_u(vec2 uv_in, vec2 across, vec2 down) {\n"
     "    vec2 uv = uv_in;\n"
     "    uint T = nscale & 255u;\n"
+    "#ifdef SCALE_ONE\n"
+    /* E is one, so its test holds and the multiply below is nothing. */
+    "    if ((flags & 1024u) != 0u && T > 1u) {\n"
+    "        vec2 corner = floor(gl_FragCoord.xy / float(T)) * float(T) - gl_FragCoord.xy;\n"
+    "        uv += across * corner.x + down * corner.y;\n"
+    "    }\n"
+    "#else\n"
     "    uint E = (nscale >> 16) & 255u;\n"
     "    if ((flags & 1024u) != 0u && T > 1u && E == 1u) {\n"
     "        vec2 corner = floor(gl_FragCoord.xy / float(T)) * float(T) - gl_FragCoord.xy;\n"
     "        uv += across * corner.x + down * corner.y;\n"
     "    }\n"
     "    uv *= float(E);\n"
+    "#endif\n"
     /* BILINEAR is the draw's flag 32, decided when the program was linked: a point-sampled draw
        does not carry the other three fetches, nor a branch over them. */
     "#ifdef BILINEAR\n"
@@ -423,19 +445,20 @@ static int find_draw_uniforms(DrawProgram *d, const char *sampler_name, GLint un
     return 1;
 }
 
-/* The PROGRAM_* variant, linked the first time a draw asks for it (a picture uses two or three
-   of the eight, and linking them all at the start would cost a second of startup for nothing).
+/* The PROGRAM_* variant, linked the first time a draw asks for it (a picture uses a handful of
+   the sixteen, and linking them all at the start would cost seconds of startup for nothing).
    NULL when it could not be built; the caller then skips the draw. */
 static DrawProgram *draw_program(DhdrNative *n, unsigned key)
 {
     DrawProgram *d = &n->programs[key & (PROGRAM_COUNT - 1)];
     if (d->tried) return d->id ? d : NULL;
     d->tried = 1;
-    char defines[128];
-    snprintf(defines, sizeof defines, "#version 430 core\n%s%s%s",
+    char defines[160];
+    snprintf(defines, sizeof defines, "#version 430 core\n%s%s%s%s",
              (key & PROGRAM_TEXELS) ? "#define TEXELS 1\n" : "",
              (key & PROGRAM_BILINEAR) ? "#define BILINEAR 1\n" : "",
-             (key & PROGRAM_ALPHA_TEST) ? "#define ALPHA_TEST 1\n" : "");
+             (key & PROGRAM_ALPHA_TEST) ? "#define ALPHA_TEST 1\n" : "",
+             (key & PROGRAM_SCALE_ONE) ? "#define SCALE_ONE 1\n" : "");
     d->id = link_program(native_vertex_source, defines, native_fragment_source, NULL);
     if (!d->id) return NULL;
     find_draw_uniforms(d, (key & PROGRAM_TEXELS) ? "native_texels" : "native_texture", 0);
@@ -883,6 +906,13 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
             flags &= ~(1u | 2048u);
         }
         if (flags & 64u) key |= PROGRAM_ALPHA_TEST;
+        /* The scale word render.rs builds is target | source << 8 | min(source, target) << 16,
+           and the source scale is 1 for everything sampled here (a surface, which is the only
+           thing that carries another, is not sampled yet), so S and E are both one and the
+           shader's texel arithmetic folds away. */
+        uint32_t source_scale = 1;
+        uint32_t resolution = source_scale < t->scale ? source_scale : t->scale;
+        if (source_scale == 1 && resolution == 1) key |= PROGRAM_SCALE_ONE;
         DrawProgram *d = draw_program(n, key);
         if (!d) continue;
         if (d->u_texels_size >= 0 &&
@@ -902,11 +932,6 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
             texture_binds++;
         }
         if (bound_sampler != sampler) { glBindSampler(0, sampler); bound_sampler = sampler; }
-        /* native.wgsl's scale word, as render.rs builds it: the target's scale, the sampled
-           surface's (1 for a decoded texture or a replacement, the only sources step 2 reads)
-           and the smaller of the two. */
-        uint32_t source_scale = 1;
-        uint32_t resolution = source_scale < target_scale ? source_scale : target_scale;
         uint32_t scale_word = target_scale | source_scale << 8 | resolution << 16;
         float tw = (float)t->width / (float)target_scale, th = (float)t->height / (float)target_scale;
         DrawProgram *w = d;
