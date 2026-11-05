@@ -49,6 +49,7 @@ struct DhdrNative {
     GLint u_rect;
     GLuint vao, vbo, ibo;
     size_t vbo_bytes, ibo_bytes;
+    int ready;                 /* the GL objects above are built (ensure_gl_objects) */
     NativeSurface surfaces[DHDR_NATIVE_SURFACE_COUNT];
     GLuint display_texture, display_fbo;
     uint32_t display_width, display_height;
@@ -202,24 +203,17 @@ static int gl_ready(void)
     return s && dhdr_gl_make_current(s);
 }
 
-/* ---- creation ---- */
+/* ---- creation ---- (dhdr_native_create runs before any window/GL context exists; ensure_gl_objects builds the
+   programs and buffers the first time a GL call finds one ready) */
 
-DhdrNative *dhdr_native_create(uint32_t flags)
+static int ensure_gl_objects(DhdrNative *n)
 {
-    (void)flags;   /* DHDR_NATIVE_DUAL: dhdr_device_features never offers dual-source blending here */
-    if (!gl_ready()) {
-        fprintf(stderr, "gs native: no OpenGL context yet for the native renderer\n");
-        return NULL;
-    }
-    DhdrNative *n = calloc(1, sizeof *n);
-    if (!n) return NULL;
+    if (n->ready) return 1;
+    if (!gl_ready()) return 0;
     n->draw_program = link_program(native_vertex_source, native_fragment_source, NULL);
     n->scanout_program = link_program(NULL, NULL, scanout_source);
     n->present_program = link_program(present_vertex_source, present_fragment_source, NULL);
-    if (!n->draw_program || !n->scanout_program || !n->present_program) {
-        free(n);
-        return NULL;
-    }
+    if (!n->draw_program || !n->scanout_program || !n->present_program) return 0;
     n->u_target_size = glGetUniformLocation(n->draw_program, "target_size");
     n->u_flags = glGetUniformLocation(n->draw_program, "flags");
     n->u_scale = glGetUniformLocation(n->draw_program, "nscale");
@@ -243,13 +237,20 @@ DhdrNative *dhdr_native_create(uint32_t flags)
     glVertexAttribIPointer(2, 4, GL_UNSIGNED_BYTE, sizeof(DhdrVertex), (void *)offsetof(DhdrVertex, rgba));
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, n->ibo);
     fprintf(stderr, "gs native: GL native renderer ready (step 1: flat geometry, no textures yet)\n");
-    return n;
+    n->ready = 1;
+    return 1;
+}
+
+DhdrNative *dhdr_native_create(uint32_t flags)
+{
+    (void)flags;   /* DHDR_NATIVE_DUAL: dhdr_device_features never offers dual-source blending here */
+    return calloc(1, sizeof(DhdrNative));
 }
 
 void dhdr_native_destroy(DhdrNative *n)
 {
     if (!n) return;
-    if (gl_ready()) {
+    if (n->ready && gl_ready()) {
         for (int i = 0; i < DHDR_NATIVE_SURFACE_COUNT; i++) {
             if (n->surfaces[i].fbo) glDeleteFramebuffers(1, &n->surfaces[i].fbo);
             if (n->surfaces[i].texture) glDeleteTextures(1, &n->surfaces[i].texture);
@@ -276,7 +277,7 @@ void dhdr_native_options(DhdrNative *n, uint32_t flags)
 int dhdr_native_surface(DhdrNative *n, uint32_t index, uint32_t scale, uint32_t w, uint32_t h, uint32_t depth,
                         uint32_t size_out[2])
 {
-    if (!n || index >= DHDR_NATIVE_SURFACE_COUNT || !gl_ready()) { size_out[0] = size_out[1] = 0; return 0; }
+    if (!n || index >= DHDR_NATIVE_SURFACE_COUNT || !ensure_gl_objects(n)) { size_out[0] = size_out[1] = 0; return 0; }
     NativeSurface *s = &n->surfaces[index];
     if (s->texture && s->width >= w && s->height >= h) {
         size_out[0] = s->width; size_out[1] = s->height;
@@ -398,7 +399,7 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
                                 DhdrPictureResult *out)
 {
     memset(out, 0, sizeof *out);
-    if (!n || !p || !gl_ready()) return 0;
+    if (!n || !p || !ensure_gl_objects(n)) return 0;
     ensure_buffer(GL_ARRAY_BUFFER, n->vbo, &n->vbo_bytes, (size_t)p->vertex_count * sizeof(DhdrVertex));
     if (p->vertex_count) glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)((size_t)p->vertex_count * sizeof(DhdrVertex)),
                                         p->vertices);
