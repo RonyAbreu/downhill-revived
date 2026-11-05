@@ -74,6 +74,41 @@ under 60 fields/s at first; the work list is the one of findings 107/112/127, me
 4. **NX4, packaging.** `package_release.py --platform switch`: the `.nro`, a `dhd.ini` template, the
    players' text; the disc image goes beside it (`sdmc:/switch/downhill-revived/`).
 
+## Other Switch ports read (2026-11-05)
+
+Two the player pointed at, and what each gave:
+
+- **R-drg/switch-hero** (SDL2, devkitPro). Its threads place themselves with
+  `svcGetInfo(InfoType_CoreMask, CUR_PROCESS_HANDLE)` and then
+  `svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, BIT(core))` (`src/main.cpp`, `src/audio.cpp`,
+  `include/background.hpp`), which is the call this port now makes in `switch_thread_core`. It
+  puts workers only on cores 1 and 2 and leaves core 0 to the main thread, and raises them with
+  `svcSetThreadPriority(..., 0x2B)`. Core 0 cannot be kept free here: four named threads over
+  three cores means one pair doubles up whatever happens. Thread priority is untried.
+- **HDErick/BO2-Requiem-NX**: no source yet (`nx/`, `buildscripts/` and `vendor/` hold an empty
+  `test.txt`), source release planned for this month. Its README is still worth the architecture:
+  D3D11 through DXVK onto Vulkan, on NaGaa95's Switch Mesa drivers.
+
+That led to the same author's two static recompilations with native Vulkan renderers on Horizon,
+which is this port's own shape: **R-drg/project8-sw** (Tony Hawk's Project 8) and
+**R-drg/the-simpsons-game-nx**. From project8-sw's README and docs:
+
+- Vulkan is NVK from **danfromtico/mesa-switch**, with NaGaa95's fork credited for "Mesa, NVK and
+  NAK on Horizon"; the port's own changes are in `patches/mesa-switch/` and add cheaper
+  descriptor binding and draws for Maxwell, plus two shader-compiler changes from nfsmw-nx.
+- Pipelines are compiled on first use and cached to the SD card, so the first minutes after an
+  update drop frames and miss objects.
+- It targets a locked 30 fps at 2,000-3,000 draws a frame with the GPU at 768 MHz set by sys-clk,
+  and says the GPU emulation it replaced ran at 1-5 fps.
+- "Busy-wait spinning costs a whole core on the Switch, versus being nearly free on the Xbox
+  360." Checked here: `port/hle/graphics_queue.c`'s `idle_wait` spins at most 4096 `isb` pauses,
+  about 2 us on these cores, and `DHD_SPIN_US` is 0 off Android, so this port does not have that
+  problem. Whether a spin helps on the Switch, where the clocks are pinned and there is no
+  governor to convince, is an experiment `DHD_SPIN_US` already allows from dhd.ini.
+- Applet mode is refused for memory, as it is here.
+
+Nothing was copied from any of them.
+
 ## Sources
 
 - devkitPro pacman packages for Switch: switch-sdl2 2.28.5, switch-mesa 20.1.0, libnx 4.12, deko3d.
