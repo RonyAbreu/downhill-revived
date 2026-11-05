@@ -1,16 +1,15 @@
-/* The Switch's renderer entries not drawn yet (finding 144): decoded textures (NX2 step 2),
-   texture packs' PNG files, and the test hooks. The device, the exact renderer and presentation
-   are render_gl.c's; the native renderer (NX2 step 1) is render_native.c's. */
+/* The Switch's renderer entries not drawn yet (finding 144): the texture packs' PNG files
+   (NX2 step 2's remainder) and the test hooks. The device, the exact renderer and presentation
+   are render_gl.c's; the native renderer (NX2 steps 1 and 2) is render_native.c's, and
+   DhdrTexture itself is textures.c's.
+
+   PNG: with no decoder, dhdr_png_size refuses every file, so texpack.c loads no texture pack and
+   button_icons.c shows no button icons. The sharp font is not a PNG and does work (it is built
+   from the game's own font through dhdr_replace_create). */
 #include <stddef.h>
 #include <stdint.h>
 #include "dhd_render.h"
 #include "dhd_render_ext.h"
-
-DhdrTexture *dhdr_texture_create(const uint32_t *rgba, uint32_t w, uint32_t h) { (void)rgba; (void)w; (void)h; return NULL; }
-DhdrTexture *dhdr_replace_create(const uint8_t *rgba_mips, uint32_t w, uint32_t h, uint32_t levels)
-{ (void)rgba_mips; (void)w; (void)h; (void)levels; return NULL; }
-void dhdr_texture_retain(DhdrTexture *t) { (void)t; }
-void dhdr_texture_release(DhdrTexture *t) { (void)t; }
 
 int dhdr_png_size(const uint8_t *data, size_t size, uint32_t *w, uint32_t *h) { (void)data; (void)size; (void)w; (void)h; return 0; }
 int dhdr_png_decode(const uint8_t *data, size_t size, uint8_t *rgba, uint32_t w, uint32_t h, uint32_t opaque)

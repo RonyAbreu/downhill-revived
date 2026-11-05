@@ -92,7 +92,7 @@ TARGETS = {t.key: t for t in (
            flags=['--target=aarch64-linux-android%d' % ANDROID_API, '-march=armv8.2-a', '-mtune=cortex-a78',
                   '-fPIC', '-fomit-frame-pointer']),
     # Nintendo Switch (finding 144): the Tegra X1's Cortex-A57s; devkitPro's flags for libnx
-    # (switch_rules: -mtp=soft, -fPIE). No Rust: render_gl.c, render_native.c, render_stubs.c and
+    # (switch_rules: -mtp=soft, -fPIE). No Rust: render_gl.c, render_native.c, textures.c, render_stubs.c and
     # rust_shims.c stand in.
     Target('switch-arm64', None, 'build/host64-switch', 'dhd.nro', 'arm64', jobs=8, outputs=8,
            flags=['-march=armv8-a+crc+crypto', '-mtune=cortex-a57', '-mtp=soft', '-fPIE', '-D__SWITCH__']),
@@ -108,7 +108,7 @@ ANDROID_EXPORTS = '{\n  global: SDL_main;\n  local: *;\n};\n'
 # The Switch: its host in place of the POSIX one, its start, and C stand-ins for the Rust library
 SWITCH_HOST = {'port/host/host_win32.c': 'port/host/host_switch.c'}
 SWITCH_UNITS = ['port/host/switch_main.c', 'port/switch/render_gl.c', 'port/switch/render_native.c',
-                'port/switch/render_stubs.c', 'port/switch/rust_shims.c']
+                'port/switch/render_stubs.c', 'port/switch/textures.c', 'port/switch/rust_shims.c']
 DEVKITPRO = Path(os.environ.get('DEVKITPRO') or '/opt/devkitpro')
 
 
@@ -169,7 +169,7 @@ def fiber_test(t, a, cc, wabt, out, env):
 def rust_library(t, work):
     """The Rust library's report (rustgs.build): here, or for linux-x64 in WSL without cargo, from
     rustgs.py on the Windows side (WSL's interop, python.exe)."""
-    if t.switch:  # no Rust on Horizon: render_gl.c, render_native.c, render_stubs.c, rust_shims.c
+    if t.switch:  # no Rust on Horizon: render_gl.c, render_native.c, textures.c, render_stubs.c, rust_shims.c
         return {'lib': None, 'native_static_libs': []}
     import rustgs  # cargo through rustgs only (its flags, version gate, checks and cache)
     if t.key != 'linux-x64' or shutil.which('cargo') or not shutil.which('python.exe'):

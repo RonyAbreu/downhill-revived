@@ -59,7 +59,7 @@ Open items:
   scratch) stays `.s`.
 - `.vutext`/DVP overlays (VU microcode) stay binary for now.
 
-## Phase 3 — PC port: Downhill Revived (current)
+## Phase 3 — PC port: Downhill Revived (shipping)
 Plan: `docs/findings/015-pc-port-plan.md`. Port code lives in `port/` and is applied at build
 time; the matching sources and checks don't change. Build steps and requirements:
 `docs/BUILDING.md`. Players' text: `port/release/README.txt`. The round-by-round log of how the
@@ -497,6 +497,58 @@ at 0, not -1, on a two-field step.
 - Browser speed: about 25-30 fields/s on the title, 17-25 in a race before finding 087's work;
   the game's worker is CPU-bound.
 - Finding 067's high-rate (120/144) AI and physics equivalence limits.
+
+## Phase 4 — Nintendo Switch homebrew (in progress)
+
+Plan: `docs/findings/144-switch-port-plan.md` (milestones NX0-NX4). A homebrew `.nro` for
+Atmosphère from the same portable core as every other target: `build/wasm/dhd_core.wasm` through
+wasm2c, the host units, and `--target switch-arm64` in `port/tools/build_host64.py`. As on
+Android, the player brings their own USA disc image; nothing of the game is in the `.nro`.
+Work lives on the `switch/port` branch, not on `main`.
+
+Build: `port/switch/Dockerfile` (devkitPro devkitA64, libnx) and `port/switch/build.sh`, which
+builds devkitPro's SDL3 fork first (`port/switch/build_sdl3.sh`, branch `switch-sdl-3.4`) and
+then `build_host64.py --target switch-arm64` into `build/host64-switch/dhd.nro`.
+
+- **NX0, plan (done).** Finding 144: what Horizon changes against the other targets, and why
+  there is no Rust on it (`aarch64-nintendo-switch-freestanding` is no_std; wgpu needs std), so
+  the whole `dhdr_*` ABI needs a C backend.
+- **NX1, the core on Switch, no picture (done).** The `.nro` builds and runs: the game reaches
+  the title, sound plays, pads and the hardware are seen. No Rust at all — `port/switch/
+  render_gl.c`, `render_native.c`, `render_stubs.c` and `rust_shims.c` stand in for the Rust
+  library, `port/host/host_switch.c` for `host_win32.c`, `port/host/switch_main.c` for the
+  launcher (there is none), `port/host64/guest_memory_switch.c` for guest RAM. Guest memory is
+  one flat block committed on demand (`svcSetMemoryPermission`), taken from the heap's start when
+  needed, not one 2 GiB reservation; wasm2c bounds checks replace the guard pages, and
+  `DHD_DEFER_READS=0` makes GS reads synchronous. `dhd.log` is written from main's start.
+- **NX2, picture (steps 1 and 2 done, step 3 open).** Step 1: `render_gl.c` makes an OpenGL 4.3 core
+  context (Mesa nouveau over SDL's EGL window, devkitPro's glad) and is the device, the exact
+  renderer and presentation — the movies and the CPU scanout show, 4:3 in the middle of the
+  screen; `DHDR_WINDOW_SWITCH` (7) is the window kind. `render_native.c` then reimplements the
+  native renderer's GL half in C from `native.wgsl`: the vertex transform and the untextured
+  pixel path as GLSL, one FBO per GS surface, a compute scanout and the same present quad.
+  Its GL objects are built on first use (`ensure_gl_objects`), because `dhdr_native_create` runs
+  before any context exists. Step 2 adds textures: `port/switch/textures.c` is `DhdrTexture` (a
+  decoded texture as R32UI texels, a replacement as RGBA8 mips with the eight samplers of the
+  Rust renderer's `shared.rs`), made as a CPU copy on whichever thread asks for it and uploaded
+  the first time the render thread samples it, with a dead list drained between pictures; the
+  fragment shader gained `native.wgsl`'s texel fetch, replacement sample and TFX combine, in two
+  compilations (texels and sampled) because GL has no specialisation constants. Step 3 is left:
+  the depth test, blending, the texture copies, sampling a surface or a conversion, and the Z
+  probe; a draw that would sample a surface still comes out flat. PNG is still a refusal
+  (`render_stubs.c`), so texture packs and the button icons do not load; the sharp font, which
+  is no PNG, does.
+- **NX3, speed (open).** Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and
+  reapplied after dock/HOME/sleep, deferring to sys-clk; then profiling on hardware and the work
+  of findings 107/112/127, plus NEON paths and thread placement over the four A57 cores. An
+  overclocked Switch is about 0.6x the Unisoc T612 of findings 126/127 single-thread, 0.35x at
+  the stock 1020 MHz, so well under 60 fields/s is expected at first.
+- **NX4, packaging (open).** `package_release.py --platform switch`: the `.nro`, a `dhd.ini`
+  template and the players' text, the disc image beside them in
+  `sdmc:/switch/downhill-revived/`.
+
+Off on Horizon, as on Android: online play (`host_service_net_offered` is 0), the disc check for
+online, and presence. `dhd.ini` is read by the C reader, not the Rust `dhd_settings` crate.
 
 ## Facts
 

@@ -43,6 +43,32 @@ under 60 fields/s at first; the work list is the one of findings 107/112/127, me
    `DHD_GPU_TIMES`-style counters give fields/s on hardware.
 2. **NX2, picture.** A C `dhdr_*` backend, first the exact path's presentation (`dhdr_present_exact`
    for movies and the CPU scanout) so menus show, then the native path.
+   - Step 1 (done): `port/switch/render_gl.c` is the device, the surface and presentation on an
+     OpenGL 4.3 core context (Mesa nouveau over SDL's EGL window, devkitPro's glad);
+     `render_native.c` is the native renderer's GL half, `native.wgsl`'s vertex transform and
+     untextured pixel path as GLSL, one FBO per GS surface, a compute scanout and the present
+     quad. Every draw flat-coloured.
+   - Step 2 (done): textures. `port/switch/textures.c` is `DhdrTexture` — a decoded texture as
+     w x h R32UI (each texel its RGBA8 bytes, as textures.rs), a replacement as RGBA8 with mip
+     levels and the eight samplers of `shared.rs` (bilinear | U clamped << 1 | V clamped << 2).
+     `dhd_render.h` lets create/retain/release run on any thread but there is one GL context on
+     one thread, so a texture is a CPU copy until the render thread first samples it, and one
+     released anywhere goes on a spin-locked dead list that `dhdr_tex_collect` drains between
+     pictures. The fragment shader gained `texel_xy`, `wrap_coordinate`, `texel_bytes`,
+     `fetch_u`, `replacement` and `combine`'s TFX block from `native.wgsl`; GL has no
+     specialisation constants, so `native_spec` is always 0 (the generic path: `texture_sized()`
+     false, so `bilinear_u`'s one-gather fast path is never taken) and the two pipelines — texels
+     and sampled — are two compilations of one source behind `#define TEXELS`. `gl_FragCoord` is
+     declared `origin_upper_left` to match WGSL's `@builtin(position)`. The scale word is built
+     as `render.rs` builds it (`big_t | 1 << 8 | min(1, big_t) << 16`: only decoded textures and
+     replacements are sampled here).
+   - Step 3 (open): the depth test, blending (no dual-source blending on this device, so the
+     two-pass fallback), the texture copies (`DHDR_CMD_COPY`, `IMPORT`, `ALPHA_UPLOAD`),
+     sampling a surface or a conversion, and the Z probe of finding 097. A draw that would
+     sample a surface still comes out flat.
+   - Also open: PNG (`dhdr_png_size`, `dhdr_png_decode` are still refusals in
+     `render_stubs.c`), so texture packs do not load and `button_icons.c` shows no button
+     icons. The sharp font is not a PNG and does work.
 3. **NX3, speed.** Clocks, profiling on hardware, the Android findings' optimisations, the Switch's
    own (NEON paths, thread placement).
 4. **NX4, packaging.** `package_release.py --platform switch`: the `.nro`, a `dhd.ini` template, the

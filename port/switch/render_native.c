@@ -1,5 +1,5 @@
-/* The Switch's native renderer, NX2 step 2's start, step 1 (finding 144): flat GS geometry on
-   OpenGL 4.3 core, no textures yet (DHD_RENDER=native; dhd.ini "renderer = native"). It stands in
+/* The Switch's native renderer, NX2 steps 1 and 2 (finding 144): textured GS geometry on
+   OpenGL 4.3 core (DHD_RENDER=native; dhd.ini "renderer = native"). It stands in
    for the Rust renderer's native half (port/render/src/native, native.wgsl) the same way
    render_gl.c stands in for its device and presentation: the command loop, the draw pipeline, the
    scanout and the present pass, all translated line for line from native.wgsl and
@@ -7,13 +7,16 @@
    the picture it builds) stays portable C (native_core.inc, gpu_rust_native.inc,
    gpu_rust_shared.inc), unchanged on every target.
 
-   What step 1 draws: every DHDR_CMD_DRAW, untextured (the texture bit of a draw's flags is never
-   read: a textured draw comes out flat, as flags & 1 == 0 would), with its vertex colour, fog and
-   alpha test; no depth test, no blending, no texture copies (DHDR_CMD_COPY, IMPORT, ALPHA_UPLOAD
-   are no-ops). Scanout and present are exact (native.wgsl's native_scanout, in a compute shader,
-   and the same windowed quad render_gl.c's exact present uses), so the picture is in the right
-   place and the right shape; it is flat-coloured menus, not exact pixels, until step 2 (textures)
-   and step 3 (depth, blending, render targets).
+   What steps 1 and 2 draw: every DHDR_CMD_DRAW, with its vertex colour, fog, alpha test and —
+   step 2 — its texture: a decoded texture (textures.c's R32UI words, fetched by the shader's
+   texel path, native.wgsl's native_pixel_u) or a replacement, a texture pack's or the sharp
+   font's (RGBA8 mips through one of the eight samplers, native_pixel). A draw that samples a
+   surface or a conversion instead (texture_surface, convert) keeps step 1's flat colour: the
+   host clears its texture bit. Still missing, all step 3: the depth test, blending, the texture
+   copies (DHDR_CMD_COPY, IMPORT and ALPHA_UPLOAD are no-ops) and render-target sampling.
+   Scanout and present are exact (native.wgsl's native_scanout, in a compute shader, and the same
+   windowed quad render_gl.c's exact present uses), so the picture is in the right place and the
+   right shape.
 
    GL context: render_gl.c's, made current lazily on the first dhdr_present_exact or
    dhdr_native_present call (render_gl_ext.h). The native renderer's own GL calls (building
@@ -30,6 +33,7 @@
 #include "dhd_render.h"
 #include "dhd_render_ext.h"
 #include "render_gl_ext.h"
+#include "textures_gl.h"
 
 enum { DHDR_NATIVE_SURFACE_COUNT = 48 };
 
@@ -40,9 +44,18 @@ typedef struct NativeSurface {
     int depth;                 /* a depth surface (GL_DEPTH_COMPONENT32F): never drawn into here */
 } NativeSurface;
 
-struct DhdrNative {
-    GLuint draw_program;
+/* One draw pipeline and its uniforms (native.wgsl's Native block, which GL has as loose
+   uniforms): the two differ only in the texture they sample, so they share every location name.
+   `texels` reads a decoded texture's R32UI words (native_pixel_u), `sampled` a replacement's
+   RGBA8 mips (native_pixel). An untextured draw uses `texels` with the texture bit cleared. */
+typedef struct DrawProgram {
+    GLuint id;
     GLint u_target_size, u_flags, u_scale, u_atst, u_aref, u_fog;
+    GLint u_alpha_scale, u_texa_alpha, u_tex_offset, u_tex_size, u_wrap, u_region;
+} DrawProgram;
+
+struct DhdrNative {
+    DrawProgram texels, sampled;
     GLuint scanout_program;
     GLint u_da, u_db, u_ds;
     GLuint present_program;
@@ -81,10 +94,21 @@ static const char *native_vertex_source =
     "    v_color = vec4(color_in);\n"
     "}\n";
 
-/* native_pixel's combine(), the untextured path only (flags & 1 is never set here): fog, alpha
-   test, premultiplied alpha (flag 512), the same arithmetic as native.wgsl. */
+/* native_pixel (and native_pixel_u with TEXELS): texture_uv, the texel fetch or the replacement
+   sample, combine() and the output, the same arithmetic as native.wgsl. The uniform block is
+   loose uniforms here, and native_spec is always 0 (the generic pipeline: no specialisation
+   constants in GL), so draw_flags() is `flags`, wrap_mode() is `wrap`, alpha_test() is `atst`
+   and texture_sized() is false — load_texels asks the texture for its size, and bilinear_u's
+   one-gather fast path, which needs texture_sized(), is never taken: its four loads are.
+
+   gl_FragCoord is declared origin_upper_left so that, with the vertex stage's Y flip, it counts
+   GS pixels from the top exactly as WGSL's @builtin(position) does (fetch's flag-1024 snap).
+
+   Blending, depth and sampling a surface or a conversion stay step 3: the host clears the
+   texture bit of a draw it cannot give a texture to, so such a draw comes out flat as it did in
+   step 1. */
 static const char *native_fragment_source =
-    "#version 430 core\n"
+    "layout(origin_upper_left) in vec4 gl_FragCoord;\n"
     "in vec4 v_stqf;\n"
     "in vec4 v_color;\n"
     "out vec4 frag_color;\n"
@@ -92,8 +116,95 @@ static const char *native_fragment_source =
     "uniform uint atst;\n"
     "uniform uint aref;\n"
     "uniform vec4 fog;\n"
-    "void main() {\n"
+    "uniform uint nscale;\n"
+    "uniform float alpha_scale;\n"
+    "uniform float texa_alpha;\n"
+    "uniform ivec2 tex_offset;\n"
+    "uniform uvec2 tex_size;\n"
+    "uniform uvec2 wrap;\n"
+    "uniform uvec4 region;\n"
+    "#ifdef TEXELS\n"
+    "uniform usampler2D native_texels;\n"
+    "#else\n"
+    "uniform sampler2D native_texture;\n"
+    "#endif\n"
+    /* CLAMP modes: repeat, clamp, region clamp, region repeat (MINU the mask, MAXU the fix). */
+    "uint wrap_coordinate(int c, uint mode, uint size, uint low, uint high) {\n"
+    "    if (mode == 0u) return uint(c) & (size - 1u);\n"
+    "    if (mode == 1u) return uint(clamp(c, 0, int(size) - 1));\n"
+    "    if (mode == 2u) return uint(clamp(c, int(low), int(high)));\n"
+    "    return (uint(c) & low) | high;\n"
+    "}\n"
+    /* The texture pixel holding GS texel c (S the texture's scale, E the draw's). */
+    "ivec2 texel_xy(ivec2 c) {\n"
+    "    uint S = (nscale >> 8) & 255u;\n"
+    "    uint E = (nscale >> 16) & 255u;\n"
+    "    uint stp = S / E;\n"
+    "    ivec2 whole = ivec2(floor(vec2(c) / float(E)));\n"
+    "    ivec2 sub = c - whole * int(E);\n"
+    "    uvec2 at = uvec2(wrap_coordinate(whole.x, wrap.x, tex_size.x, region.x, region.y),\n"
+    "                     wrap_coordinate(whole.y, wrap.y, tex_size.y, region.z, region.w));\n"
+    "    return (tex_offset + ivec2(at)) * int(S) + sub * int(stp) + int(stp / 2u);\n"
+    "}\n"
+    "#ifdef TEXELS\n"
+    "uint load_texels(ivec2 xy) {\n"
+    "    ivec2 size = textureSize(native_texels, 0);\n"
+    "    uint w = texelFetch(native_texels, clamp(xy, ivec2(0), size - 1), 0).x;\n"
+    "    return (all(greaterThanEqual(xy, ivec2(0))) && all(lessThan(xy, size))) ? w : 0u;\n"
+    "}\n"
+    /* A decoded texel's RGBA bytes in GS units (texel_bytes). */
+    "vec4 texel_bytes(uint w) {\n"
+    "    float a = float(w >> 24);\n"
+    "    float alpha = (alpha_scale == 255.0) ? a : round(a / 255.0 * alpha_scale);\n"
+    "    return vec4(float(w & 255u), float((w >> 8) & 255u), float((w >> 16) & 255u),\n"
+    "                ((flags & 256u) != 0u) ? texa_alpha : alpha);\n"
+    "}\n"
+    "vec4 texel_u(ivec2 c) { return texel_bytes(load_texels(texel_xy(c))); }\n"
+    "vec4 fetch_u(vec2 uv_in, vec2 across, vec2 down) {\n"
+    "    vec2 uv = uv_in;\n"
+    "    uint T = nscale & 255u;\n"
+    "    uint E = (nscale >> 16) & 255u;\n"
+    "    if ((flags & 1024u) != 0u && T > 1u && E == 1u) {\n"
+    "        vec2 corner = floor(gl_FragCoord.xy / float(T)) * float(T) - gl_FragCoord.xy;\n"
+    "        uv += across * corner.x + down * corner.y;\n"
+    "    }\n"
+    "    uv *= float(E);\n"
+    "    if ((flags & 32u) != 0u) {\n"
+    "        uv -= 0.5;\n"
+    "        ivec2 b = ivec2(floor(uv));\n"
+    "        vec2 f = uv - floor(uv);\n"
+    "        return mix(mix(texel_u(b), texel_u(b + ivec2(1, 0)), f.x),\n"
+    "                   mix(texel_u(b + ivec2(0, 1)), texel_u(b + ivec2(1, 1)), f.x), f.y);\n"
+    "    }\n"
+    "    return texel_u(ivec2(floor(uv)));\n"
+    "}\n"
+    "#else\n"
+    /* A replacement (flag 2048): the mips sampled, region clamp applied half a texel inside. */
+    "vec4 replacement(vec2 uv_in, vec2 across, vec2 down) {\n"
+    "    vec2 uv = uv_in;\n"
+    "    vec2 size = vec2(textureSize(native_texture, 0));\n"
+    "    vec2 gs_size = vec2(tex_size);\n"
+    "    vec2 half_texel = gs_size / size * 0.5;\n"
+    "    if (wrap.x == 2u) uv.x = clamp(uv.x, float(region.x) + half_texel.x, float(region.y) + 1.0 - half_texel.x);\n"
+    "    if (wrap.y == 2u) uv.y = clamp(uv.y, float(region.z) + half_texel.y, float(region.w) + 1.0 - half_texel.y);\n"
+    "    vec4 t = textureGrad(native_texture, uv / gs_size, across / gs_size, down / gs_size);\n"
+    "    return vec4(t.rgb * 255.0, t.a * alpha_scale);\n"
+    "}\n"
+    "#endif\n"
+    "vec4 combine(vec4 t) {\n"
     "    vec4 color = v_color;\n"
+    "    if ((flags & 1u) != 0u) {\n"
+    "        uint tfx = (flags >> 2) & 3u;\n"
+    "        vec3 rgb = (tfx == 1u) ? t.rgb : min(floor(t.rgb * color.rgb / 128.0), vec3(255.0));\n"
+    "        if (tfx >= 2u) rgb = min(rgb + color.a, vec3(255.0));\n"
+    "        float a = color.a;\n"
+    "        if ((flags & 2u) != 0u) {\n"
+    "            if (tfx == 0u) a = min(floor(t.a * color.a / 128.0), 255.0);\n"
+    "            else if (tfx == 2u) a = min(t.a + color.a, 255.0);\n"
+    "            else a = t.a;\n"
+    "        }\n"
+    "        color = vec4(rgb, a);\n"
+    "    }\n"
     "    if ((flags & 16u) != 0u) { color = vec4(floor(mix(fog.rgb, color.rgb, v_stqf.w)), color.a); }\n"
     "    if ((flags & 64u) != 0u) {\n"
     "        uint a = uint(color.a);\n"
@@ -103,6 +214,25 @@ static const char *native_fragment_source =
     "        if (passed == ((flags & 128u) != 0u)) discard;\n"
     "    }\n"
     "    if ((flags & 512u) != 0u) { color = vec4(floor(color.rgb * color.a / 128.0), color.a); }\n"
+    "    return color;\n"
+    "}\n"
+    "vec2 texture_uv() {\n"
+    "    float q = (abs(v_stqf.z) > 1e-30) ? v_stqf.z : 1e-30;\n"
+    "    return v_stqf.xy / q * vec2(tex_size);\n"
+    "}\n"
+    "void main() {\n"
+    "    vec2 uv = texture_uv();\n"
+    "    vec2 across = dFdx(uv);\n"
+    "    vec2 down = dFdy(uv);\n"
+    "    vec4 t = vec4(0.0);\n"
+    "    if ((flags & 1u) != 0u) {\n"
+    "#ifdef TEXELS\n"
+    "        t = fetch_u(uv, across, down);\n"
+    "#else\n"
+    "        t = replacement(uv, across, down);\n"
+    "#endif\n"
+    "    }\n"
+    "    vec4 color = combine(t);\n"
     "    frag_color = vec4(color.rgb / 255.0, clamp(color.a / 255.0, 0.0, 1.0));\n"
     "}\n";
 
@@ -146,11 +276,14 @@ static const char *present_fragment_source =
     "out vec4 color;\n"
     "void main() { color = vec4(texture(picture, uv).rgb, 1.0); }\n";
 
-static GLuint compile(GLenum kind, const char *source)
+/* `prefix`, when given, is prepended: the `#version` line and the fragment stage's `#define`
+   (GL has no specialisation constants, so the two draw pipelines are two compilations). */
+static GLuint compile(GLenum kind, const char *prefix, const char *source)
 {
     GLuint s = glCreateShader(kind);
     GLint ok = 0;
-    glShaderSource(s, 1, &source, NULL);
+    const char *parts[2] = { prefix, source };
+    glShaderSource(s, prefix ? 2 : 1, prefix ? parts : &parts[1], NULL);
     glCompileShader(s);
     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
     if (!ok) {
@@ -163,14 +296,16 @@ static GLuint compile(GLenum kind, const char *source)
     return s;
 }
 
-/* A program from one or two shaders (compute: just cs); 0 on failure (logged). */
-static GLuint link_program(const char *vs_src, const char *fs_src, const char *cs_src)
+/* A program from one or two shaders (compute: just cs); fs_prefix heads the fragment source.
+   0 on failure (logged). */
+static GLuint link_program(const char *vs_src, const char *fs_prefix, const char *fs_src, const char *cs_src)
 {
     GLuint vs = 0, fs = 0, cs = 0, program;
     if (cs_src) {
-        if (!(cs = compile(GL_COMPUTE_SHADER, cs_src))) return 0;
+        if (!(cs = compile(GL_COMPUTE_SHADER, NULL, cs_src))) return 0;
     } else {
-        if (!(vs = compile(GL_VERTEX_SHADER, vs_src)) || !(fs = compile(GL_FRAGMENT_SHADER, fs_src))) {
+        if (!(vs = compile(GL_VERTEX_SHADER, NULL, vs_src)) ||
+            !(fs = compile(GL_FRAGMENT_SHADER, fs_prefix, fs_src))) {
             glDeleteShader(vs);
             glDeleteShader(fs);
             return 0;
@@ -206,20 +341,39 @@ static int gl_ready(void)
 /* ---- creation ---- (dhdr_native_create runs before any window/GL context exists; ensure_gl_objects builds the
    programs and buffers the first time a GL call finds one ready) */
 
+/* The two draw pipelines' uniform locations (the same names in both). */
+static int find_draw_uniforms(DrawProgram *d, const char *sampler_name, GLint unit)
+{
+    if (!d->id) return 0;
+    d->u_target_size = glGetUniformLocation(d->id, "target_size");
+    d->u_flags = glGetUniformLocation(d->id, "flags");
+    d->u_scale = glGetUniformLocation(d->id, "nscale");
+    d->u_atst = glGetUniformLocation(d->id, "atst");
+    d->u_aref = glGetUniformLocation(d->id, "aref");
+    d->u_fog = glGetUniformLocation(d->id, "fog");
+    d->u_alpha_scale = glGetUniformLocation(d->id, "alpha_scale");
+    d->u_texa_alpha = glGetUniformLocation(d->id, "texa_alpha");
+    d->u_tex_offset = glGetUniformLocation(d->id, "tex_offset");
+    d->u_tex_size = glGetUniformLocation(d->id, "tex_size");
+    d->u_wrap = glGetUniformLocation(d->id, "wrap");
+    d->u_region = glGetUniformLocation(d->id, "region");
+    glUseProgram(d->id);
+    glUniform1i(glGetUniformLocation(d->id, sampler_name), unit);
+    return 1;
+}
+
 static int ensure_gl_objects(DhdrNative *n)
 {
     if (n->ready) return 1;
     if (!gl_ready()) return 0;
-    n->draw_program = link_program(native_vertex_source, native_fragment_source, NULL);
-    n->scanout_program = link_program(NULL, NULL, scanout_source);
-    n->present_program = link_program(present_vertex_source, present_fragment_source, NULL);
-    if (!n->draw_program || !n->scanout_program || !n->present_program) return 0;
-    n->u_target_size = glGetUniformLocation(n->draw_program, "target_size");
-    n->u_flags = glGetUniformLocation(n->draw_program, "flags");
-    n->u_scale = glGetUniformLocation(n->draw_program, "nscale");
-    n->u_atst = glGetUniformLocation(n->draw_program, "atst");
-    n->u_aref = glGetUniformLocation(n->draw_program, "aref");
-    n->u_fog = glGetUniformLocation(n->draw_program, "fog");
+    n->texels.id = link_program(native_vertex_source, "#version 430 core\n#define TEXELS 1\n",
+                                native_fragment_source, NULL);
+    n->sampled.id = link_program(native_vertex_source, "#version 430 core\n", native_fragment_source, NULL);
+    n->scanout_program = link_program(NULL, NULL, NULL, scanout_source);
+    n->present_program = link_program(present_vertex_source, NULL, present_fragment_source, NULL);
+    if (!n->texels.id || !n->sampled.id || !n->scanout_program || !n->present_program) return 0;
+    find_draw_uniforms(&n->texels, "native_texels", 0);
+    find_draw_uniforms(&n->sampled, "native_texture", 0);
     n->u_da = glGetUniformLocation(n->scanout_program, "da");
     n->u_db = glGetUniformLocation(n->scanout_program, "db");
     n->u_ds = glGetUniformLocation(n->scanout_program, "ds");
@@ -236,7 +390,8 @@ static int ensure_gl_objects(DhdrNative *n)
     glEnableVertexAttribArray(2);
     glVertexAttribIPointer(2, 4, GL_UNSIGNED_BYTE, sizeof(DhdrVertex), (void *)offsetof(DhdrVertex, rgba));
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, n->ibo);
-    fprintf(stderr, "gs native: GL native renderer ready (step 1: flat geometry, no textures yet)\n");
+    fprintf(stderr, "gs native: GL native renderer ready (step 2: textured geometry; no depth, "
+                    "no blending, no render-target sampling yet)\n");
     n->ready = 1;
     return 1;
 }
@@ -260,9 +415,11 @@ void dhdr_native_destroy(DhdrNative *n)
         glDeleteBuffers(1, &n->vbo);
         glDeleteBuffers(1, &n->ibo);
         glDeleteVertexArrays(1, &n->vao);
-        glDeleteProgram(n->draw_program);
+        glDeleteProgram(n->texels.id);
+        glDeleteProgram(n->sampled.id);
         glDeleteProgram(n->scanout_program);
         glDeleteProgram(n->present_program);
+        dhdr_tex_shutdown();
     }
     free(n);
 }
@@ -408,14 +565,15 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, (GLsizeiptr)((size_t)index_count * sizeof(uint32_t)), indices);
     }
     glBindVertexArray(n->vao);
-    glUseProgram(n->draw_program);
     glDisable(GL_DEPTH_TEST);   /* depth, blending: step 3 */
     glDisable(GL_BLEND);
     glEnable(GL_SCISSOR_TEST);
+    glActiveTexture(GL_TEXTURE0);
     GLint bound_fbo = -1;
+    GLuint bound_program = 0;
     for (uint32_t i = 0; i < p->command_count; i++) {
         const DhdrCommand *k = &p->commands[i];
-        if (k->kind != DHDR_CMD_DRAW || !k->count) continue;   /* COPY, IMPORT, ALPHA_UPLOAD: step 2 */
+        if (k->kind != DHDR_CMD_DRAW || !k->count) continue;   /* COPY, IMPORT, ALPHA_UPLOAD: step 3 */
         if (k->target < 0 || (uint32_t)k->target >= DHDR_NATIVE_SURFACE_COUNT) continue;
         NativeSurface *t = &n->surfaces[k->target];
         if (!t->texture || t->depth) continue;
@@ -433,12 +591,49 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
         glScissor(left, (int32_t)t->height - bottom, right - left, bottom - top);
         glColorMask((k->color_mask & 1) != 0, (k->color_mask & 2) != 0, (k->color_mask & 4) != 0,
                    (k->color_mask & 8) != 0);
-        glUniform2f(n->u_target_size, (float)t->width / (float)target_scale, (float)t->height / (float)target_scale);
-        glUniform1ui(n->u_flags, k->constants.flags);
-        glUniform1ui(n->u_scale, target_scale);
-        glUniform1ui(n->u_atst, k->constants.atst);
-        glUniform1ui(n->u_aref, k->constants.aref);
-        glUniform4f(n->u_fog, k->constants.fog[0], k->constants.fog[1], k->constants.fog[2], k->constants.fog[3]);
+        /* The texture this draw samples, and with it the pipeline. A replacement (flag 2048) is
+           sampled through one of the eight samplers; a decoded texture is fetched texel by texel.
+           A draw that would sample a surface or a conversion (texture_surface, convert: step 3),
+           and one whose texture could not be uploaded, loses its texture bit and comes out flat,
+           as every textured draw did in step 1. */
+        uint32_t flags = k->constants.flags;
+        const DrawProgram *d = &n->texels;
+        GLuint texture = 0, sampler = 0;
+        if ((flags & 2048u) && k->replacement && (texture = dhdr_tex_gl(k->replacement))) {
+            d = &n->sampled;
+            sampler = dhdr_tex_sampler((flags >> 5 & 1) | (unsigned)(k->constants.wrap[0] != 0) << 1 |
+                                       (unsigned)(k->constants.wrap[1] != 0) << 2);
+        } else if (!(flags & 2048u) && k->texture_surface < 0 && k->convert < 0 && k->texture &&
+                   (texture = dhdr_tex_gl(k->texture))) {
+            /* a decoded texture: n->texels, nothing to change */
+        } else {
+            texture = dhdr_tex_dummy_texels();
+            flags &= ~(1u | 2048u);
+        }
+        if (bound_program != d->id) {
+            glUseProgram(d->id);
+            bound_program = d->id;
+        }
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glBindSampler(0, sampler);
+        /* native.wgsl's scale word, as render.rs builds it: the target's scale, the sampled
+           surface's (1 for a decoded texture or a replacement, the only sources step 2 reads)
+           and the smaller of the two. */
+        uint32_t source_scale = 1;
+        uint32_t resolution = source_scale < target_scale ? source_scale : target_scale;
+        glUniform2f(d->u_target_size, (float)t->width / (float)target_scale, (float)t->height / (float)target_scale);
+        glUniform1ui(d->u_flags, flags);
+        glUniform1ui(d->u_scale, target_scale | source_scale << 8 | resolution << 16);
+        glUniform1ui(d->u_atst, k->constants.atst);
+        glUniform1ui(d->u_aref, k->constants.aref);
+        glUniform4f(d->u_fog, k->constants.fog[0], k->constants.fog[1], k->constants.fog[2], k->constants.fog[3]);
+        glUniform1f(d->u_alpha_scale, k->constants.alpha_scale);
+        glUniform1f(d->u_texa_alpha, k->constants.texa_alpha);
+        glUniform2i(d->u_tex_offset, k->constants.tex_offset[0], k->constants.tex_offset[1]);
+        glUniform2ui(d->u_tex_size, k->constants.tex_size[0], k->constants.tex_size[1]);
+        glUniform2ui(d->u_wrap, k->constants.wrap[0], k->constants.wrap[1]);
+        glUniform4ui(d->u_region, k->constants.region[0], k->constants.region[1], k->constants.region[2],
+                     k->constants.region[3]);
         if (indices && index_count) {
             glDrawElements(GL_TRIANGLES, (GLsizei)k->count, GL_UNSIGNED_INT,
                            (const void *)(uintptr_t)((size_t)k->first * sizeof(uint32_t)));
@@ -447,7 +642,11 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
         }
         out->draws++;
     }
+    glBindSampler(0, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    /* Textures released on any thread since the last picture: their GL objects are this
+       thread's to delete (textures_gl.h). */
+    dhdr_tex_collect();
     int shown = p->movie_on ? scan_out_movie(n, p->movie_width, p->movie_height, p->movie) : scan_out(n, p);
     out->shown = shown != 0;
     out->display_width = n->display_width;
