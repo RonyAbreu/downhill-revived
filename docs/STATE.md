@@ -587,7 +587,16 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
 - Where the two scales stand on hardware (menus, clocks at `max`): scale 1 about 47 fields/s and
   playable, limited by the VU thread; scale 2 about 24, limited by the render thread, with the
   draws 40-43 ms a picture against 1-12 at scale 1 -- four times the pixels for about four times
-  the cost, so scale 2 is fill-bound and will not reach 60 on this GPU. Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and
+  the cost, so scale 2 is fill-bound and will not reach 60 on this GPU.
+- A race at scale 2 (the first measured) is a different shape from the menus: every thread is
+  heavy, a field's busy times being game 25-33 ms, vu 24-44, gs 15-22 and the native renderer
+  14-33, which is about 100 ms of work over three cores. That floor alone is 33 ms a field, so
+  30 fields/s is the ceiling there however the threads are placed; 19-25 is what it does, and
+  `limit=` moves between render, vu and game from one half-minute to the next. The draws are
+  340-546 a picture against about 50 in the menus, but the time does not follow the count (495
+  draws in 38.8 ms against 52 in 41.0), so it is still pixels rather than calls. The game clock
+  runs at about x0.75 there: the port slows the game rather than dropping input (finding 139).
+  A race at scale 1 has not been measured yet, and it is the next thing worth knowing. Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and
   reapplied after dock/HOME/sleep, deferring to sys-clk; then profiling on hardware and the work
   of findings 107/112/127, plus NEON paths and thread placement over the four A57 cores. An
   overclocked Switch is about 0.6x the Unisoc T612 of findings 126/127 single-thread, 0.35x at
