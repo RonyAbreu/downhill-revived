@@ -602,12 +602,13 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   2.3-4.7 ms a picture for 300-576 draws), and the limit is `cpu:game` or `cpu:vu`, those two
   being 18-24 ms each. **Scale 1 is the playable mode; scale 2 is for looking at.** Past this
   needs finding 127's work on the VU and EE, not the renderer.
-- Open on hardware: the sound goes quiet when a race starts and stays quiet for the race, while
-  the sound clock says the mixer is still producing its 48,000 samples a second. So the mixer
-  runs and its voices have nothing in them, which points at the race's sound bank rather than
-  at starvation (which is what the same symptom was at three fields a second). Every way out of
-  `snd_bank_load` now says why it failed; three of them used to return quietly.
-  `DHD_SND_HOST_TRACE` and `DHD_SND_TRACE` are the two switches for the next run. Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and
+- The sound going quiet when a race started is fixed, and it was not the sound bank: the trace
+  showed no `989snd` failure and the mixer producing its 48,000 samples a second throughout.
+  SDL's audio thread was starved -- Horizon starts it at the ordinary priority among four
+  threads wanting more than three cores, beside fields of 227 ms -- and it now raises itself to
+  0x2B from inside the audio callback, the only place that thread can be reached
+  (`switch_audio_thread`, as switch-hero does). Verified on hardware: a whole race with the
+  callback running 100 times a second, none idle, and the underruns stopping at 4. Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and
   reapplied after dock/HOME/sleep, deferring to sys-clk; then profiling on hardware and the work
   of findings 107/112/127, plus NEON paths and thread placement over the four A57 cores. An
   overclocked Switch is about 0.6x the Unisoc T612 of findings 126/127 single-thread, 0.35x at

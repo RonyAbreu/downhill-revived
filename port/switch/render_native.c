@@ -167,9 +167,11 @@ static const char *native_fragment_source =
     "uniform uvec2 tex_size;\n"
     "uniform uvec2 wrap;\n"
     "uniform uvec4 region;\n"
+    /* The sampled texture's own size, which the host knows: no textureSize anywhere, and a
+       bilinear fetch would have asked for it four times over. */
+    "uniform ivec2 texels_size;\n"
     "#ifdef TEXELS\n"
     "uniform usampler2D native_texels;\n"
-    "uniform ivec2 texels_size;\n"
     "#else\n"
     "uniform sampler2D native_texture;\n"
     "#endif\n"
@@ -261,13 +263,45 @@ static const char *native_fragment_source =
     /* A replacement (flag 2048): the mips sampled, region clamp applied half a texel inside. */
     "vec4 replacement(vec2 uv_in, vec2 across, vec2 down) {\n"
     "    vec2 uv = uv_in;\n"
-    "    vec2 size = vec2(textureSize(native_texture, 0));\n"
+    "    vec2 size = vec2(texels_size);\n"
     "    vec2 gs_size = vec2(tex_size);\n"
     "    vec2 half_texel = gs_size / size * 0.5;\n"
     "    if (wrap.x == 2u) uv.x = clamp(uv.x, float(region.x) + half_texel.x, float(region.y) + 1.0 - half_texel.x);\n"
     "    if (wrap.y == 2u) uv.y = clamp(uv.y, float(region.z) + half_texel.y, float(region.w) + 1.0 - half_texel.y);\n"
     "    vec4 t = textureGrad(native_texture, uv / gs_size, across / gs_size, down / gs_size);\n"
     "    return vec4(t.rgb * 255.0, t.a * alpha_scale);\n"
+    "}\n"
+    /* A surface this draw samples (native.wgsl's load_texel and texel): another colour surface's
+       RGBA8, read texel by texel with the same wrap and scale arithmetic as a decoded texture,
+       and turned into GS units the same way. A loaded unorm8 times 255 is exactly the byte, and
+       round() keeps it so where a compiler would fuse the product into a later add. */
+    "vec4 load_texel_f(ivec2 xy) {\n"
+    "    ivec2 size = texels_size;\n"
+    "    vec4 v = texelFetch(native_texture, clamp(xy, ivec2(0), size - 1), 0);\n"
+    "    return (all(greaterThanEqual(xy, ivec2(0))) && all(lessThan(xy, size))) ? v : vec4(0.0);\n"
+    "}\n"
+    "vec4 texel(ivec2 c) {\n"
+    "    vec4 t = load_texel_f(texel_xy(c));\n"
+    "    return vec4(round(t.rgb * 255.0),\n"
+    "                ((flags & 256u) != 0u) ? texa_alpha : round(t.a * alpha_scale));\n"
+    "}\n"
+    "vec4 fetch_surface(vec2 uv_in, vec2 across, vec2 down) {\n"
+    "    vec2 uv = uv_in;\n"
+    "    uint T = nscale & 255u;\n"
+    "    uint E = (nscale >> 16) & 255u;\n"
+    "    if ((flags & 1024u) != 0u && T > 1u && E == 1u) {\n"
+    "        vec2 corner = floor(gl_FragCoord.xy / float(T)) * float(T) - gl_FragCoord.xy;\n"
+    "        uv += across * corner.x + down * corner.y;\n"
+    "    }\n"
+    "    uv *= float(E);\n"
+    "    if ((flags & 32u) != 0u) {\n"
+    "        uv -= 0.5;\n"
+    "        ivec2 b = ivec2(floor(uv));\n"
+    "        vec2 f = uv - floor(uv);\n"
+    "        return mix(mix(texel(b), texel(b + ivec2(1, 0)), f.x),\n"
+    "                   mix(texel(b + ivec2(0, 1)), texel(b + ivec2(1, 1)), f.x), f.y);\n"
+    "    }\n"
+    "    return texel(ivec2(floor(uv)));\n"
     "}\n"
     "#endif\n"
     "vec4 combine(vec4 t) {\n"
@@ -313,7 +347,9 @@ static const char *native_fragment_source =
     "#ifdef TEXELS\n"
     "        t = fetch_u(uv, across, down);\n"
     "#else\n"
-    "        t = replacement(uv, across, down);\n"
+    /* native.wgsl's fetch(): the float texture is a replacement or a surface. */
+    "        t = ((flags & 2048u) != 0u) ? replacement(uv, across, down)\n"
+    "                                    : fetch_surface(uv, across, down);\n"
     "#endif\n"
     "    }\n"
     "    vec4 color = combine(t);\n"
@@ -805,12 +841,15 @@ static uint64_t phase_end(int level)
 }
 
 static void report_times(uint64_t draws_ns, uint64_t scan_ns, uint64_t collect_ns, uint64_t draws,
-                         uint64_t programs, uint64_t textures)
+                         uint64_t programs, uint64_t textures, uint64_t fconvert, uint64_t fsurface,
+                         uint64_t fother)
 {
     static uint64_t pictures, a_draws_ns, a_scan_ns, a_collect_ns, a_draws, a_programs, a_textures;
+    static uint64_t a_fconvert, a_fsurface, a_fother;
     static uint64_t was_uploads, was_upload_ns, was_bytes, since;
     a_draws_ns += draws_ns; a_scan_ns += scan_ns; a_collect_ns += collect_ns;
     a_draws += draws; a_programs += programs; a_textures += textures;
+    a_fconvert += fconvert; a_fsurface += fsurface; a_fother += fother;
     uint64_t now = SDL_GetTicksNS();
     if (!since) since = now;
     /* 300 pictures or five seconds, whichever comes first: at 60 fields a second that is a line
@@ -823,12 +862,14 @@ static void report_times(uint64_t draws_ns, uint64_t scan_ns, uint64_t collect_n
     double n = (double)pictures;
     fprintf(stderr, "gs native: per picture over %u: draws %.2f ms (%.0f draws, %.0f program changes, "
                     "%.0f texture binds), scanout %.2f ms, collect %.2f ms | uploads %.1f (%.2f ms, "
-                    "%.0f KiB)\n",
+                    "%.0f KiB) | flat %.1f convert, %.1f surface, %.1f other\n",
             (unsigned)pictures, a_draws_ns / n / 1e6, a_draws / n, a_programs / n, a_textures / n,
             a_scan_ns / n / 1e6, a_collect_ns / n / 1e6, (uploads - was_uploads) / n,
-            (upload_ns - was_upload_ns) / n / 1e6, (bytes - was_bytes) / n / 1024.0);
+            (upload_ns - was_upload_ns) / n / 1e6, (bytes - was_bytes) / n / 1024.0,
+            a_fconvert / n, a_fsurface / n, a_fother / n);
     was_uploads = uploads; was_upload_ns = upload_ns; was_bytes = bytes;
     pictures = a_draws_ns = a_scan_ns = a_collect_ns = a_draws = a_programs = a_textures = 0;
+    a_fconvert = a_fsurface = a_fother = 0;
 }
 
 int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint32_t *indices, uint32_t index_count,
@@ -839,6 +880,10 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
     int times = gl_times();
     uint64_t t0 = times ? SDL_GetTicksNS() : 0, t1 = 0, t2 = 0, t3 = 0;
     uint64_t program_changes = 0, texture_binds = 0;
+    /* Textured draws this renderer still cannot give a texture to, by what it would have
+       sampled: a conversion, its own target (or a surface with nothing in it), or a decoded
+       texture that would not upload. They come out flat, and these say which to do next. */
+    uint64_t flat_convert = 0, flat_surface = 0, flat_other = 0;
     ensure_buffer(GL_ARRAY_BUFFER, n->vbo, &n->vbo_bytes, (size_t)p->vertex_count * sizeof(DhdrVertex));
     if (p->vertex_count) glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)((size_t)p->vertex_count * sizeof(DhdrVertex)),
                                         p->vertices);
@@ -895,33 +940,51 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
             glScissor(cut[0], cut[1], cut[2], cut[3]);
             memcpy(held_scissor, cut, sizeof cut);
         }
-        /* The texture this draw samples, and with it the pipeline. A replacement (flag 2048) is
-           sampled through one of the eight samplers; a decoded texture is fetched texel by texel.
-           A draw that would sample a surface or a conversion (texture_surface, convert: step 3),
-           and one whose texture could not be uploaded, loses its texture bit and comes out flat,
-           as every textured draw did in step 1. */
+        /* Where this draw's texture comes from, and with it the pipeline, in the order render.rs
+           tries: the surface it names, else a replacement (flag 2048) through one of the eight
+           samplers, else its decoded texture. A draw sampling its own target needs the copy
+           sample_target makes and is not drawn textured here; nor is one whose texture is a
+           conversion, nor one whose texture could not be uploaded. Those lose the texture bit
+           and come out flat, as every textured draw did in step 1. */
         uint32_t flags = k->constants.flags;
         unsigned key = PROGRAM_TEXELS;
         GLuint texture = 0, sampler = 0;
-        uint32_t tw_texels = 1, th_texels = 1;
-        if ((flags & 2048u) && k->replacement && (texture = dhdr_tex_gl(k->replacement))) {
+        uint32_t tw_texels = 1, th_texels = 1, source_scale = 1;
+        if (k->texture_surface >= 0 && (uint32_t)k->texture_surface < DHDR_NATIVE_SURFACE_COUNT &&
+            k->texture_surface != k->target && !(flags & 2048u)) {
+            NativeSurface *src = &n->surfaces[k->texture_surface];
+            if (src->texture && !src->depth) {
+                key = 0;   /* the float path: another surface's RGBA8, fetched texel by texel */
+                texture = src->texture;
+                tw_texels = src->width; th_texels = src->height;
+                source_scale = src->scale ? src->scale : 1;
+            }
+        } else if ((flags & 2048u) && k->replacement && (texture = dhdr_tex_gl(k->replacement))) {
             key = 0;    /* the sampled path: the sampler does the filtering, so no BILINEAR */
+            dhdr_tex_size(k->replacement, &tw_texels, &th_texels, NULL);
             sampler = dhdr_tex_sampler((flags >> 5 & 1) | (unsigned)(k->constants.wrap[0] != 0) << 1 |
                                        (unsigned)(k->constants.wrap[1] != 0) << 2);
         } else if (!(flags & 2048u) && k->texture_surface < 0 && k->convert < 0 && k->texture &&
                    (texture = dhdr_tex_gl(k->texture))) {
             dhdr_tex_size(k->texture, &tw_texels, &th_texels, NULL);
             if (flags & 32u) key |= PROGRAM_BILINEAR;
-        } else {
+        }
+        if (!texture) {
+            if (flags & 1u) {   /* what is still missing, so the next round knows which to do */
+                if (k->convert >= 0) flat_convert++;
+                else if (k->texture_surface >= 0) flat_surface++;
+                else flat_other++;
+            }
+            key = PROGRAM_TEXELS;
             texture = dhdr_tex_dummy_texels();
+            tw_texels = th_texels = 1;
+            source_scale = 1;
             flags &= ~(1u | 2048u);
         }
         if (flags & 64u) key |= PROGRAM_ALPHA_TEST;
-        /* The scale word render.rs builds is target | source << 8 | min(source, target) << 16,
-           and the source scale is 1 for everything sampled here (a surface, which is the only
-           thing that carries another, is not sampled yet), so S and E are both one and the
-           shader's texel arithmetic folds away. */
-        uint32_t source_scale = 1;
+        /* The scale word render.rs builds: target | source << 8 | min(source, target) << 16.
+           The source scale is the sampled surface's, and 1 for a decoded texture or a
+           replacement; S and E both being 1 is what folds the shader's texel arithmetic away. */
         uint32_t resolution = source_scale < t->scale ? source_scale : t->scale;
         if (source_scale == 1 && resolution == 1) key |= PROGRAM_SCALE_ONE;
         if (!k->constants.wrap[0] && !k->constants.wrap[1]) key |= PROGRAM_WRAP_REPEAT;
@@ -1053,7 +1116,8 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
     int shown = p->movie_on ? scan_out_movie(n, p->movie_width, p->movie_height, p->movie) : scan_out(n, p);
     if (times) {
         t3 = phase_end(times);
-        report_times(t1 - t0, t3 - t2, t2 - t1, out->draws, program_changes, texture_binds);
+        report_times(t1 - t0, t3 - t2, t2 - t1, out->draws, program_changes, texture_binds,
+                     flat_convert, flat_surface, flat_other);
     }
     out->shown = shown != 0;
     out->display_width = n->display_width;
