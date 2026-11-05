@@ -1,0 +1,84 @@
+Downhill Revived on Nintendo Switch (homebrew, experimental)
+============================================================
+
+This is Downhill Domination running natively on the Switch, from the same portable game
+core as the PC build. It is homebrew: it needs a Switch that can run homebrew
+(Atmosphere), and it is not a Nintendo product.
+
+It contains none of the game. You bring your own disc image.
+
+
+What you need
+-------------
+
+* A Switch running Atmosphere, with the Homebrew Menu.
+* Your own dump of a Downhill Domination (USA) disc, as an .iso file.
+
+
+Installing
+----------
+
+1. Copy the whole switch/ folder of this archive onto your SD card, so that you have
+   sdmc:/switch/downhill-revived/dhd.nro
+2. Put your disc image beside it as game.iso, or name it in dhd.ini (the iso = line).
+3. Start the Homebrew Menu HOLDING R while you launch a game you own, not from the
+   Album. Then pick Downhill Revived.
+
+The last step matters. Started from the Album, homebrew gets a few hundred megabytes,
+and the game needs far more; it will tell you so on screen and exit.
+
+
+Settings
+--------
+
+dhd.ini, beside dhd.nro, has the settings and explains each one. The two that change
+the most:
+
+  scale = 1   the PlayStation 2's own resolution. A race holds a playable rate here.
+  scale = 2   twice as sharp, about half the rate. Better for the menus than a race.
+
+  DHD_SWITCH_CLOCKS = on   raises the CPU, GPU and memory clocks to the rates Horizon
+                           uses for its own boost modes. The game needs them. "max"
+                           goes a step further and runs hotter; "off" leaves the
+                           clocks alone, which is what to use if sys-clk manages this
+                           title, so the two do not fight.
+
+The game also has its own SETTINGS page in the menus.
+
+Raised clocks mean a warmer console and a shorter battery in handheld. That is the
+trade for a playable rate on this hardware.
+
+
+What works, and what does not
+-----------------------------
+
+Working: the game and its menus, the opening movies, sound, the pads, memory cards
+(saves go in a saves/ folder beside dhd.nro), and the rumble.
+
+Not working yet:
+  * Online play. It is off on the Switch, as it is on phones.
+  * Some effects still draw flat, where the renderer cannot yet give a draw its
+    texture.
+  * A race runs at roughly 40 to 46 fields a second at scale 1, not 60.
+
+There is no update check and no launcher: to update, replace dhd.nro.
+
+
+Where the files go
+------------------
+
+  sdmc:/switch/downhill-revived/dhd.nro     the game
+  sdmc:/switch/downhill-revived/dhd.ini     your settings
+  sdmc:/switch/downhill-revived/game.iso    your disc image
+  sdmc:/switch/downhill-revived/dhd.log     what the last run logged
+  sdmc:/switch/downhill-revived/saves/      memory cards
+
+If something goes wrong, dhd.log beside the .nro says what happened, and it is the
+thing to attach to a report.
+
+
+Licences
+--------
+
+LICENSE.txt is this project's. THIRD-PARTY-NOTICES.txt names the other work it is
+built with and their licences.
