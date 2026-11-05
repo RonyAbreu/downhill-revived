@@ -596,7 +596,18 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   340-546 a picture against about 50 in the menus, but the time does not follow the count (495
   draws in 38.8 ms against 52 in 41.0), so it is still pixels rather than calls. The game clock
   runs at about x0.75 there: the port slows the game rather than dropping input (finding 139).
-  A race at scale 1 has not been measured yet, and it is the next thing worth knowing. Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and
+  A race at scale 1 is a different matter: 40-46 fields/s with the game clock at x0.994-x0.998
+  and the sound clock at x0.999, so the race runs at real speed rather than the x0.75 slow
+  motion scale 2 falls into. The renderer is all but free there (3.3-4.1 ms a field, the draws
+  2.3-4.7 ms a picture for 300-576 draws), and the limit is `cpu:game` or `cpu:vu`, those two
+  being 18-24 ms each. **Scale 1 is the playable mode; scale 2 is for looking at.** Past this
+  needs finding 127's work on the VU and EE, not the renderer.
+- Open on hardware: the sound goes quiet when a race starts and stays quiet for the race, while
+  the sound clock says the mixer is still producing its 48,000 samples a second. So the mixer
+  runs and its voices have nothing in them, which points at the race's sound bank rather than
+  at starvation (which is what the same symptom was at three fields a second). Every way out of
+  `snd_bank_load` now says why it failed; three of them used to return quietly.
+  `DHD_SND_HOST_TRACE` and `DHD_SND_TRACE` are the two switches for the next run. Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and
   reapplied after dock/HOME/sleep, deferring to sys-clk; then profiling on hardware and the work
   of findings 107/112/127, plus NEON paths and thread placement over the four A57 cores. An
   overclocked Switch is about 0.6x the Unisoc T612 of findings 126/127 single-thread, 0.35x at

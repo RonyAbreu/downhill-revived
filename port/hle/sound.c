@@ -1299,18 +1299,27 @@ static uint32_t load_bank(uint32_t lsn)
     uint8_t *image;
     BankSlot *slot = NULL;
     int i;
-    if (!cdvd_read(lsn, 1, head))
+    /* Every way out of here is the game going quiet, so each one says so: a bank that does not
+       load leaves the mixer running at full rate over voices with nothing in them, which is
+       silence with nothing in the log to explain it. */
+    if (!cdvd_read(lsn, 1, head)) {
+        hle_log("989snd: the disc would not read the bank's first sector at LSN %u\n", lsn);
         return 0;
+    }
     if (memcmp(head + 0x18, "SBlk", 4) != 0) {
         hle_log("989snd: bank at LSN %u is not an SBlk bank\n", lsn);
         return 0;
     }
     size = rd32(head + 16) + rd32(head + 20);
-    if (size < 0x40 || size > 16u * 1024 * 1024)
+    if (size < 0x40 || size > 16u * 1024 * 1024) {
+        hle_log("989snd: bank at LSN %u says it is %u bytes\n", lsn, size);
         return 0;
+    }
     sectors = (size + 2047) / 2048;
     image = (uint8_t *)malloc(sectors * 2048);
     if (!image || !cdvd_read(lsn, sectors, image)) {
+        hle_log("989snd: the bank at LSN %u (%u sectors) would not %s\n", lsn, sectors,
+                image ? "read from the disc" : "fit in memory");
         free(image);
         return 0;
     }
