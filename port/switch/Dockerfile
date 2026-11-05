@@ -36,6 +36,10 @@ ENV WASI_SYSROOT=$DHD_DEVCACHES/wasi-sdk/wasi-sdk-${WASI_SDK}.0-x86_64-linux/sha
 # a Docker volume so it survives the container and lives on the engine's own disk rather than the
 # bind mount:  docker run -v dhd-objcache:/objcache ...
 # Without it every build recompiles all ~60 objects, vu0_interp.c alone taking about seven minutes.
+# libpng for the texture packs and the button icons (port/switch/png_switch.c): the other
+# targets decode PNG in Rust, which Horizon has none of.
+RUN dkp-pacman -S --noconfirm --needed switch-libpng
+
 ENV DHD_OBJCACHE_DIR=/objcache
 VOLUME /objcache
 
