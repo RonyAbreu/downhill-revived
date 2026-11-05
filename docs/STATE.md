@@ -525,7 +525,7 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   one flat block committed on demand (`svcSetMemoryPermission`), taken from the heap's start when
   needed, not one 2 GiB reservation; wasm2c bounds checks replace the guard pages, and
   `DHD_DEFER_READS=0` makes GS reads synchronous. `dhd.log` is written from main's start.
-- **NX2, picture (steps 1 and 2 done, step 3 open).** Step 1: `render_gl.c` makes an OpenGL 4.3 core
+- **NX2, picture (steps 1-3 done bar surface sampling).** Step 1: `render_gl.c` makes an OpenGL 4.3 core
   context (Mesa nouveau over SDL's EGL window, devkitPro's glad) and is the device, the exact
   renderer and presentation — the movies and the CPU scanout show, 4:3 in the middle of the
   screen; `DHDR_WINDOW_SWITCH` (7) is the window kind. `render_native.c` then reimplements the
@@ -537,9 +537,14 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   Rust renderer's `shared.rs`), made as a CPU copy on whichever thread asks for it and uploaded
   the first time the render thread samples it, with a dead list drained between pictures; the
   fragment shader gained `native.wgsl`'s texel fetch, replacement sample and TFX combine, in two
-  compilations (texels and sampled) because GL has no specialisation constants. Step 3 is left:
-  the depth test, blending, the texture copies, sampling a surface or a conversion, and the Z
-  probe; a draw that would sample a surface still comes out flat. PNG is still a refusal
+  compilations (texels and sampled) because GL has no specialisation constants. Step 3 adds the depth test and
+  blending as `pipelines.rs`'s key describes them: the Z surface is attached to the colour
+  surface's framebuffer, the vertex stage maps WebGPU's [0, 1] clip Z onto OpenGL's [-1, 1]
+  (`glClipControl` is core only in 4.5), a new depth surface clears to zero because the GS tests
+  GREATER against it, and a draw blending on As is split in two, since this device offers no
+  dual-source blending. Left: sampling a surface or a conversion (such a draw still comes out
+  flat), the texture copies, the Z probe, and the reversed triangle order the alpha pass of a
+  GREATER-with-writes draw wants. PNG is still a refusal
   (`render_stubs.c`), so texture packs and the button icons do not load; the sharp font, which
   is no PNG, does.
 - **NX3, speed (open).** Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and

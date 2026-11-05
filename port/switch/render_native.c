@@ -7,13 +7,20 @@
    the picture it builds) stays portable C (native_core.inc, gpu_rust_native.inc,
    gpu_rust_shared.inc), unchanged on every target.
 
-   What steps 1 and 2 draw: every DHDR_CMD_DRAW, with its vertex colour, fog, alpha test and —
-   step 2 — its texture: a decoded texture (textures.c's R32UI words, fetched by the shader's
-   texel path, native.wgsl's native_pixel_u) or a replacement, a texture pack's or the sharp
-   font's (RGBA8 mips through one of the eight samplers, native_pixel). A draw that samples a
-   surface or a conversion instead (texture_surface, convert) keeps step 1's flat colour: the
-   host clears its texture bit. Still missing, all step 3: the depth test, blending, the texture
-   copies (DHDR_CMD_COPY, IMPORT and ALPHA_UPLOAD are no-ops) and render-target sampling.
+   What it draws: every DHDR_CMD_DRAW, with its vertex colour, fog, alpha test and — step 2 —
+   its texture: a decoded texture (textures.c's R32UI words, fetched by the shader's texel path,
+   native.wgsl's native_pixel_u) or a replacement, a texture pack's or the sharp font's (RGBA8
+   mips through one of the eight samplers, native_pixel). Step 3 adds the depth test and
+   blending, as pipelines.rs's key describes them: the Z surface is attached to the colour
+   surface's framebuffer, and a draw that blends on As is split in two (the colour with As / 128
+   as its source alpha, then the alpha channel alone, unblended), because this device offers no
+   dual-source blending.
+
+   Still missing: sampling a surface or a conversion (texture_surface, convert) — such a draw
+   loses its texture bit and comes out flat, as every textured draw did in step 1 — the texture
+   copies (DHDR_CMD_COPY, IMPORT and ALPHA_UPLOAD are no-ops), the Z probe of finding 097, and
+   the reversed triangle order the alpha pass of a GREATER-with-writes draw wants.
+
    Scanout and present are exact (native.wgsl's native_scanout, in a compute shader, and the same
    windowed quad render_gl.c's exact present uses), so the picture is in the right place and the
    right shape.
@@ -42,7 +49,9 @@ typedef struct NativeSurface {
     GLuint texture, fbo;
     uint32_t width, height;    /* scaled pixels, as dhdr_native_surface's w, h */
     uint32_t scale;            /* the resolution scale this surface's texture is at */
-    int depth;                 /* a depth surface (GL_DEPTH_COMPONENT32F): never drawn into here */
+    int depth;                 /* a depth surface (GL_DEPTH_COMPONENT32F): the Z of the draws into
+                                  a colour surface, attached to that surface's framebuffer */
+    GLuint depth_attached;     /* the depth texture on this colour surface's framebuffer, or 0 */
 } NativeSurface;
 
 /* One draw pipeline and its uniforms (native.wgsl's Native block, which GL has as loose
@@ -52,13 +61,13 @@ typedef struct NativeSurface {
 typedef struct DrawProgram {
     GLuint id;
     GLint u_target_size, u_flags, u_scale, u_atst, u_aref, u_fog;
-    GLint u_alpha_scale, u_texa_alpha, u_tex_offset, u_tex_size, u_wrap, u_region;
+    GLint u_alpha_scale, u_texa_alpha, u_tex_offset, u_tex_size, u_wrap, u_region, u_alpha_div;
     /* What the program already holds. A GS picture is thousands of draws whose state mostly
        repeats, and a uniform the program already has is a driver call for nothing; `held` says
        the fields below are what was last sent to this program (uniforms are per program, so
        each has its own copy). */
     int held;
-    float h_target[2], h_fog[4], h_alpha_scale, h_texa_alpha;
+    float h_target[2], h_fog[4], h_alpha_scale, h_texa_alpha, h_alpha_div;
     uint32_t h_flags, h_scale, h_atst, h_aref, h_tex_size[2], h_wrap[2], h_region[4];
     int32_t h_tex_offset[2];
 } DrawProgram;
@@ -98,7 +107,11 @@ static const char *native_vertex_source =
     "    if ((flags & 1024u) != 0u && (nscale & 255u) > 1u) {\n"
     "        position = vec3(ceil(position.xy - 0.5), position.z);\n"
     "    }\n"
-    "    gl_Position = vec4(position.xy / target_size * vec2(2.0, -2.0) + vec2(-1.0, 1.0), position.z, 1.0);\n"
+    /* WebGPU's clip space has z in [0, 1] and OpenGL's in [-1, 1], and the GS Z the picture
+       carries is WebGPU's. glClipControl would say so, but it is core only in 4.5, so the vertex
+       stage maps it: the window depth GL works back to, 0.5 * (2z - 1) + 0.5, is z again. */
+    "    gl_Position = vec4(position.xy / target_size * vec2(2.0, -2.0) + vec2(-1.0, 1.0),\n"
+    "                       position.z * 2.0 - 1.0, 1.0);\n"
     "    v_stqf = stqf;\n"
     "    v_color = vec4(color_in);\n"
     "}\n";
@@ -126,6 +139,10 @@ static const char *native_fragment_source =
     "uniform uint aref;\n"
     "uniform vec4 fog;\n"
     "uniform uint nscale;\n"
+    /* 255 for native_pixel, 128 for native_pixel_blend (the RGB pass of a draw that blends on As
+       where there is no dual-source blending): the only difference between the two entry points,
+       so a uniform rather than a third compilation. */
+    "uniform float alpha_div;\n"
     "uniform float alpha_scale;\n"
     "uniform float texa_alpha;\n"
     "uniform ivec2 tex_offset;\n"
@@ -242,7 +259,7 @@ static const char *native_fragment_source =
     "#endif\n"
     "    }\n"
     "    vec4 color = combine(t);\n"
-    "    frag_color = vec4(color.rgb / 255.0, clamp(color.a / 255.0, 0.0, 1.0));\n"
+    "    frag_color = vec4(color.rgb / 255.0, clamp(color.a / alpha_div, 0.0, 1.0));\n"
     "}\n";
 
 /* native_scanout (native.wgsl), the exact (non-"fast") form: da = display[0..3] (psm, bw, scale
@@ -373,6 +390,7 @@ static int find_draw_uniforms(DrawProgram *d, const char *sampler_name, GLint un
     d->u_tex_size = glGetUniformLocation(d->id, "tex_size");
     d->u_wrap = glGetUniformLocation(d->id, "wrap");
     d->u_region = glGetUniformLocation(d->id, "region");
+    d->u_alpha_div = glGetUniformLocation(d->id, "alpha_div");
     glUseProgram(d->id);
     glUniform1i(glGetUniformLocation(d->id, sampler_name), unit);
     return 1;
@@ -406,8 +424,8 @@ static int ensure_gl_objects(DhdrNative *n)
     glEnableVertexAttribArray(2);
     glVertexAttribIPointer(2, 4, GL_UNSIGNED_BYTE, sizeof(DhdrVertex), (void *)offsetof(DhdrVertex, rgba));
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, n->ibo);
-    fprintf(stderr, "gs native: GL native renderer ready (step 2: textured geometry; no depth, "
-                    "no blending, no render-target sampling yet)\n");
+    fprintf(stderr, "gs native: GL native renderer ready (step 3: textures, depth and blending; "
+                    "no render-target sampling, no texture copies yet)\n");
     n->ready = 1;
     return 1;
 }
@@ -472,7 +490,9 @@ int dhdr_native_surface(DhdrNative *n, uint32_t index, uint32_t scale, uint32_t 
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, depth ? GL_DEPTH_ATTACHMENT : GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
     if (!depth) { glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT); }
-    else { glClearDepthf(1.0f); glClear(GL_DEPTH_BUFFER_BIT); }
+    /* zero, not one: dhd_render.h gives a new surface zero texels, and the GS tests GREATER
+       against them, which a one would reject every draw against. */
+    else { glDepthMask(GL_TRUE); glClearDepthf(0.0f); glClear(GL_DEPTH_BUFFER_BIT); }
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         fprintf(stderr, "gs native: surface %u's framebuffer is incomplete (%u x %u)\n", index, nw, nh);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -491,6 +511,7 @@ int dhdr_native_surface(DhdrNative *n, uint32_t index, uint32_t scale, uint32_t 
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     s->texture = texture; s->fbo = fbo; s->width = nw; s->height = nh; s->scale = scale ? scale : 1; s->depth = depth != 0;
+    s->depth_attached = 0;   /* a new framebuffer carries none of the old one's attachments */
     size_out[0] = nw; size_out[1] = nh;
     return 1;
 }
@@ -568,6 +589,120 @@ static void ensure_buffer(GLenum target, GLuint buffer, size_t *capacity, size_t
     }
 }
 
+/* ---- depth and blending (pipelines.rs's key, as GL state) ---- */
+
+/* A draw's depth state: pipelines.rs's 5-bit depth field read back out. `on` is its attachment
+   bit; the GS function numbers are 0 never, 1 always, 2 gequal, 3 greater, 4 equal (5-7 always),
+   which is what depth_compare maps. */
+typedef struct DepthState { int on, write; uint32_t function; } DepthState;
+typedef struct BlendState { int on; GLenum src, dst, op; } BlendState;
+
+static GLenum depth_func(uint32_t function)
+{
+    switch (function) {
+    case 0: return GL_NEVER;
+    case 2: return GL_GEQUAL;
+    case 3: return GL_GREATER;
+    case 4: return GL_EQUAL;
+    default: return GL_ALWAYS;
+    }
+}
+
+/* D3D11's blend factor numbers, the ones the GS blend uses (pipelines.rs's blend_factor); every
+   other number is One there too. Without dual-source blending SRC_ALPHA and INV_SRC_ALPHA are the
+   plain source alpha, which is why a draw blending on As is split into two. */
+static GLenum blend_factor(uint32_t d3d)
+{
+    switch (d3d) {
+    case 1: return GL_ZERO;
+    case 2: return GL_ONE;
+    case 5: return GL_SRC_ALPHA;
+    case 6: return GL_ONE_MINUS_SRC_ALPHA;
+    case 7: return GL_DST_ALPHA;
+    case 8: return GL_ONE_MINUS_DST_ALPHA;
+    case 14: return GL_CONSTANT_COLOR;
+    case 15: return GL_ONE_MINUS_CONSTANT_COLOR;
+    default: return GL_ONE;
+    }
+}
+
+/* D3D11's operation numbers (pipelines.rs's blend_operation); 6 and 7 have no pipeline there, and
+   0 is wgpu-native's default, Add. 0 back: the draw is skipped, as the Rust renderer skips it. */
+static GLenum blend_op(uint32_t d3d)
+{
+    switch (d3d) {
+    case 0: case 1: return GL_FUNC_ADD;
+    case 2: return GL_FUNC_SUBTRACT;
+    case 3: return GL_FUNC_REVERSE_SUBTRACT;
+    case 4: return GL_MIN;
+    case 5: return GL_MAX;
+    default: return 0;
+    }
+}
+
+enum { BLEND_SA = 5, BLEND_ISA = 6 };   /* D3D11_BLEND_SRC_ALPHA, _INV_SRC_ALPHA (render.rs) */
+
+static void set_depth(DepthState *held, DepthState want)
+{
+    if (held->on != want.on) {
+        if (want.on) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+        held->on = want.on;
+        held->function = 0xFFFFFFFFu;   /* the func is only meaningful while the test is on */
+    }
+    if (want.on && held->function != want.function) {
+        glDepthFunc(depth_func(want.function));
+        held->function = want.function;
+    }
+    if (held->write != want.write) {
+        glDepthMask(want.write ? GL_TRUE : GL_FALSE);
+        held->write = want.write;
+    }
+}
+
+static void set_mask(uint32_t *held, uint32_t mask)
+{
+    if (*held == mask) return;
+    glColorMask((mask & 1) != 0, (mask & 2) != 0, (mask & 4) != 0, (mask & 8) != 0);
+    *held = mask;
+}
+
+/* 255 is native_pixel's divisor, 128 native_pixel_blend's. A DrawProgram is zeroed when it is
+   made, and neither value is zero, so the first call always sends it. */
+static void set_alpha_div(DrawProgram *d, float div)
+{
+    if (d->h_alpha_div == div) return;
+    glUniform1f(d->u_alpha_div, div);
+    d->h_alpha_div = div;
+}
+
+static void issue(const uint32_t *indices, uint32_t index_count, uint32_t first, uint32_t count)
+{
+    if (indices && index_count)
+        glDrawElements(GL_TRIANGLES, (GLsizei)count, GL_UNSIGNED_INT,
+                       (const void *)(uintptr_t)((size_t)first * sizeof(uint32_t)));
+    else
+        glDrawArrays(GL_TRIANGLES, (GLint)first, (GLsizei)count);
+}
+
+static void set_blend(BlendState *held, BlendState want)
+{
+    if (held->on != want.on) {
+        if (want.on) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+        held->on = want.on;
+    }
+    if (!want.on) return;
+    if (held->src != want.src || held->dst != want.dst) {
+        /* The colour blend is the draw's; the alpha channel is written as it comes (One, Zero,
+           Add), as pipelines.rs builds every BlendState. */
+        glBlendFuncSeparate(want.src, want.dst, GL_ONE, GL_ZERO);
+        held->src = want.src; held->dst = want.dst;
+    }
+    if (held->op != want.op) {
+        glBlendEquationSeparate(want.op, GL_FUNC_ADD);
+        held->op = want.op;
+    }
+}
+
 /* DHD_GL_TIMES: where the render thread's time goes, which the perf lines cannot say (they see
    one `render` thread). 1 times the CPU side of each phase, 2 puts a glFinish between the phases
    so the GPU's own time lands in the phase that caused it (much slower; for one measurement, not
@@ -580,7 +715,9 @@ static int gl_times(void)
 {
     static int level = -1;
     if (level < 0) {
-        const char *s = SDL_getenv("DHD_GL_TIMES");
+        /* getenv, not SDL_getenv: dhd.ini reaches the process environment through
+           host_putenv_s after SDL took its own copy, so SDL_getenv would never see it. */
+        const char *s = getenv("DHD_GL_TIMES");
         level = s ? atoi(s) : 0;
     }
     return level;
@@ -635,14 +772,19 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, (GLsizeiptr)((size_t)index_count * sizeof(uint32_t)), indices);
     }
     glBindVertexArray(n->vao);
-    glDisable(GL_DEPTH_TEST);   /* depth, blending: step 3 */
-    glDisable(GL_BLEND);
     glEnable(GL_SCISSOR_TEST);
     glActiveTexture(GL_TEXTURE0);
     GLint bound_fbo = -1;
     GLuint bound_program = 0, bound_texture = 0, bound_sampler = 0;
     uint32_t held_mask = 16;                      /* no colour mask sent yet (a mask is 0..15) */
     int32_t held_scissor[4] = { -1, -1, -1, -1 }; /* nor a scissor (its values are never negative) */
+    DepthState held_depth = { 0, 0, 0 };          /* the test off, as set right below */
+    BlendState held_blend = { 0, 0, 0, 0 };
+    uint32_t held_fix = 0xFFFFFFFFu;              /* no blend constant sent yet */
+    int held_fix_set = 0;
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_BLEND);
     for (uint32_t i = 0; i < p->command_count; i++) {
         const DhdrCommand *k = &p->commands[i];
         if (k->kind != DHDR_CMD_DRAW || !k->count) continue;   /* COPY, IMPORT, ALPHA_UPLOAD: step 3 */
@@ -654,6 +796,19 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
             glViewport(0, 0, (GLsizei)t->width, (GLsizei)t->height);
             bound_fbo = (GLint)t->fbo;
         }
+        /* The Z this draw tests against (depth_key bit 3 says it has one, native_core.inc), as
+           this colour surface's depth attachment. A colour surface keeps the one it was last
+           given, so a run of draws sharing a Z attaches it once. */
+        NativeSurface *z = NULL;
+        if (k->depth >= 0 && (uint32_t)k->depth < DHDR_NATIVE_SURFACE_COUNT && (k->depth_key & 8)) {
+            NativeSurface *d = &n->surfaces[k->depth];
+            if (d->texture && d->depth) z = d;
+        }
+        GLuint want_z = z ? z->texture : 0;
+        if (t->depth_attached != want_z) {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, want_z, 0);
+            t->depth_attached = want_z;
+        }
         uint32_t target_scale = t->scale;
         int32_t left = clampi(k->scissor[0] * (int32_t)target_scale, 0, (int32_t)t->width);
         int32_t top = clampi(k->scissor[1] * (int32_t)target_scale, 0, (int32_t)t->height);
@@ -664,11 +819,6 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
         if (memcmp(held_scissor, cut, sizeof cut)) {
             glScissor(cut[0], cut[1], cut[2], cut[3]);
             memcpy(held_scissor, cut, sizeof cut);
-        }
-        if (held_mask != (uint32_t)k->color_mask) {
-            glColorMask((k->color_mask & 1) != 0, (k->color_mask & 2) != 0, (k->color_mask & 4) != 0,
-                        (k->color_mask & 8) != 0);
-            held_mask = k->color_mask;
         }
         /* The texture this draw samples, and with it the pipeline. A replacement (flag 2048) is
            sampled through one of the eight samplers; a decoded texture is fetched texel by texel.
@@ -753,13 +903,56 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
             memcpy(w->h_region, k->constants.region, sizeof w->h_region);
         }
         w->held = 1;
-        if (indices && index_count) {
-            glDrawElements(GL_TRIANGLES, (GLsizei)k->count, GL_UNSIGNED_INT,
-                           (const void *)(uintptr_t)((size_t)k->first * sizeof(uint32_t)));
-        } else {
-            glDrawArrays(GL_TRIANGLES, (GLint)k->first, (GLsizei)k->count);
+        /* The depth test and the blend (pipelines.rs's key), then the draw — one, or the two
+           render.rs splits a blend on As into where there is no dual-source blending, which this
+           device has none of (dhdr_device_features offers none). */
+        uint32_t blend_key = k->blend_key;
+        uint32_t src = blend_key >> 1 & 31, dst = blend_key >> 6 & 31;
+        int blends = (blend_key & 1) != 0;
+        GLenum op = blends ? blend_op(blend_key >> 11 & 7) : GL_FUNC_ADD;
+        if (blends && !op) continue;   /* operations 6 and 7 have no pipeline in the Rust path either */
+        int uses_as = blends && (src == BLEND_SA || src == BLEND_ISA || dst == BLEND_SA || dst == BLEND_ISA);
+        DepthState zs = { z != NULL, z && (k->depth_key & 4), (uint32_t)(k->depth_key & 3) };
+        BlendState bs = { blends, blend_factor(src), blend_factor(dst), op };
+        if (blends && (src == 14 || src == 15 || dst == 14 || dst == 15) &&
+            (!held_fix_set || held_fix != k->blend_fix)) {
+            float fix = (float)k->blend_fix / 128.0f;   /* all four channels (render.rs set_state) */
+            glBlendColor(fix, fix, fix, fix);
+            held_fix = k->blend_fix;
+            held_fix_set = 1;
         }
-        out->draws++;
+        if (!uses_as) {
+            set_depth(&held_depth, zs);
+            set_blend(&held_blend, bs);
+            set_mask(&held_mask, k->color_mask);
+            set_alpha_div(d, 255.0f);
+            issue(indices, index_count, k->first, k->count);
+            out->draws++;
+        } else {
+            if (k->color_mask & 7) {   /* the colour, blended, with As / 128 as its source alpha */
+                set_depth(&held_depth, zs);
+                set_blend(&held_blend, bs);
+                set_mask(&held_mask, (uint32_t)k->color_mask & 7);
+                set_alpha_div(d, 128.0f);
+                issue(indices, index_count, k->first, k->count);
+                out->draws++;
+            }
+            if (k->color_mask & 8) {   /* then the alpha channel alone, unblended */
+                /* No write, and EQUAL where the first pass wrote Z. render.rs also reverses the
+                   triangle order for GREATER with writes, so a later triangle at an equal Z loses
+                   as it did in the first pass; that is not done here yet. */
+                DepthState second = { z != NULL, 0,
+                                      z ? ((k->depth_key & 4) ? 4u : (uint32_t)(k->depth_key & 3)) : 0u };
+                BlendState none = { 0, GL_ONE, GL_ZERO, GL_FUNC_ADD };
+                set_depth(&held_depth, second);
+                set_blend(&held_blend, none);
+                set_mask(&held_mask, 8);
+                set_alpha_div(d, 255.0f);
+                issue(indices, index_count, k->first, k->count);
+                out->draws++;
+                out->two_pass_draws++;
+            }
+        }
     }
     glBindSampler(0, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
