@@ -145,11 +145,15 @@ void switch_clocks_stop(void)
    core could have done, so some spreading was happening, but 3 ms more than the heaviest thread
    alone, which is what queueing costs.
 
-   The layout, over the cores the process is actually allowed (svcGetInfo's CoreMask):
-   vu and gs get one each, game and render share the first, and everything the port does not
-   name -- the main thread, SDL's audio -- stays where Horizon put it. With fewer than three
-   cores nothing is pinned: putting vu and gs together would be worse than the scheduler's own
-   choice. dhd.ini's DHD_SWITCH_CORES = off turns it off. */
+   The layout, over the cores the process is actually allowed (svcGetInfo's CoreMask): the
+   render thread gets one to itself, vu gets one, and gs and game share the third. Render is the
+   one whose cost moves with the resolution -- 3.3 ms a field at scale 1 and 35.5 at scale 2 --
+   so it is the one that must not share; the first attempt paired it with game and made that
+   core the whole field at scale 2 (35.5 + 6.7 against a 41.3 ms field). The other three barely
+   move with the resolution, and gs and game together, about 17 ms, sit beside vu's 17 to 18.
+   Everything the port does not name -- the main thread, SDL's audio -- stays where Horizon put
+   it. With fewer than three cores nothing is pinned: doubling up the heavy threads would be
+   worse than the scheduler's own choice. dhd.ini's DHD_SWITCH_CORES = off turns it off. */
 
 static int core_list(int *cores, int max)
 {
@@ -173,9 +177,9 @@ void switch_thread_core(const char *name)
     }
     if (off || count < 3 || !name) return;
     int core;
-    if (!strcmp(name, "vu")) core = cores[1];
-    else if (!strcmp(name, "gs")) core = cores[2];
-    else if (!strcmp(name, "game") || !strcmp(name, "render")) core = cores[0];
+    if (!strcmp(name, "render")) core = cores[0];
+    else if (!strcmp(name, "vu")) core = cores[1];
+    else if (!strcmp(name, "gs") || !strcmp(name, "game")) core = cores[2];
     else return;   /* the main thread, SDL's audio and anything else: left alone */
     if (R_FAILED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core))) {
         fprintf(stderr, "switch: the %s thread would not move to core %d\n", name, core);

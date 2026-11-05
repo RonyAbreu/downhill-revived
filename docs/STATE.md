@@ -581,7 +581,13 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   is the work. The one Switch lever still untried is thread placement, since Horizon starts
   every thread on the process's default core (`switch_thread_core` in clocks.c); a field at
   21.4 ms against a heaviest thread of 18.2 ms is the queueing that costs, so the ceiling it can
-  reach is about 55 fields/s. Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and
+  reach is about 55 fields/s. The process gets three cores (`switch: 3 cores for this process`).
+  Scale 2 is a different picture: the render thread is 35.5 ms a field there and is the limit,
+  so it has a core to itself and gs and game share the third.
+- Where the two scales stand on hardware (menus, clocks at `max`): scale 1 about 47 fields/s and
+  playable, limited by the VU thread; scale 2 about 24, limited by the render thread, with the
+  draws 40-43 ms a picture against 1-12 at scale 1 -- four times the pixels for about four times
+  the cost, so scale 2 is fill-bound and will not reach 60 on this GPU. Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and
   reapplied after dock/HOME/sleep, deferring to sys-clk; then profiling on hardware and the work
   of findings 107/112/127, plus NEON paths and thread placement over the four A57 cores. An
   overclocked Switch is about 0.6x the Unisoc T612 of findings 126/127 single-thread, 0.35x at

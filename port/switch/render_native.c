@@ -69,7 +69,8 @@ typedef struct NativeSurface {
    depth rejection for the draws that have no alpha test at all. */
 enum {
     PROGRAM_TEXELS = 1, PROGRAM_BILINEAR = 2, PROGRAM_ALPHA_TEST = 4, PROGRAM_SCALE_ONE = 8,
-    PROGRAM_COUNT = 16
+    PROGRAM_WRAP_REPEAT = 16,
+    PROGRAM_COUNT = 32
 };
 
 typedef struct DrawProgram {
@@ -172,13 +173,22 @@ static const char *native_fragment_source =
     "#else\n"
     "uniform sampler2D native_texture;\n"
     "#endif\n"
-    /* CLAMP modes: repeat, clamp, region clamp, region repeat (MINU the mask, MAXU the fix). */
+    /* CLAMP modes: repeat, clamp, region clamp, region repeat (MINU the mask, MAXU the fix).
+       WRAP_REPEAT is both axes on plain repeat, which most draws are: texel_xy calls this twice
+       and a bilinear fetch calls texel_xy four times, so the three compares cost eight branches
+       a pixel for a mode that never changes within a draw. */
+    "#ifdef WRAP_REPEAT\n"
+    "uint wrap_coordinate(int c, uint mode, uint size, uint low, uint high) {\n"
+    "    return uint(c) & (size - 1u);\n"
+    "}\n"
+    "#else\n"
     "uint wrap_coordinate(int c, uint mode, uint size, uint low, uint high) {\n"
     "    if (mode == 0u) return uint(c) & (size - 1u);\n"
     "    if (mode == 1u) return uint(clamp(c, 0, int(size) - 1));\n"
     "    if (mode == 2u) return uint(clamp(c, int(low), int(high)));\n"
     "    return (uint(c) & low) | high;\n"
     "}\n"
+    "#endif\n"
     /* The texture pixel holding GS texel c (S the texture's scale, E the draw's).
 
        SCALE_ONE is S == E == 1, which is every draw that reads a decoded texture or a
@@ -453,12 +463,13 @@ static DrawProgram *draw_program(DhdrNative *n, unsigned key)
     DrawProgram *d = &n->programs[key & (PROGRAM_COUNT - 1)];
     if (d->tried) return d->id ? d : NULL;
     d->tried = 1;
-    char defines[160];
-    snprintf(defines, sizeof defines, "#version 430 core\n%s%s%s%s",
+    char defines[200];
+    snprintf(defines, sizeof defines, "#version 430 core\n%s%s%s%s%s",
              (key & PROGRAM_TEXELS) ? "#define TEXELS 1\n" : "",
              (key & PROGRAM_BILINEAR) ? "#define BILINEAR 1\n" : "",
              (key & PROGRAM_ALPHA_TEST) ? "#define ALPHA_TEST 1\n" : "",
-             (key & PROGRAM_SCALE_ONE) ? "#define SCALE_ONE 1\n" : "");
+             (key & PROGRAM_SCALE_ONE) ? "#define SCALE_ONE 1\n" : "",
+             (key & PROGRAM_WRAP_REPEAT) ? "#define WRAP_REPEAT 1\n" : "");
     d->id = link_program(native_vertex_source, defines, native_fragment_source, NULL);
     if (!d->id) return NULL;
     find_draw_uniforms(d, (key & PROGRAM_TEXELS) ? "native_texels" : "native_texture", 0);
@@ -913,6 +924,7 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
         uint32_t source_scale = 1;
         uint32_t resolution = source_scale < t->scale ? source_scale : t->scale;
         if (source_scale == 1 && resolution == 1) key |= PROGRAM_SCALE_ONE;
+        if (!k->constants.wrap[0] && !k->constants.wrap[1]) key |= PROGRAM_WRAP_REPEAT;
         DrawProgram *d = draw_program(n, key);
         if (!d) continue;
         if (d->u_texels_size >= 0 &&
