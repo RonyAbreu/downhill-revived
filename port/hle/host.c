@@ -632,7 +632,8 @@ void host_thread_name(const char *name)
 #elif defined(__APPLE__)
     pthread_setname_np(name);  /* the calling thread's own */
 #elif defined(__SWITCH__)
-    /* libnx's threads have no names */
+    /* libnx's threads have no names; the name is what picks the core (port/switch/clocks.c) */
+    { void switch_thread_core(const char *name); switch_thread_core(name); }
 #else
     /* Linux and Android: the main thread's name is the process's own (ps, top, pgrep, a desktop's
        system monitor), so that thread keeps "dhd" (a crash report then says thread dhd) */

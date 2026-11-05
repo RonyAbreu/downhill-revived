@@ -135,3 +135,51 @@ void switch_clocks_stop(void)
     if (g_legacy) pcvExit(); else clkrstExit();
     fprintf(stderr, "switch: the clocks are back as they were\n");
 }
+
+/* ---- which core each of the port's threads runs on (finding 144, NX3) ----
+
+   Horizon starts every thread on the process's default core, so the game, VU, GS and render
+   threads queue behind one another on one of the three an application may use. The measurement
+   that prompted this, scale 1 with the clocks raised: a field took 21.4 ms while the threads'
+   own busy times were 5.3 (game), 18.2 (vu), 12.1 (gs) and 3.3 (render) -- more work than one
+   core could have done, so some spreading was happening, but 3 ms more than the heaviest thread
+   alone, which is what queueing costs.
+
+   The layout, over the cores the process is actually allowed (svcGetInfo's CoreMask):
+   vu and gs get one each, game and render share the first, and everything the port does not
+   name -- the main thread, SDL's audio -- stays where Horizon put it. With fewer than three
+   cores nothing is pinned: putting vu and gs together would be worse than the scheduler's own
+   choice. dhd.ini's DHD_SWITCH_CORES = off turns it off. */
+
+static int core_list(int *cores, int max)
+{
+    uint64_t mask = 0;
+    if (R_FAILED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0))) return 0;
+    int n = 0;
+    for (int i = 0; i < 64 && n < max; i++)
+        if (mask & (1ull << i)) cores[n++] = i;
+    return n;
+}
+
+void switch_thread_core(const char *name)
+{
+    static int cores[8], count = -1, off;
+    if (count < 0) {
+        const char *want = getenv("DHD_SWITCH_CORES");
+        off = want && (!strcasecmp(want, "off") || !strcmp(want, "0"));
+        count = core_list(cores, 8);
+        fprintf(stderr, "switch: %d core%s for this process%s\n", count, count == 1 ? "" : "s",
+                off ? " (DHD_SWITCH_CORES = off: the threads stay where Horizon put them)" : "");
+    }
+    if (off || count < 3 || !name) return;
+    int core;
+    if (!strcmp(name, "vu")) core = cores[1];
+    else if (!strcmp(name, "gs")) core = cores[2];
+    else if (!strcmp(name, "game") || !strcmp(name, "render")) core = cores[0];
+    else return;   /* the main thread, SDL's audio and anything else: left alone */
+    if (R_FAILED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core))) {
+        fprintf(stderr, "switch: the %s thread would not move to core %d\n", name, core);
+        return;
+    }
+    fprintf(stderr, "switch: the %s thread runs on core %d\n", name, core);
+}

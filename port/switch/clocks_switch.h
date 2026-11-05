@@ -1,4 +1,5 @@
-/* The Switch's CPU, GPU and memory clocks (clocks.c, finding 144 NX3), for switch_main.c. */
+/* The Switch's performance knobs (clocks.c, finding 144 NX3): the CPU, GPU and memory clocks
+   for switch_main.c, and the core each of the port's threads runs on. */
 #ifndef SWITCH_CLOCKS_H
 #define SWITCH_CLOCKS_H
 
@@ -9,5 +10,12 @@ void switch_clocks_start(const char *mode);
 
 /* Puts the clocks back as they were. Safe when start did nothing. */
 void switch_clocks_stop(void);
+
+/* Pins the CALLING thread to a core, by the name it just gave itself (host_thread_name:
+   "game", "vu", "gs", "render", ...). Horizon leaves every thread on the process's default
+   core, so the heavy ones queue behind each other; this spreads them. A name it does not
+   know, fewer than three cores to spread over, or DHD_SWITCH_CORES = off, and it does
+   nothing. */
+void switch_thread_core(const char *name);
 
 #endif

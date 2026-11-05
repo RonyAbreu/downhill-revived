@@ -568,7 +568,20 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   and sleep each put them back and there is no one event for the three, so a thread writes them
   again every two seconds; the originals are restored at exit. `DHD_SWITCH_CLOCKS = off` leaves
   every clock alone, which is also what to use under sys-clk so the two do not fight.
-- **NX3, the rest (open).** Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and
+- **NX3, the fragment stage (done, and the limit moved).** `texel_xy` did two integer divisions
+  a texel, and a GPU has no integer divide, so a bilinear fetch paid eight long sequences per
+  pixel; every draw here has S = E = 1, so `PROGRAM_SCALE_ONE` compiles them away. Measured on
+  hardware at scale 1 with the clocks raised, the same menus: `draws` went from 107 ms to
+  **1.2 ms** and the render thread's busy time from ~70 to **3.3 ms** a field. The limit is now
+  `cpu:vu` at **46.8 fields/s**, with the VU thread 18.2 ms busy against a 16.7 ms budget.
+  Together with the clocks, scale 1 is playable and scale 2 is not yet.
+- **NX3, the rest (open).** The VU thread is the limit, and at 18.2 ms on a 1785 MHz A57 it is
+  about what finding 127 measured on a T612 (13-14 ms), so it is not a Switch-specific fault:
+  `native_geometry_loop` and `native_clip_run` are the costs, and finding 127's "what is left"
+  is the work. The one Switch lever still untried is thread placement, since Horizon starts
+  every thread on the process's default core (`switch_thread_core` in clocks.c); a field at
+  21.4 ms against a heaviest thread of 18.2 ms is the queueing that costs, so the ceiling it can
+  reach is about 55 fields/s. Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and
   reapplied after dock/HOME/sleep, deferring to sys-clk; then profiling on hardware and the work
   of findings 107/112/127, plus NEON paths and thread placement over the four A57 cores. An
   overclocked Switch is about 0.6x the Unisoc T612 of findings 126/127 single-thread, 0.35x at
