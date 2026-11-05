@@ -560,6 +560,14 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   first use) in place of the specialisation constants WebGPU gives the Rust path — a point
   sampled draw no longer carries three extra fetches, and a draw with no alpha test no longer
   carries a `discard` that costs every pixel its early depth rejection.
+- **NX3, the clocks (done).** Horizon hands a homebrew the handheld defaults -- CPU 1020 MHz,
+  GPU 307.2 MHz, EMC 1331.2 MHz -- and nothing raised them, which is the ~150 Mpixel/s of
+  effective fill the measurement above works out to. `port/switch/clocks.c` raises them through
+  clkrst (pcv before 8.0.0) to the rates Horizon uses for its own boost modes, not past stock:
+  CPU 1785, GPU 768 (921.6 with `DHD_SWITCH_CLOCKS = max`), EMC 1600 MHz. Docking, the HOME menu
+  and sleep each put them back and there is no one event for the three, so a thread writes them
+  again every two seconds; the originals are restored at exit. `DHD_SWITCH_CLOCKS = off` leaves
+  every clock alone, which is also what to use under sys-clk so the two do not fight.
 - **NX3, the rest (open).** Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and
   reapplied after dock/HOME/sleep, deferring to sys-clk; then profiling on hardware and the work
   of findings 107/112/127, plus NEON paths and thread placement over the four A57 cores. An

@@ -108,7 +108,8 @@ ANDROID_EXPORTS = '{\n  global: SDL_main;\n  local: *;\n};\n'
 # The Switch: its host in place of the POSIX one, its start, and C stand-ins for the Rust library
 SWITCH_HOST = {'port/host/host_win32.c': 'port/host/host_switch.c'}
 SWITCH_UNITS = ['port/host/switch_main.c', 'port/switch/render_gl.c', 'port/switch/render_native.c',
-                'port/switch/render_stubs.c', 'port/switch/textures.c', 'port/switch/rust_shims.c']
+                'port/switch/render_stubs.c', 'port/switch/textures.c', 'port/switch/clocks.c',
+                'port/switch/rust_shims.c']
 DEVKITPRO = Path(os.environ.get('DEVKITPRO') or '/opt/devkitpro')
 
 
