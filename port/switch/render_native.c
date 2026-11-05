@@ -25,6 +25,7 @@
    the very first field: this file makes the game's one surface current itself, the same way
    render_gl.c's present calls do. */
 #include <glad/glad.h>
+#include <SDL3/SDL.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -52,6 +53,14 @@ typedef struct DrawProgram {
     GLuint id;
     GLint u_target_size, u_flags, u_scale, u_atst, u_aref, u_fog;
     GLint u_alpha_scale, u_texa_alpha, u_tex_offset, u_tex_size, u_wrap, u_region;
+    /* What the program already holds. A GS picture is thousands of draws whose state mostly
+       repeats, and a uniform the program already has is a driver call for nothing; `held` says
+       the fields below are what was last sent to this program (uniforms are per program, so
+       each has its own copy). */
+    int held;
+    float h_target[2], h_fog[4], h_alpha_scale, h_texa_alpha;
+    uint32_t h_flags, h_scale, h_atst, h_aref, h_tex_size[2], h_wrap[2], h_region[4];
+    int32_t h_tex_offset[2];
 } DrawProgram;
 
 struct DhdrNative {
@@ -238,7 +247,13 @@ static const char *native_fragment_source =
 
 /* native_scanout (native.wgsl), the exact (non-"fast") form: da = display[0..3] (psm, bw, scale
    byte unused here, dbx), db = display[4..7] (dby, width, height, interlace), ds = display[8]
-   (the resolution scale, set by this file as scanout() does in render.rs). */
+   (the resolution scale, set by this file as scanout() does in render.rs).
+
+   The Y flip: native_vertex maps GS y = 0 onto clip y = +1, which is a render target's LAST
+   texture row in OpenGL (row 0 is the bottom one), so a surface texture holds the GS picture
+   upside down. WebGPU has no such difference and native.wgsl needs no flip; here the fetch
+   turns the row round, so the display texture comes out with GS row 0 first, which is what the
+   present pass and dhdr_native_read_finish expect. */
 static const char *scanout_source =
     "#version 430 core\n"
     "layout(local_size_x = 8, local_size_y = 8) in;\n"
@@ -254,7 +269,8 @@ static const char *scanout_source =
     "    uvec2 origin = uvec2(da.w, db.x);\n"
     "    uvec2 xy = ((origin + at / ds) & uvec2(2047u)) * ds + at % ds;\n"
     "    ivec2 size = textureSize(source, 0);\n"
-    "    vec3 c = (int(xy.x) < size.x && int(xy.y) < size.y) ? texelFetch(source, ivec2(xy), 0).rgb : vec3(0.0);\n"
+    "    vec3 c = (int(xy.x) < size.x && int(xy.y) < size.y)\n"
+    "           ? texelFetch(source, ivec2(int(xy.x), size.y - 1 - int(xy.y)), 0).rgb : vec3(0.0);\n"
     "    imageStore(screen, ivec2(tid), vec4(c, 1.0));\n"
     "}\n";
 
@@ -552,11 +568,59 @@ static void ensure_buffer(GLenum target, GLuint buffer, size_t *capacity, size_t
     }
 }
 
+/* DHD_GL_TIMES: where the render thread's time goes, which the perf lines cannot say (they see
+   one `render` thread). 1 times the CPU side of each phase, 2 puts a glFinish between the phases
+   so the GPU's own time lands in the phase that caused it (much slower; for one measurement, not
+   for play). A line every 300 pictures.
+
+   The phases are the picture's three parts: the draw loop (every DHDR_CMD_DRAW, with the texture
+   uploads a first sample pays for), the scanout compute shader and, separately, what
+   textures.c spent uploading. */
+static int gl_times(void)
+{
+    static int level = -1;
+    if (level < 0) {
+        const char *s = SDL_getenv("DHD_GL_TIMES");
+        level = s ? atoi(s) : 0;
+    }
+    return level;
+}
+
+static uint64_t phase_end(int level)
+{
+    if (level >= 2) glFinish();
+    return SDL_GetTicksNS();
+}
+
+static void report_times(uint64_t draws_ns, uint64_t scan_ns, uint64_t collect_ns, uint64_t draws,
+                         uint64_t programs, uint64_t textures)
+{
+    static uint64_t pictures, a_draws_ns, a_scan_ns, a_collect_ns, a_draws, a_programs, a_textures;
+    static uint64_t was_uploads, was_upload_ns, was_bytes;
+    a_draws_ns += draws_ns; a_scan_ns += scan_ns; a_collect_ns += collect_ns;
+    a_draws += draws; a_programs += programs; a_textures += textures;
+    if (++pictures < 300) return;
+    uint64_t uploads, upload_ns, bytes;
+    dhdr_tex_upload_stats(&uploads, &upload_ns, &bytes);
+    double n = (double)pictures;
+    fprintf(stderr, "gs native: per picture over %u: draws %.2f ms (%.0f draws, %.0f program changes, "
+                    "%.0f texture binds), scanout %.2f ms, collect %.2f ms | uploads %.1f (%.2f ms, "
+                    "%.0f KiB)\n",
+            (unsigned)pictures, a_draws_ns / n / 1e6, a_draws / n, a_programs / n, a_textures / n,
+            a_scan_ns / n / 1e6, a_collect_ns / n / 1e6, (uploads - was_uploads) / n,
+            (upload_ns - was_upload_ns) / n / 1e6, (bytes - was_bytes) / n / 1024.0);
+    was_uploads = uploads; was_upload_ns = upload_ns; was_bytes = bytes;
+    pictures = a_draws_ns = a_scan_ns = a_collect_ns = a_draws = a_programs = a_textures = 0;
+}
+
 int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint32_t *indices, uint32_t index_count,
                                 DhdrPictureResult *out)
 {
     memset(out, 0, sizeof *out);
     if (!n || !p || !ensure_gl_objects(n)) return 0;
+    int times = gl_times();
+    uint64_t t0 = times ? SDL_GetTicksNS() : 0, t1 = 0, t2 = 0, t3 = 0;
+    uint64_t program_changes = 0, texture_binds = 0;
     ensure_buffer(GL_ARRAY_BUFFER, n->vbo, &n->vbo_bytes, (size_t)p->vertex_count * sizeof(DhdrVertex));
     if (p->vertex_count) glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)((size_t)p->vertex_count * sizeof(DhdrVertex)),
                                         p->vertices);
@@ -570,7 +634,9 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
     glEnable(GL_SCISSOR_TEST);
     glActiveTexture(GL_TEXTURE0);
     GLint bound_fbo = -1;
-    GLuint bound_program = 0;
+    GLuint bound_program = 0, bound_texture = 0, bound_sampler = 0;
+    uint32_t held_mask = 16;                      /* no colour mask sent yet (a mask is 0..15) */
+    int32_t held_scissor[4] = { -1, -1, -1, -1 }; /* nor a scissor (its values are never negative) */
     for (uint32_t i = 0; i < p->command_count; i++) {
         const DhdrCommand *k = &p->commands[i];
         if (k->kind != DHDR_CMD_DRAW || !k->count) continue;   /* COPY, IMPORT, ALPHA_UPLOAD: step 3 */
@@ -588,16 +654,23 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
         int32_t right = clampi(k->scissor[2] * (int32_t)target_scale, 0, (int32_t)t->width);
         int32_t bottom = clampi(k->scissor[3] * (int32_t)target_scale, 0, (int32_t)t->height);
         if (right <= left || bottom <= top) continue;
-        glScissor(left, (int32_t)t->height - bottom, right - left, bottom - top);
-        glColorMask((k->color_mask & 1) != 0, (k->color_mask & 2) != 0, (k->color_mask & 4) != 0,
-                   (k->color_mask & 8) != 0);
+        int32_t cut[4] = { left, (int32_t)t->height - bottom, right - left, bottom - top };
+        if (memcmp(held_scissor, cut, sizeof cut)) {
+            glScissor(cut[0], cut[1], cut[2], cut[3]);
+            memcpy(held_scissor, cut, sizeof cut);
+        }
+        if (held_mask != (uint32_t)k->color_mask) {
+            glColorMask((k->color_mask & 1) != 0, (k->color_mask & 2) != 0, (k->color_mask & 4) != 0,
+                        (k->color_mask & 8) != 0);
+            held_mask = k->color_mask;
+        }
         /* The texture this draw samples, and with it the pipeline. A replacement (flag 2048) is
            sampled through one of the eight samplers; a decoded texture is fetched texel by texel.
            A draw that would sample a surface or a conversion (texture_surface, convert: step 3),
            and one whose texture could not be uploaded, loses its texture bit and comes out flat,
            as every textured draw did in step 1. */
         uint32_t flags = k->constants.flags;
-        const DrawProgram *d = &n->texels;
+        DrawProgram *d = &n->texels;
         GLuint texture = 0, sampler = 0;
         if ((flags & 2048u) && k->replacement && (texture = dhdr_tex_gl(k->replacement))) {
             d = &n->sampled;
@@ -613,27 +686,67 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
         if (bound_program != d->id) {
             glUseProgram(d->id);
             bound_program = d->id;
+            program_changes++;
         }
-        glBindTexture(GL_TEXTURE_2D, texture);
-        glBindSampler(0, sampler);
+        if (bound_texture != texture) {
+            glBindTexture(GL_TEXTURE_2D, texture);
+            bound_texture = texture;
+            texture_binds++;
+        }
+        if (bound_sampler != sampler) { glBindSampler(0, sampler); bound_sampler = sampler; }
         /* native.wgsl's scale word, as render.rs builds it: the target's scale, the sampled
            surface's (1 for a decoded texture or a replacement, the only sources step 2 reads)
            and the smaller of the two. */
         uint32_t source_scale = 1;
         uint32_t resolution = source_scale < target_scale ? source_scale : target_scale;
-        glUniform2f(d->u_target_size, (float)t->width / (float)target_scale, (float)t->height / (float)target_scale);
-        glUniform1ui(d->u_flags, flags);
-        glUniform1ui(d->u_scale, target_scale | source_scale << 8 | resolution << 16);
-        glUniform1ui(d->u_atst, k->constants.atst);
-        glUniform1ui(d->u_aref, k->constants.aref);
-        glUniform4f(d->u_fog, k->constants.fog[0], k->constants.fog[1], k->constants.fog[2], k->constants.fog[3]);
-        glUniform1f(d->u_alpha_scale, k->constants.alpha_scale);
-        glUniform1f(d->u_texa_alpha, k->constants.texa_alpha);
-        glUniform2i(d->u_tex_offset, k->constants.tex_offset[0], k->constants.tex_offset[1]);
-        glUniform2ui(d->u_tex_size, k->constants.tex_size[0], k->constants.tex_size[1]);
-        glUniform2ui(d->u_wrap, k->constants.wrap[0], k->constants.wrap[1]);
-        glUniform4ui(d->u_region, k->constants.region[0], k->constants.region[1], k->constants.region[2],
-                     k->constants.region[3]);
+        uint32_t scale_word = target_scale | source_scale << 8 | resolution << 16;
+        float tw = (float)t->width / (float)target_scale, th = (float)t->height / (float)target_scale;
+        DrawProgram *w = d;
+        if (!w->held || w->h_target[0] != tw || w->h_target[1] != th) {
+            glUniform2f(d->u_target_size, tw, th);
+            w->h_target[0] = tw; w->h_target[1] = th;
+        }
+        if (!w->held || w->h_flags != flags) { glUniform1ui(d->u_flags, flags); w->h_flags = flags; }
+        if (!w->held || w->h_scale != scale_word) { glUniform1ui(d->u_scale, scale_word); w->h_scale = scale_word; }
+        if (!w->held || w->h_atst != k->constants.atst) {
+            glUniform1ui(d->u_atst, k->constants.atst);
+            w->h_atst = k->constants.atst;
+        }
+        if (!w->held || w->h_aref != k->constants.aref) {
+            glUniform1ui(d->u_aref, k->constants.aref);
+            w->h_aref = k->constants.aref;
+        }
+        if (!w->held || memcmp(w->h_fog, k->constants.fog, sizeof w->h_fog)) {
+            glUniform4f(d->u_fog, k->constants.fog[0], k->constants.fog[1], k->constants.fog[2],
+                        k->constants.fog[3]);
+            memcpy(w->h_fog, k->constants.fog, sizeof w->h_fog);
+        }
+        if (!w->held || w->h_alpha_scale != k->constants.alpha_scale) {
+            glUniform1f(d->u_alpha_scale, k->constants.alpha_scale);
+            w->h_alpha_scale = k->constants.alpha_scale;
+        }
+        if (!w->held || w->h_texa_alpha != k->constants.texa_alpha) {
+            glUniform1f(d->u_texa_alpha, k->constants.texa_alpha);
+            w->h_texa_alpha = k->constants.texa_alpha;
+        }
+        if (!w->held || memcmp(w->h_tex_offset, k->constants.tex_offset, sizeof w->h_tex_offset)) {
+            glUniform2i(d->u_tex_offset, k->constants.tex_offset[0], k->constants.tex_offset[1]);
+            memcpy(w->h_tex_offset, k->constants.tex_offset, sizeof w->h_tex_offset);
+        }
+        if (!w->held || memcmp(w->h_tex_size, k->constants.tex_size, sizeof w->h_tex_size)) {
+            glUniform2ui(d->u_tex_size, k->constants.tex_size[0], k->constants.tex_size[1]);
+            memcpy(w->h_tex_size, k->constants.tex_size, sizeof w->h_tex_size);
+        }
+        if (!w->held || w->h_wrap[0] != k->constants.wrap[0] || w->h_wrap[1] != k->constants.wrap[1]) {
+            glUniform2ui(d->u_wrap, k->constants.wrap[0], k->constants.wrap[1]);
+            w->h_wrap[0] = k->constants.wrap[0]; w->h_wrap[1] = k->constants.wrap[1];
+        }
+        if (!w->held || memcmp(w->h_region, k->constants.region, sizeof w->h_region)) {
+            glUniform4ui(d->u_region, k->constants.region[0], k->constants.region[1], k->constants.region[2],
+                         k->constants.region[3]);
+            memcpy(w->h_region, k->constants.region, sizeof w->h_region);
+        }
+        w->held = 1;
         if (indices && index_count) {
             glDrawElements(GL_TRIANGLES, (GLsizei)k->count, GL_UNSIGNED_INT,
                            (const void *)(uintptr_t)((size_t)k->first * sizeof(uint32_t)));
@@ -644,10 +757,16 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
     }
     glBindSampler(0, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (times) t1 = phase_end(times);
     /* Textures released on any thread since the last picture: their GL objects are this
        thread's to delete (textures_gl.h). */
     dhdr_tex_collect();
+    if (times) t2 = phase_end(times);
     int shown = p->movie_on ? scan_out_movie(n, p->movie_width, p->movie_height, p->movie) : scan_out(n, p);
+    if (times) {
+        t3 = phase_end(times);
+        report_times(t1 - t0, t3 - t2, t2 - t1, out->draws, program_changes, texture_binds);
+    }
     out->shown = shown != 0;
     out->display_width = n->display_width;
     out->display_height = n->display_height;

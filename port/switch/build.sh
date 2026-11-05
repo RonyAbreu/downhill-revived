@@ -1,7 +1,10 @@
 #!/bin/bash
 # The Switch's dhd.nro (finding 144) from build/wasm/dhd_core.wasm, inside the build image:
 #   docker build -t dhd-switch-dev port/switch
-#   docker run --rm -v "$PWD:/src" dhd-switch-dev bash port/switch/build.sh [build_host64.py options]
+#   docker run --rm -v "$PWD:/src" -v dhd-objcache:/objcache dhd-switch-dev bash port/switch/build.sh [options]
+# The dhd-objcache volume is the shared object cache (tools/objcache.py, DHD_OBJCACHE_DIR in the
+# Dockerfile). Without it every build recompiles all ~60 objects, about 25 minutes; with it only
+# what changed is compiled.
 # SDL3 first (port/switch/build_sdl3.sh); DHD_VUTEXT or assets/vutext.bin as for every target.
 set -euo pipefail
 cd "$(dirname "$0")/../.."

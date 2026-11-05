@@ -138,8 +138,18 @@ void dhdr_texture_release(DhdrTexture *t)
 
 /* ---- the render thread ---- */
 
+/* What the uploads cost, for DHD_GL_TIMES (render_native.c prints them). */
+static uint64_t g_upload_count, g_upload_ns, g_upload_bytes;
+
+void dhdr_tex_upload_stats(uint64_t *count, uint64_t *ns, uint64_t *bytes)
+{
+    *count = g_upload_count; *ns = g_upload_ns; *bytes = g_upload_bytes;
+}
+
 static void upload(DhdrTexture *t)
 {
+    uint64_t began = SDL_GetTicksNS();
+    size_t bytes = t->bytes;
     glGenTextures(1, &t->gl);
     if (!t->gl) { t->failed = 1; return; }
     glBindTexture(GL_TEXTURE_2D, t->gl);
@@ -168,6 +178,9 @@ static void upload(DhdrTexture *t)
     free(t->pixels);
     t->pixels = NULL;
     t->bytes = 0;
+    g_upload_count++;
+    g_upload_bytes += bytes;
+    g_upload_ns += SDL_GetTicksNS() - began;
 }
 
 GLuint dhdr_tex_gl(DhdrTexture *t)

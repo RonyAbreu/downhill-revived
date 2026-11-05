@@ -37,6 +37,9 @@ GLuint dhdr_tex_dummy_rgba(void);     /* RGBA8 */
    RENDER THREAD ONLY, context current; called once per picture. */
 void dhdr_tex_collect(void);
 
+/* What the uploads have cost so far (DHD_GL_TIMES): how many, their nanoseconds and their bytes. */
+void dhdr_tex_upload_stats(uint64_t *count, uint64_t *ns, uint64_t *bytes);
+
 /* Every GL object textures.c owns (the dead list drained first), for surface teardown. */
 void dhdr_tex_shutdown(void);
 
