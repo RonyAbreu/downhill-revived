@@ -596,10 +596,16 @@ static void report_times(uint64_t draws_ns, uint64_t scan_ns, uint64_t collect_n
                          uint64_t programs, uint64_t textures)
 {
     static uint64_t pictures, a_draws_ns, a_scan_ns, a_collect_ns, a_draws, a_programs, a_textures;
-    static uint64_t was_uploads, was_upload_ns, was_bytes;
+    static uint64_t was_uploads, was_upload_ns, was_bytes, since;
     a_draws_ns += draws_ns; a_scan_ns += scan_ns; a_collect_ns += collect_ns;
     a_draws += draws; a_programs += programs; a_textures += textures;
-    if (++pictures < 300) return;
+    uint64_t now = SDL_GetTicksNS();
+    if (!since) since = now;
+    /* 300 pictures or five seconds, whichever comes first: at 60 fields a second that is a line
+       every five seconds, and at three (the rate this was written to explain) it still is, rather
+       than one line every hundred seconds. */
+    if (++pictures < 300 && now - since < 5000000000ull) return;
+    since = now;
     uint64_t uploads, upload_ns, bytes;
     dhdr_tex_upload_stats(&uploads, &upload_ns, &bytes);
     double n = (double)pictures;
