@@ -101,6 +101,12 @@ struct DhdrNative {
     NativeSurface surfaces[DHDR_NATIVE_SURFACE_COUNT];
     GLuint display_texture, display_fbo;
     uint32_t display_width, display_height;
+    /* A surface copying onto itself cannot read and write one texture at once, so it goes
+       through this; an IMPORT's pixels land here first and are blitted on (surfaces.rs). */
+    GLuint scratch_texture, scratch_fbo;
+    uint32_t scratch_width, scratch_height;
+    GLuint import_texture, import_fbo;
+    uint32_t import_width, import_height;
     int point_filter;
 };
 
@@ -557,6 +563,10 @@ void dhdr_native_destroy(DhdrNative *n)
         }
         if (n->display_fbo) glDeleteFramebuffers(1, &n->display_fbo);
         if (n->display_texture) glDeleteTextures(1, &n->display_texture);
+        if (n->scratch_fbo) glDeleteFramebuffers(1, &n->scratch_fbo);
+        if (n->scratch_texture) glDeleteTextures(1, &n->scratch_texture);
+        if (n->import_fbo) glDeleteFramebuffers(1, &n->import_fbo);
+        if (n->import_texture) glDeleteTextures(1, &n->import_texture);
         glDeleteBuffers(1, &n->vbo);
         glDeleteBuffers(1, &n->ibo);
         glDeleteVertexArrays(1, &n->vao);
@@ -686,7 +696,131 @@ static int scan_out_movie(DhdrNative *n, uint32_t w, uint32_t h, const uint32_t 
     return 1;
 }
 
-/* ---- the picture: native_render's command loop, DRAW only (step 1 has no textures) ---- */
+/* ---- the texture copies: DHDR_CMD_COPY and IMPORT (surfaces.rs's transfer) ----
+
+   The Y flip again: a surface texture holds the GS picture upside down, because native_vertex
+   puts GS y = 0 at the last texture row. So a GS rectangle `y` high at `h` lives at texture row
+   `surface height - y - h`, and every rectangle below is turned round on its way in or out.
+
+   ALPHA_UPLOAD is still a no-op: native.wgsl's native_upload_alpha keeps the target's RGB and
+   replaces bits of its alpha from a 64 x 32 upload whose red is the new bits and whose green is
+   the mask, which needs a pass of its own over a copy of the previous content rather than the
+   plain rectangle copies here. */
+
+/* A GS rectangle's texture row (the surface's own pixels, not GS ones). */
+static int32_t flip_y(uint32_t height, int32_t y, int32_t h) { return (int32_t)height - y - h; }
+
+static int ensure_aux(GLuint *texture, GLuint *fbo, uint32_t *have_w, uint32_t *have_h,
+                      uint32_t w, uint32_t h)
+{
+    if (*texture && *have_w >= w && *have_h >= h) return 1;
+    uint32_t nw = *have_w > w ? *have_w : w, nh = *have_h > h ? *have_h : h;
+    if (!nw || !nh || nw > 8192 || nh > 8192) return 0;
+    if (*fbo) glDeleteFramebuffers(1, fbo);
+    if (*texture) glDeleteTextures(1, texture);
+    *texture = *fbo = 0; *have_w = *have_h = 0;
+    glGenTextures(1, texture);
+    glBindTexture(GL_TEXTURE_2D, *texture);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, (GLsizei)nw, (GLsizei)nh);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glGenFramebuffers(1, fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, *fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, *texture, 0);
+    int ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (!ok) { glDeleteFramebuffers(1, fbo); glDeleteTextures(1, texture); *texture = *fbo = 0; return 0; }
+    *have_w = nw; *have_h = nh;
+    return 1;
+}
+
+/* native_copy: a w x h rectangle of GS pixels from surface `source` at (sx, sy) to `target` at
+   (x, y). The scales matching, the texels move as they are; differing, the rectangle is blitted
+   and resampled, as surfaces.rs does. */
+static void copy_surface(DhdrNative *n, const DhdrCommand *k, DhdrPictureResult *out)
+{
+    if (k->source < 0 || (uint32_t)k->source >= DHDR_NATIVE_SURFACE_COUNT) return;
+    if (k->target < 0 || (uint32_t)k->target >= DHDR_NATIVE_SURFACE_COUNT) return;
+    NativeSurface *s = &n->surfaces[k->source], *t = &n->surfaces[k->target];
+    if (!s->texture || !t->texture || s->depth || t->depth) return;
+    uint32_t ss = s->scale, ts = t->scale;
+    if (!ss || !ts) return;
+    int32_t w = k->w, h = k->h, sx = k->sx, sy = k->sy, x = k->x, y = k->y;
+    int32_t sw = (int32_t)(s->width / ss), sh = (int32_t)(s->height / ss);
+    int32_t tw = (int32_t)(t->width / ts), th = (int32_t)(t->height / ts);
+    if (sx + w > sw) w = sw - sx;
+    if (sy + h > sh) h = sh - sy;
+    if (x + w > tw) w = tw - x;
+    if (y + h > th) h = th - y;
+    if (w <= 0 || h <= 0 || sx < 0 || sy < 0 || x < 0 || y < 0) return;
+    out->copies++;
+    out->copy_px += (uint64_t)w * (uint64_t)h;
+    if (ss != ts) {   /* resampled: the only way between textures of different sizes */
+        int32_t s0 = (int32_t)(sx * (int32_t)ss), s1 = s0 + w * (int32_t)ss;
+        int32_t d0 = (int32_t)(x * (int32_t)ts), d1 = d0 + w * (int32_t)ts;
+        int32_t sy0 = flip_y(s->height, sy * (int32_t)ss, h * (int32_t)ss);
+        int32_t dy0 = flip_y(t->height, y * (int32_t)ts, h * (int32_t)ts);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, s->fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, t->fbo);
+        glDisable(GL_SCISSOR_TEST);
+        glBlitFramebuffer(s0, sy0, s1, sy0 + h * (int32_t)ss, d0, dy0, d1, dy0 + h * (int32_t)ts,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glEnable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        return;
+    }
+    GLint bx = sx * (int32_t)ss, bw = w * (int32_t)ss, bh = h * (int32_t)ss;
+    GLint dx = x * (int32_t)ss;
+    GLint by = flip_y(s->height, sy * (int32_t)ss, bh), dy = flip_y(t->height, y * (int32_t)ss, bh);
+    if (k->source == k->target) {
+        /* One texture read and written at once is undefined, so it goes out and back. */
+        if (!ensure_aux(&n->scratch_texture, &n->scratch_fbo, &n->scratch_width, &n->scratch_height,
+                        (uint32_t)bw, (uint32_t)bh))
+            return;
+        glCopyImageSubData(s->texture, GL_TEXTURE_2D, 0, bx, by, 0,
+                           n->scratch_texture, GL_TEXTURE_2D, 0, 0, 0, 0, bw, bh, 1);
+        glCopyImageSubData(n->scratch_texture, GL_TEXTURE_2D, 0, 0, 0, 0,
+                           t->texture, GL_TEXTURE_2D, 0, dx, dy, 0, bw, bh, 1);
+        out->self_copies++;
+        out->self_copy_px += (uint64_t)w * (uint64_t)h;
+        return;
+    }
+    glCopyImageSubData(s->texture, GL_TEXTURE_2D, 0, bx, by, 0,
+                       t->texture, GL_TEXTURE_2D, 0, dx, dy, 0, bw, bh, 1);
+}
+
+/* native_import: w x h RGBA8 pixels (rows from the top, as the GS has them) into the target
+   surface at (x, y), scaled up to the surface's own scale. */
+static void import_pixels(DhdrNative *n, const DhdrCommand *k, DhdrPictureResult *out)
+{
+    if (k->target < 0 || (uint32_t)k->target >= DHDR_NATIVE_SURFACE_COUNT || !k->pixels) return;
+    NativeSurface *t = &n->surfaces[k->target];
+    if (!t->texture || t->depth) return;
+    uint32_t ts = t->scale ? t->scale : 1;
+    int32_t w = k->w, h = k->h, x = k->x, y = k->y;
+    int32_t tw = (int32_t)(t->width / ts), th = (int32_t)(t->height / ts);
+    if (w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > tw || y + h > th) return;
+    if (!ensure_aux(&n->import_texture, &n->import_fbo, &n->import_width, &n->import_height,
+                    (uint32_t)w, (uint32_t)h))
+        return;
+    glBindTexture(GL_TEXTURE_2D, n->import_texture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, k->pixels);
+    /* The destination rectangle is given upside down, which is what turns the rows round: the
+       pixels arrive with row 0 at the GS top, and the surface keeps the GS top last. */
+    int32_t d0 = x * (int32_t)ts, d1 = d0 + w * (int32_t)ts;
+    int32_t low = flip_y(t->height, y * (int32_t)ts, h * (int32_t)ts);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, n->import_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, t->fbo);
+    glDisable(GL_SCISSOR_TEST);
+    glBlitFramebuffer(0, 0, w, h, d0, low + h * (int32_t)ts, d1, low, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glEnable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    out->imports++;
+    out->import_px += (uint64_t)w * (uint64_t)h;
+}
+
+/* ---- the picture: native_render's command loop ---- */
 
 static int32_t clampi(int32_t v, int32_t lo, int32_t hi) { return v < lo ? lo : v > hi ? hi : v; }
 
@@ -907,7 +1041,15 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
     glDisable(GL_BLEND);
     for (uint32_t i = 0; i < p->command_count; i++) {
         const DhdrCommand *k = &p->commands[i];
-        if (k->kind != DHDR_CMD_DRAW || !k->count) continue;   /* COPY, IMPORT, ALPHA_UPLOAD: step 3 */
+        if (k->kind == DHDR_CMD_COPY || k->kind == DHDR_CMD_IMPORT) {
+            if (k->kind == DHDR_CMD_COPY) copy_surface(n, k, out);
+            else import_pixels(n, k, out);
+            /* Both bind framebuffers of their own and turn the scissor off. */
+            bound_fbo = -1;
+            held_scissor[0] = -1;
+            continue;
+        }
+        if (k->kind != DHDR_CMD_DRAW || !k->count) continue;   /* ALPHA_UPLOAD is still a no-op */
         if (k->target < 0 || (uint32_t)k->target >= DHDR_NATIVE_SURFACE_COUNT) continue;
         NativeSurface *t = &n->surfaces[k->target];
         if (!t->texture || t->depth) continue;
