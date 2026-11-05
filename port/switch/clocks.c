@@ -193,3 +193,20 @@ void switch_thread_core(const char *name)
     }
     fprintf(stderr, "switch: the %s thread runs on core %d\n", name, core);
 }
+
+/* SDL's audio thread, raised from inside the audio callback (sound_out_sdl.c): it is the one
+   thread of the lot that must never be late, and Horizon starts it at the ordinary priority
+   among four threads that want more than three cores. 0x2B is one step above the default 0x2C
+   (a lower number is a higher priority on Horizon), the same step switch-hero gives its own
+   audio and input threads. DHD_SWITCH_AUDIO_PRIORITY = off leaves it alone. */
+void switch_audio_thread(void)
+{
+    const char *want = getenv("DHD_SWITCH_AUDIO_PRIORITY");
+    if (want && (!strcasecmp(want, "off") || !strcmp(want, "0"))) return;
+    int32_t prio = want && *want ? (int32_t)strtol(want, NULL, 0) : 0x2B;
+    if (prio < 0x1C || prio > 0x3F) prio = 0x2B;   /* the range Horizon gives an application */
+    if (R_FAILED(svcSetThreadPriority(CUR_THREAD_HANDLE, (u32)prio)))
+        fprintf(stderr, "switch: the audio thread would not take priority 0x%X\n", (unsigned)prio);
+    else
+        fprintf(stderr, "switch: the audio thread runs at priority 0x%X\n", (unsigned)prio);
+}

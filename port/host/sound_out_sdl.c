@@ -258,6 +258,7 @@ static struct {
     int running, started, trace, stretch;
     double phase, last_trace, speed, speed_at;
     long speed_write;
+    long calls, idle;         /* callbacks since the last trace line, and those that wrote nothing */
     unsigned trace_min, trace_max;
 } out;
 
@@ -269,6 +270,22 @@ static void SDLCALL host_callback(void *unused, SDL_AudioStream *stream, int add
     unsigned request = (unsigned)total / 4, padding, level, queued, need, made = 0, target;
     unsigned device = DEVICE_MS * per_ms;
     (void)unused; (void)additional;
+#ifdef __SWITCH__
+    /* This runs on SDL's own audio thread, which Horizon starts at the ordinary priority and
+       leaves to queue behind four threads that between them want more than the three cores the
+       process has. A field that takes 227 ms (measured on hardware) starves it, and the sound
+       did not come back afterwards. Raising it here is the only place that thread is reachable
+       (switch-hero does the same from its own audio thread, finding 144). */
+    {
+        static int raised;
+        if (!raised) {
+            raised = 1;
+            void switch_audio_thread(void);
+            switch_audio_thread();
+        }
+    }
+#endif
+    out.calls++;
     ring_end = ring_write;
     SDL_MemoryBarrierAcquire();
     /* what the device holds when SDL asks (up to a period) plus the stream: WASAPI's padding */
@@ -299,20 +316,28 @@ static void SDLCALL host_callback(void *unused, SDL_AudioStream *stream, int add
         queued = target;
     }
     need = device > padding ? device - padding : 0;
-    if (!need) return;
-    if (need > ST_FIFO - ST_HOP) need = ST_FIFO - ST_HOP;
-    host_histograms(queued);
+    /* Before the early return, not after it: a callback that finds the stream already full
+       writes nothing, and with the trace below that return a run of them looked exactly like
+       the callback having stopped being called at all. `calls` and `idle` tell those apart. */
     if (out.trace) {
         double now = host_wall_seconds();
         if (queued < out.trace_min) out.trace_min = queued;
         if (queued > out.trace_max) out.trace_max = queued;
         if (now - out.last_trace >= 1.0) {
-            hle_log("snd host: queue %u-%u ms, rate %+.0f ppm, game speed %.3f, tempo %.3f, stretched %.1f s, underruns %ld, silence %.1f ms, dropped %ld, skipped %ld\n",
+            hle_log("snd host: queue %u-%u ms, rate %+.0f ppm, game speed %.3f, tempo %.3f, stretched %.1f s, underruns %ld, silence %.1f ms, dropped %ld, skipped %ld, calls %ld (%ld idle, need %u of %u)\n",
                     out.trace_min / per_ms, out.trace_max / per_ms, (host_ratio - 1) * 1e6, out.speed, host_tempo,
-                    host_stretched / (double)SND_RATE, host_underruns, host_silence / (double)per_ms, host_dropped, host_skipped);
+                    host_stretched / (double)SND_RATE, host_underruns, host_silence / (double)per_ms, host_dropped,
+                    host_skipped, out.calls, out.idle, need / per_ms, device / per_ms);
             out.trace_min = ~0u; out.trace_max = 0; out.last_trace = now;
+            out.calls = out.idle = 0;
         }
     }
+    if (!need) {
+        out.idle++;
+        return;
+    }
+    if (need > ST_FIFO - ST_HOP) need = ST_FIFO - ST_HOP;
+    host_histograms(queued);
     if (!out.running && queued >= target) out.running = out.started = 1;
     if (out.running) {
         /* Slower than real time (heavy scene): stretch to the game's speed, corrected by the

@@ -18,4 +18,9 @@ void switch_clocks_stop(void);
    nothing. */
 void switch_thread_core(const char *name);
 
+/* Raises SDL's audio thread, called once from the audio callback (that thread itself is the
+   only place it can be reached). DHD_SWITCH_AUDIO_PRIORITY = off leaves it alone, or a number
+   sets it; 0x2B by default, one step above Horizon's ordinary 0x2C. */
+void switch_audio_thread(void);
+
 #endif
