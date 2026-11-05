@@ -508,7 +508,11 @@ Work lives on the `switch/port` branch, not on `main`.
 
 Build: `port/switch/Dockerfile` (devkitPro devkitA64, libnx) and `port/switch/build.sh`, which
 builds devkitPro's SDL3 fork first (`port/switch/build_sdl3.sh`, branch `switch-sdl-3.4`) and
-then `build_host64.py --target switch-arm64` into `build/host64-switch/dhd.nro`.
+then `build_host64.py --target switch-arm64` into `build/host64-switch/dhd.nro`. Pass the object
+cache's volume (`docker run -v "$PWD:/src" -v dhd-objcache:/objcache ...`): the Dockerfile names
+it in `DHD_OBJCACHE_DIR`, which `tools/objcache.py` needs before it caches anything off Windows.
+Without it every build compiles all 62 objects (23 minutes here, `vu0_interp.c` alone taking
+seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss, 3 minutes.
 
 - **NX0, plan (done).** Finding 144: what Horizon changes against the other targets, and why
   there is no Rust on it (`aarch64-nintendo-switch-freestanding` is no_std; wgpu needs std), so
