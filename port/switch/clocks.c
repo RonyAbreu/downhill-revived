@@ -145,15 +145,17 @@ void switch_clocks_stop(void)
    core could have done, so some spreading was happening, but 3 ms more than the heaviest thread
    alone, which is what queueing costs.
 
-   The layout, over the cores the process is actually allowed (svcGetInfo's CoreMask): the
-   render thread gets one to itself, vu gets one, and gs and game share the third. Render is the
-   one whose cost moves with the resolution -- 3.3 ms a field at scale 1 and 35.5 at scale 2 --
-   so it is the one that must not share; the first attempt paired it with game and made that
-   core the whole field at scale 2 (35.5 + 6.7 against a 41.3 ms field). The other three barely
-   move with the resolution, and gs and game together, about 17 ms, sit beside vu's 17 to 18.
-   Everything the port does not name -- the main thread, SDL's audio -- stays where Horizon put
-   it. With fewer than three cores nothing is pinned: doubling up the heavy threads would be
-   worse than the scheduler's own choice. dhd.ini's DHD_SWITCH_CORES = off turns it off. */
+   OFF BY DEFAULT, and the measurements are why. Three builds of the same scene at scale 2 --
+   no pinning, then one layout, then another -- gave 24.2, 24.2 and 24.5 fields/s, so Horizon's
+   own scheduler was already doing what a fixed map could. A race then showed why a fixed map
+   cannot win: every thread is heavy there (a field's busy times: game 25-33 ms, vu 24-44, gs
+   15-22, the native renderer 14-33), four of them over three cores, and which two are light
+   enough to share changes with the scene and with the resolution. A scheduler free to move them
+   beats a map chosen in advance.
+
+   dhd.ini's DHD_SWITCH_CORES = on asks for the layout anyway: the native renderer a core to
+   itself, vu another, gs and game the third. It is kept for measuring, not because it is known
+   to help. With fewer than three cores nothing is pinned. */
 
 static int core_list(int *cores, int max)
 {
@@ -167,20 +169,24 @@ static int core_list(int *cores, int max)
 
 void switch_thread_core(const char *name)
 {
-    static int cores[8], count = -1, off;
+    static int cores[8], count = -1, on;
     if (count < 0) {
         const char *want = getenv("DHD_SWITCH_CORES");
-        off = want && (!strcasecmp(want, "off") || !strcmp(want, "0"));
+        on = want && (!strcasecmp(want, "on") || !strcmp(want, "1"));
         count = core_list(cores, 8);
-        fprintf(stderr, "switch: %d core%s for this process%s\n", count, count == 1 ? "" : "s",
-                off ? " (DHD_SWITCH_CORES = off: the threads stay where Horizon put them)" : "");
+        fprintf(stderr, "switch: %d core%s for this process; the threads %s\n", count,
+                count == 1 ? "" : "s",
+                on ? "are pinned (DHD_SWITCH_CORES = on)" : "stay where Horizon puts them");
     }
-    if (off || count < 3 || !name) return;
+    if (!on || count < 3 || !name) return;
     int core;
-    if (!strcmp(name, "render")) core = cores[0];
+    /* "native" is the native renderer's thread (native_core.inc). The perf lines call it
+       "render", which is no thread's own name, and naming it that here was why it was the one
+       thread the first attempt never moved. */
+    if (!strcmp(name, "native")) core = cores[0];
     else if (!strcmp(name, "vu")) core = cores[1];
     else if (!strcmp(name, "gs") || !strcmp(name, "game")) core = cores[2];
-    else return;   /* the main thread, SDL's audio and anything else: left alone */
+    else return;   /* the main thread, SDL's audio, movie, texpack: left alone */
     if (R_FAILED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core))) {
         fprintf(stderr, "switch: the %s thread would not move to core %d\n", name, core);
         return;
