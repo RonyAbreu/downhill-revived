@@ -499,10 +499,11 @@ def main():
                  '-Wl,-Map,' + str(out/'dhd.map'), '@'+str(rsp), *sdl_libs,
                  '-L' + str(DEVKITPRO/'portlibs/switch/lib'), '-L' + str(DEVKITPRO/'libnx/lib'),
                  '-lnx', '-lm', '-o', elf], timeout=1800)
-            v = re.search(r'DHD_VERSION\s+"([^"]+)"', (ROOT/'port/include/version.h').read_text())
+            # the homebrew's own name, author and version (port/switch/switch_version.h)
+            ident = (ROOT/'port/switch/switch_version.h').read_text()
+            field = lambda key: re.search(r'#define\s+DHD_SWITCH_%s\s+"([^"]+)"' % key, ident).group(1)
             nacp = work/'dhd.nacp'
-            run([DEVKITPRO/'tools/bin/nacptool', '--create', 'Downhill Revived', 'Downhill Revived (Switch port)',
-                 v.group(1) if v else '0.0.0', nacp])
+            run([DEVKITPRO/'tools/bin/nacptool', '--create', field('NAME'), field('AUTHOR'), field('VERSION'), nacp])
             run([DEVKITPRO/'tools/bin/elf2nro', elf, exe, '--nacp=' + str(nacp)])
         elif t.mac:
             # ld64: -dead_strip as --gc-sections; no -rdynamic (exporting every symbol keeps the

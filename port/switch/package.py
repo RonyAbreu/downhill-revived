@@ -5,14 +5,14 @@ the SD card, checked and zipped into build/release-switch/.
     python port/switch/package.py --nro PATH
 
 The archive holds the SD card's own layout, so unzipping it onto the card puts everything in
-sdmc:/switch/downhill-revived/ :
+sdmc:/switch/downhill-switch/ :
 
-    switch/downhill-revived/dhd.nro                 the game
-    switch/downhill-revived/dhd.ini                 the settings template (port/release/switch-dhd.ini)
-    switch/downhill-revived/README.txt              the players' text (port/release/SWITCH-NOTES.txt)
-    switch/downhill-revived/LICENSE.txt
-    switch/downhill-revived/THIRD-PARTY-NOTICES.txt
-    switch/downhill-revived/SWITCH-THIRD-PARTY-NOTICES.txt   what only the .nro links statically:
+    switch/downhill-switch/dhd.nro                 the game
+    switch/downhill-switch/dhd.ini                 the settings template (port/release/switch-dhd.ini)
+    switch/downhill-switch/README.txt              the players' text (port/release/SWITCH-NOTES.txt)
+    switch/downhill-switch/LICENSE.txt
+    switch/downhill-switch/THIRD-PARTY-NOTICES.txt
+    switch/downhill-switch/SWITCH-THIRD-PARTY-NOTICES.txt   what only the .nro links statically:
                                                     libnx, newlib, the GCC runtime, Mesa,
                                                     libdrm_nouveau, glad, libpng, zlib
 
@@ -37,14 +37,24 @@ import package_release as rel  # noqa: E402  (its checks, so there is one copy o
 
 RELEASE = ROOT / 'port' / 'release'
 OUT = ROOT / 'build' / 'release-switch'
-FOLDER = 'switch/downhill-revived/'      # where it all lands on the SD card
+FOLDER = 'switch/downhill-switch/'       # where it all lands on the SD card (DHD_SWITCH_DIR)
 
 
 def version():
+    """The game's own version (DHD_VERSION): the .nro must carry it, as every build does."""
     text = (ROOT / 'port' / 'include' / 'version.h').read_text(encoding='utf-8')
     found = re.search(r'#define\s+DHD_VERSION\s+"([^"]+)"', text)
     if not found:
         sys.exit('no DHD_VERSION in port/include/version.h')
+    return found.group(1)
+
+
+def switch_version():
+    """The homebrew's own version (port/switch/switch_version.h), which names the release."""
+    text = (ROOT / 'port' / 'switch' / 'switch_version.h').read_text(encoding='utf-8')
+    found = re.search(r'#define\s+DHD_SWITCH_VERSION\s+"([^"]+)"', text)
+    if not found:
+        sys.exit('no DHD_SWITCH_VERSION in port/switch/switch_version.h')
     return found.group(1)
 
 
@@ -59,6 +69,8 @@ def nro_problems(nro, name, settings):
         problems.append('no NRO0 header: this is not a Switch homebrew file')
     if b'dhd-port %s ' % name.encode() not in data:
         problems.append('not built from version %s (its own version string is not in it)' % name)
+    if switch_version().encode() not in data:
+        problems.append('not built as Downhill Switch %s (switch_version.h changed since?)' % switch_version())
     # The strings, each with what is around it, so a match can be judged without running the scan
     # again by hand. The game's own paths that hold the project's name (its SD card folder, its
     # repository's address) are blanked first: rel.OWN_PATHS says why that cannot hide a leak.
@@ -103,7 +115,8 @@ def main():
         print('IGNORED (--skip-checks): ' + line)
 
     OUT.mkdir(parents=True, exist_ok=True)
-    zip_path = OUT / ('DownhillRevived-%s-switch-experimental.zip' % name)
+    release = switch_version()
+    zip_path = OUT / ('DownhillSwitch-%s.zip' % release)
     files = [(FOLDER + 'dhd.nro', a.nro.read_bytes()),
              (FOLDER + 'dhd.ini', rel.lf(RELEASE / 'switch-dhd.ini')),
              (FOLDER + 'README.txt', rel.lf(RELEASE / 'SWITCH-NOTES.txt')),
@@ -118,7 +131,7 @@ def main():
             z.writestr(path, content)
 
     # The folder beside the archive, so the layout can be looked at without unzipping.
-    folder = OUT / ('DownhillRevived-%s-switch' % name)
+    folder = OUT / ('DownhillSwitch-%s' % release)
     if folder.exists():
         shutil.rmtree(folder)
     for path, content in files:

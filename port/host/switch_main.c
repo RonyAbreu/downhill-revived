@@ -18,7 +18,9 @@
 #include "dhd_settings.h"
 #include "../switch/clocks_switch.h"
 
-#define DEFAULT_DIR "sdmc:/switch/downhill-revived/"
+#include "../switch/switch_version.h"
+
+#define DEFAULT_DIR DHD_SWITCH_DIR
 
 int dhd_launcher_main(int argc, char **argv);
 
@@ -165,7 +167,7 @@ int main(int argc, char **argv)
     /* SETTINGS without the window rows: one screen, as on a phone */
     setenv("DHD_PC_SETTINGS_ROWS", "DHD_SCALE,DHD_ASPECT,DHD_PRESENT_FILTER,DHD_WIDESCREEN,DHD_SKIP_MOVIES,DHD_VIBRATION,"
            "DHD_STICK_DEAD_ZONE,DHD_PROMPTS,DHD_TEXTURES,DHD_FONT,DHD_FPS,DHD_VSYNC,DHD_PERF_COUNTER,DHD_UNLOCK_ALL", 0);
-    fprintf(stderr, "switch: Downhill Revived in %s\n", dir);
+    fprintf(stderr, "switch: %s %s by %s in %s\n", DHD_SWITCH_NAME, DHD_SWITCH_VERSION, DHD_SWITCH_AUTHOR, dir);
     /* The clocks before the game starts: Horizon hands a homebrew the handheld defaults, and at
        GPU 307.2 MHz the native renderer is fill-rate bound (finding 144, NX3). */
     char clocks[16];
