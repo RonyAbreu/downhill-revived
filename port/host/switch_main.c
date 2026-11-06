@@ -102,10 +102,14 @@ static void switch_exit_now(void)
 {
     int gs_native_halt(unsigned ms);   /* port/gs/native_core.inc */
     void host_freeze_watch_stop(unsigned ms);   /* port/hle/host.c: a thread waking every second */
+    void switch_profile_stop(const char *dir);   /* port/switch/profile.c */
+    switch_profile_stop(dir);
     int halted = gs_native_halt(1000);
     host_freeze_watch_stop(1500);
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
     switch_shutdown();
+    int switch_thread_census(unsigned ms);   /* port/switch/clocks.c */
+    switch_thread_census(1000);
     const char *how = getenv("DHD_SWITCH_EXIT");
     int kernel = how && !strcmp(how, "kernel");
     fprintf(stderr, "switch: the process ends (%s%s)\n", kernel ? "svcExitProcess" : "back to the loader",
@@ -174,6 +178,9 @@ int main(int argc, char **argv)
     char cores[8];
     if (!getenv("DHD_SWITCH_CORES") && dhd_settings_read(ini, "DHD_SWITCH_CORES", cores, sizeof cores))
         setenv("DHD_SWITCH_CORES", cores, 1);
+    char profile[8];   /* DHD_SWITCH_PROFILE likewise: decided at the first named thread */
+    if (!getenv("DHD_SWITCH_PROFILE") && dhd_settings_read(ini, "DHD_SWITCH_PROFILE", profile, sizeof profile))
+        setenv("DHD_SWITCH_PROFILE", profile, 1);
 
     char *args[] = {exe, NULL};
     int code = dhd_launcher_main(1, args);

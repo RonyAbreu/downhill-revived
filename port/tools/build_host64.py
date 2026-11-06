@@ -109,7 +109,7 @@ ANDROID_EXPORTS = '{\n  global: SDL_main;\n  local: *;\n};\n'
 SWITCH_HOST = {'port/host/host_win32.c': 'port/host/host_switch.c'}
 SWITCH_UNITS = ['port/host/switch_main.c', 'port/switch/render_gl.c', 'port/switch/render_native.c',
                 'port/switch/render_stubs.c', 'port/switch/textures.c', 'port/switch/clocks.c',
-                'port/switch/png_switch.c',
+                'port/switch/png_switch.c', 'port/switch/profile.c',
                 'port/switch/rust_shims.c']
 DEVKITPRO = Path(os.environ.get('DEVKITPRO') or '/opt/devkitpro')
 

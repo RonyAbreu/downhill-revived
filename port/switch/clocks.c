@@ -168,9 +168,67 @@ static int core_list(int *cores, int max)
     return n;
 }
 
+/* Every named thread's kernel id, for the census at exit (switch_thread_census). */
+static struct { const char *name; u64 id; } named_threads[16];
+static int named_count;
+
+static void switch_thread_named(const char *name)
+{
+    u64 id;
+    if (!name || R_FAILED(svcGetThreadId(&id, CUR_THREAD_HANDLE))) return;
+    int i = __atomic_fetch_add(&named_count, 1, __ATOMIC_ACQ_REL);
+    if (i < 16) { named_threads[i].name = name; named_threads[i].id = id; }
+}
+
+/* At the return to the loader (switch_main.c): which threads of this process are still there
+   besides the caller. The Homebrew Menu is loaded into this same process next, so anything listed
+   here is a thread that may wake inside it (finding 144). Waits up to ms for them to go, then
+   names what is left: a named thread by its name, any other by its kernel id. Returns how many. */
+int switch_thread_census(unsigned ms)
+{
+    u64 self = 0, ids[64];
+    s32 count = 0;
+    svcGetThreadId(&self, CUR_THREAD_HANDLE);
+    /* The process's own handle, not the pseudo-handle (GetThreadList refuses pseudo-handles) nor
+       0, which lists every thread on the console: the loader hands it over (envGetOwnProcessHandle) */
+    Handle process = envGetOwnProcessHandle();
+    if (process == CUR_PROCESS_HANDLE) {
+        fprintf(stderr, "switch: no process handle from the loader: the threads left are not counted\n");
+        return -1;
+    }
+    for (unsigned waited = 0;; waited += 10) {
+        Result rc = svcGetThreadList(&count, ids, 64, process);
+        if (R_FAILED(rc)) {
+            fprintf(stderr, "switch: the thread list could not be read (0x%X)\n", (unsigned)rc);
+            return -1;
+        }
+        int others = 0;
+        for (s32 i = 0; i < count && i < 64; i++) others += ids[i] != self;
+        if (!others || waited >= ms) break;
+        svcSleepThread(10000000);
+    }
+    char line[512];
+    int at = snprintf(line, sizeof line, "switch: threads left at the return:");
+    int left = 0;
+    for (s32 i = 0; i < count && i < 64 && at < (int)sizeof line - 32; i++) {
+        if (ids[i] == self) continue;
+        const char *name = NULL;
+        for (int k = 0; k < named_count && k < 16; k++)
+            if (named_threads[k].id == ids[i]) name = named_threads[k].name;
+        at += name ? snprintf(line + at, sizeof line - at, " %s", name)
+                   : snprintf(line + at, sizeof line - at, " #%llu", (unsigned long long)ids[i]);
+        left++;
+    }
+    fprintf(stderr, "%s%s\n", line, left ? "" : " none");
+    return left;
+}
+
 void switch_thread_core(const char *name)
 {
     static int cores[8], count = -1, on;
+    void switch_profile_thread(const char *name);   /* profile.c: DHD_SWITCH_PROFILE */
+    switch_profile_thread(name);
+    switch_thread_named(name);
     if (count < 0) {
         const char *want = getenv("DHD_SWITCH_CORES");
         on = want && (!strcasecmp(want, "on") || !strcmp(want, "1"));

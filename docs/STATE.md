@@ -609,7 +609,7 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   at scale 2 fell from 25-26 to 17-20 fields/s, `limit=cpu:gs` with gs 43-57 ms busy: at scale 2
   the native renderer is 37 ms a field, and the map shares its core with gs. The map was chosen
   from scale 1 (renderer 3-4 ms); it stays off by default.
-- **EXIT GAME's crash (fixed, untested).** Atmosphère's crash report: SDL's main thread in
+- **EXIT GAME's crash (fixed).** Atmosphère's crash report: SDL's main thread in
   `SWITCH_PollTouch -> hidGetTouchScreenStates -> diagAbortWithResult` (2345-0008).
   `gs_pump_messages` calls `exit(0)` from the game thread with every other thread still running,
   and libnx's teardown closed HID under SDL's event pump; `switch_shutdown` (the clocks back)
@@ -629,7 +629,39 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   VU and GS workers and the clock keeper were already joined. Verified on hardware: EXIT GAME
   returns to the Homebrew Menu with no error screen and no new crash report.
   `DHD_SWITCH_EXIT = kernel` keeps the svcExitProcess ending. In 2x with the scanout fixed: 41-47
-  fields/s in races, `cpu:game`/`cpu:vu`, render 3-4 ms.
+  fields/s in races, `cpu:game`/`cpu:vu`, render 3-4 ms. One later exit (with the profiler on)
+  crashed inside sphaira's own code, a null read, after our log had ended; the next two did not.
+  The exit now lists the threads of the process still there besides the main one
+  (`switch_thread_census`, clocks.c: `svcGetThreadList` on the loader's process handle -- 0
+  lists every thread on the console), named when they are ours, so another such crash can be
+  told apart from a sphaira fault.
+- **NX3, the CPU threads measured on the console (2026-11-06).** `DHD_SWITCH_PROFILE = 1`
+  (port/switch/profile.c) samples the named threads about 1,000 times a second from a thread of
+  its own: it pauses each one (`svcSetThreadActivity`), reads its PC and LR
+  (`svcGetThreadContext3`), and for a sample in a kernel wait walks its frame records a few calls
+  up while it is still paused. It writes `profile.txt` beside dhd.log at exit, which
+  `port/switch/profile_report.py` symbolizes against dhd.elf. Every 10 s it logs each thread's
+  share of the wall clock run (the kernel's `ThreadTickCount`), waiting and ready-but-not-running.
+  What it found at scale 2, races:
+  - The game thread spent 22% of its samples waiting for the VU/GS chain, 7% of it spinning in
+    `idle_wait` (512 pauses before each sleep) on three cores the other threads want. The spin is
+    now 0 on the Switch (`DHD_QUEUE_SPINS`, graphics_queue.c): 40.9 -> 45.0 fields/s in a race,
+    41.6 -> 49.7 in the menus.
+  - The VU and GS threads then lost 5-7% each to a lock: `wake` read the semaphore's value
+    before signalling it, and newlib's semaphore is a mutex and a condition variable, the mutex
+    held by the sleeper's own `sem_wait`. `wake` now keeps an atomic "signalled" flag per
+    semaphore, cleared by the sleeper before it announces itself, so it takes the mutex only to
+    post: the lock fell to 0.2-0.3% of each thread.
+  - Ready-but-not-running stays at 2-9%: placement is not the limit, the work is. On a long race
+    the game thread now runs 93-96% of the wall clock (`limit=cpu:game`), the VU 80-94% and the GS
+    55-73%: the three cores are nearly full. 41.6-43.3 fields/s there, the menus 44-49.
+  - What is left on the game thread: the recompiled EE (`rc_func_0021B8A8` 7.5%, `00213C08`
+    4.5%, `0021CC44` 2.9%), VU0 macro code (`ps2_vu0_run`, `native0_transform`, `vu0c_*`, about
+    7%), and **the sound mixer, about 9%** (`render`, `reverb_sample`, `snd_adsr_tick`), which
+    runs on the game thread inside the core. On the VU thread: `native_clip_run` 9%,
+    `ps2_vu1_run` 8.6%, `unpack_stream` 7.5%, `vif_feed` 5.9%, and `memset` 3.2% (two thirds of
+    it the 512-byte `component_ready` clear at every `native_clip_run`, the rest `ps2_vu1_run`'s
+    1 KB state clear 90,000 times a second).
 - Where the two scales stand on hardware (menus, clocks at `max`): scale 1 about 47 fields/s and
   playable, limited by the VU thread; scale 2 about 24, limited by the render thread, with the
   draws 40-43 ms a picture against 1-12 at scale 1 -- four times the pixels for about four times
