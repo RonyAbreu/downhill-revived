@@ -676,6 +676,11 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
     `ps2_vu1_run` 8.6%, `unpack_stream` 7.5%, `vif_feed` 5.9%, and `memset` 3.2% (two thirds of
     it the 512-byte `component_ready` clear at every `native_clip_run`, the rest `ps2_vu1_run`'s
     1 KB state clear 90,000 times a second).
+  - The CPU and renderer work merged (no profiler), same track: race **43.8 fields/s, low1%
+    24.5, worst field 186 ms**, menus 47.5; EXIT GAME back to the menu with no crash. The exit's
+    census listed `game`, `native` and one unnamed thread: the first two had ended (threadExit,
+    the render thread's quit) but were never joined, so the list cannot yet tell a thread that
+    ended from one still running.
 - Where the two scales stand on hardware (menus, clocks at `max`): scale 1 about 47 fields/s and
   playable, limited by the VU thread; scale 2 about 24, limited by the render thread, with the
   draws 40-43 ms a picture against 1-12 at scale 1 -- four times the pixels for about four times
