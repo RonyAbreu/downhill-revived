@@ -681,6 +681,17 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
     census listed `game`, `native` and one unnamed thread: the first two had ended (threadExit,
     the render thread's quit) but were never joined, so the list cannot yet tell a thread that
     ended from one still running.
+- **NX3, the sound mixer voice by voice (done, finding 147).** The game thread's ~9% in the
+  989snd mixer: it can only move off the thread as a second, native copy of the mixer (the core
+  is one wasm2c instance, and the driver reads what the mixer moves on). `render` now runs each
+  sounding voice over a whole 200-sample driver period, and the streams, reverb and gain trace
+  per sample as before. The output is bit-exact: `test_sound` and 40 seeded random RPC/render
+  sequences give the same PCM and polled state through the core's wasm2c path. The mixer takes
+  about a fifth less time on the bench. Same track on hardware: race **44.6 fields/s** (43.8),
+  game busy **20.87 ms** a field (22.06; the 30-second windows spread over 4 ms, so the change
+  explains about 0.4 of it), low1% 22.7, the same 4 underruns (start-up and load), and the
+  player heard no difference. The native mixer copy is left until the game thread is still the
+  limit after the VU and renderer work.
 - Where the two scales stand on hardware (menus, clocks at `max`): scale 1 about 47 fields/s and
   playable, limited by the VU thread; scale 2 about 24, limited by the render thread, with the
   draws 40-43 ms a picture against 1-12 at scale 1 -- four times the pixels for about four times
