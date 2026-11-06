@@ -146,7 +146,7 @@ typedef struct FieldCost {
     uint64_t draws_ns, collect_ns, scan_ns;
     uint32_t links;   uint64_t link_ns;
     uint32_t surfaces; uint64_t surface_ns;
-    uint64_t uploads, upload_ns, upload_bytes;
+    uint64_t uploads, upload_ns, upload_bytes, alloc_ns, reused;
     uint64_t present_began, present_ended;   /* dhdr_native_present, 0 when it did not run */
     uint32_t draws, copies, imports, converts;
 } FieldCost;
@@ -199,12 +199,13 @@ static void slow_field_check(uint64_t now)
                         : pace >= own ? "pacing" : swap >= picture + present ? "the swap (GPU or display)"
                         : "the render thread";
     fprintf(stderr, "gs native: slow field %.1f ms: picture %.1f (draws %.1f over %u draws, %u links %.1f ms, "
-                    "%llu uploads %.1f ms %.0f KiB, %u surfaces %.1f ms, %u copies, %u imports, %u conversions, "
+                    "%llu uploads %.1f ms %.0f KiB (new textures %.1f ms, %llu reused), %u surfaces %.1f ms, %u copies, %u imports, %u conversions, "
                     "dead textures %.1f, "
                     "scanout %.1f), present %.1f, pacing %.1f, swap %.1f, %u surfaces made for the next %.1f, "
                     "waiting for the next field %.1f -> %s\n",
             ms, picture, c->draws_ns / 1e6, c->draws, c->links, c->link_ns / 1e6,
-            (unsigned long long)c->uploads, c->upload_ns / 1e6, c->upload_bytes / 1024.0, c->surfaces,
+            (unsigned long long)c->uploads, c->upload_ns / 1e6, c->upload_bytes / 1024.0, c->alloc_ns / 1e6,
+            (unsigned long long)c->reused, c->surfaces,
             c->surface_ns / 1e6, c->copies, c->imports, c->converts, c->collect_ns / 1e6, c->scan_ns / 1e6, present, pace, swap,
             next->surfaces, before, wait, verdict);
 }
@@ -463,6 +464,10 @@ static const char *native_fragment_source =
     "    }\n"
     "    vec4 color = combine(t);\n"
     "    frag_color = vec4(color.rgb / 255.0, clamp(color.a / alpha_div, 0.0, 1.0));\n"
+    /* Flag 4096 (native_core.inc): the GS blend is Cd * (1 + As / 128), which no blend factor
+       gives. The colour leaves the shader as As / 128 and the blend is DstColor, One:
+       Cd * As / 128 + Cd. Exact up to As = 128; above, the output stops at 1 (Cd * 2). */
+    "    if ((flags & 4096u) != 0u) frag_color.rgb = vec3(clamp(color.a / 128.0, 0.0, 1.0));\n"
     "}\n";
 
 /* native_scanout (native.wgsl), the exact (non-"fast") form: da = display[0..3] (psm, bw, scale
@@ -1718,8 +1723,9 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
     /* The phases are always timed (three clock reads a picture), for the slow field line. */
     uint64_t t0 = SDL_GetTicksNS(), t1 = 0, t2 = 0, t3 = 0;
     slow_field_check(t0);
-    uint64_t uploads0, upload_ns0, upload_bytes0;
+    uint64_t uploads0, upload_ns0, upload_bytes0, alloc_ns0, reused0;
     dhdr_tex_upload_stats(&uploads0, &upload_ns0, &upload_bytes0);
+    dhdr_tex_upload_split(&alloc_ns0, &reused0);
     g_cost.start = t0;
     uint64_t program_changes = 0, texture_binds = 0;
     /* Textured draws this renderer still cannot give a texture to, by what it would have
@@ -1966,6 +1972,7 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
         int uses_as = blend_uses_as(blend_key);
         DepthState zs = { z != NULL, z && (k->depth_key & 4), (uint32_t)(k->depth_key & 3) };
         BlendState bs = { blends, blend_factor(src), blend_factor(dst), op };
+        if (blends && (flags & 4096u)) bs = (BlendState){ 1, GL_DST_COLOR, GL_ONE, GL_FUNC_ADD };
         if (blends && (src == 14 || src == 15 || dst == 14 || dst == 15) &&
             (!held_fix_set || held_fix != k->blend_fix)) {
             float fix = (float)k->blend_fix / 128.0f;   /* all four channels (render.rs set_state) */
@@ -2021,6 +2028,10 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
         g_cost.uploads = uploads - uploads0;
         g_cost.upload_ns = upload_ns - upload_ns0;
         g_cost.upload_bytes = upload_bytes - upload_bytes0;
+        uint64_t alloc_ns, reused;
+        dhdr_tex_upload_split(&alloc_ns, &reused);
+        g_cost.alloc_ns = alloc_ns - alloc_ns0;
+        g_cost.reused = reused - reused0;
         g_cost.draws_ns = t1 - t0; g_cost.collect_ns = t2 - t1; g_cost.scan_ns = t3 - t2;
         g_cost.draws = out->draws; g_cost.copies = out->copies; g_cost.imports = out->imports;
         g_cost.converts = (uint32_t)out_converts;
