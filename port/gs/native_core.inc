@@ -2443,12 +2443,54 @@ static void native_zread_after(Native *n)
 
 }
 
+#if defined(__SWITCH__) && !defined(NATIVE_INLINE)
+/* The Switch's idle uploads (port/switch/textures.c, finding 145): new textures the GS worker
+   made are uploaded while the render thread waits for the field that samples them, one at a
+   time so a field handed over waits for one upload at most. The GS worker's first texture into
+   an empty queue wakes the wait (native_idle_wake, under queue_lock, so it cannot fall between
+   the check below and the sleep). Not another thread: the driver's contexts share one command
+   buffer with no lock. */
+int dhdr_switch_idle(DhdrNative *r);
+int dhdr_tex_idle_pending(void);
+void dhdr_tex_idle_waker(void (*wake)(void *), void *arg);
+
+static void native_idle_wake(void *argument)
+{
+    Native *n = argument;
+    native_mutex_lock(&n->queue_lock);
+    native_cond_broadcast(&n->queue_changed);
+    native_mutex_unlock(&n->queue_lock);
+}
+
+/* queue_lock held on entry and on return. */
+static void native_idle_uploads(Native *n)
+{
+    static int registered;
+    if (!registered) { registered = 1; dhdr_tex_idle_waker(native_idle_wake, n); }
+    while (!n->pending_count && !n->quit) {
+        if (!dhdr_tex_idle_pending()) {
+            native_cond_wait(&n->queue_changed, &n->queue_lock);
+            continue;
+        }
+        native_mutex_unlock(&n->queue_lock);
+        native_mutex_lock(&n->context_lock);
+        int did = dhdr_switch_idle(n->r);
+        native_mutex_unlock(&n->context_lock);
+        native_mutex_lock(&n->queue_lock);
+        if (!did) break;   /* no context yet: wait as before */
+    }
+}
+#endif
+
 /* The next handed field drawn and its frame recycled; 0 once told to quit. The render thread's
    loop, or with NATIVE_INLINE the field's own vsync (the field is already pending, so no wait). */
 static int native_render_next(Native *n)
 {
     double rs_wait = native_rstat_start(), waited = perf_log_on() ? host_wall_seconds() : 0;
     native_mutex_lock(&n->queue_lock);
+#if defined(__SWITCH__) && !defined(NATIVE_INLINE)
+    native_idle_uploads(n);
+#endif
     NATIVE_WAIT(n, !n->pending_count && !n->quit);
     if (n->quit) { native_mutex_unlock(&n->queue_lock); return 0; }
     NativeFrame *f = n->pending[0];

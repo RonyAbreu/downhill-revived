@@ -81,6 +81,7 @@ typedef struct DrawProgram {
     GLint u_target_size, u_flags, u_scale, u_atst, u_aref, u_fog;
     GLint u_alpha_scale, u_texa_alpha, u_tex_offset, u_tex_size, u_wrap, u_region, u_alpha_div;
     GLint u_texels_size;       /* the GL texture's own size, so the shader never asks for it */
+    GLint u_texels_origin;     /* where a decoded texture's texels start in it (an atlas slot) */
     /* What the program already holds. A GS picture is thousands of draws whose state mostly
        repeats, and a uniform the program already has is a driver call for nothing; `held` says
        the fields below are what was last sent to this program (uniforms are per program, so
@@ -88,7 +89,7 @@ typedef struct DrawProgram {
     int held;
     float h_target[2], h_fog[4], h_alpha_scale, h_texa_alpha, h_alpha_div;
     uint32_t h_flags, h_scale, h_atst, h_aref, h_tex_size[2], h_wrap[2], h_region[4];
-    int32_t h_tex_offset[2], h_texels_size[2];
+    int32_t h_tex_offset[2], h_texels_size[2], h_texels_origin[2];
 } DrawProgram;
 
 /* The scanout's forms (DHD_SWITCH_SCANOUT): a draw with the divisions in float (the default), the
@@ -122,6 +123,7 @@ struct DhdrNative {
     /* Conversions (run_convert): the program, the inverse table, the constants block, and one
        converted texture per conversion index (convert.rs's converted[64]). */
     GLuint convert_program, convert_inverse, convert_constants;
+    GLint convert_base_rect;
     struct { GLuint texture; uint32_t w, h; } converted[CONVERTS];
     int point_filter;
     /* The Z probe (finding 097, zread.rs): a compute pass copies the probed patch of a Z surface
@@ -147,6 +149,7 @@ typedef struct FieldCost {
     uint32_t links;   uint64_t link_ns;
     uint32_t surfaces; uint64_t surface_ns;
     uint64_t uploads, upload_ns, upload_bytes, alloc_ns, reused;
+    uint64_t idle_uploads, idle_ns, idle_bytes;   /* uploaded while waiting for the field (dhdr_switch_idle) */
     uint64_t present_began, present_ended;   /* dhdr_native_present, 0 when it did not run */
     uint32_t draws, copies, imports, converts;
 } FieldCost;
@@ -167,6 +170,10 @@ static int slow_field_ms(void)
     }
     return ms;
 }
+
+/* profile.c: with DHD_SWITCH_PROFILE on, what each sampled thread did over the last `ms`
+   milliseconds, kept as window `id` for profile.txt (0 when the profiler is off). */
+unsigned switch_profile_window(double ms);
 
 /* At a picture's start: the last cycle, logged when it was slow. */
 static void slow_field_check(uint64_t now)
@@ -190,24 +197,31 @@ static void slow_field_check(uint64_t now)
         }
     }
     /* Surfaces made for this picture ran after the last swap, outside both pictures. */
-    double before = next->surface_ns / 1e6;
-    wait = now > last ? (now - last) / 1e6 - before : 0;
+    double before = next->surface_ns / 1e6, idle = next->idle_ns / 1e6;
+    wait = now > last ? (now - last) / 1e6 - before - idle : 0;
     if (wait < 0) wait = 0;
-    /* What the cycle went into most: this thread's own work, the pacing, or the wait for a field. */
+    /* What the cycle went into most: this thread's own work, the pacing, or the wait for a field.
+       Uploads made while waiting ran while no field was there to draw, so they are not this
+       thread's delay unless they outlast everything else. */
     double own = picture + present + swap + before;
-    const char *verdict = wait >= own && wait >= pace ? "the CPU threads (waiting for the next field)"
+    const char *verdict = idle > wait && idle >= own && idle >= pace ? "uploads while waiting"
+                        : wait >= own && wait >= pace ? "the CPU threads (waiting for the next field)"
                         : pace >= own ? "pacing" : swap >= picture + present ? "the swap (GPU or display)"
                         : "the render thread";
-    fprintf(stderr, "gs native: slow field %.1f ms: picture %.1f (draws %.1f over %u draws, %u links %.1f ms, "
+    unsigned window = switch_profile_window(ms);
+    char profiled[48] = "";
+    if (window) snprintf(profiled, sizeof profiled, " [profile window %u]", window);
+    fprintf(stderr, "gs native: slow field at %.1f s, %.1f ms: picture %.1f (draws %.1f over %u draws, %u links %.1f ms, "
                     "%llu uploads %.1f ms %.0f KiB (new textures %.1f ms, %llu reused), %u surfaces %.1f ms, %u copies, %u imports, %u conversions, "
                     "dead textures %.1f, "
                     "scanout %.1f), present %.1f, pacing %.1f, swap %.1f, %u surfaces made for the next %.1f, "
-                    "waiting for the next field %.1f -> %s\n",
-            ms, picture, c->draws_ns / 1e6, c->draws, c->links, c->link_ns / 1e6,
+                    "%llu uploaded while waiting %.1f ms %.0f KiB, waiting for the next field %.1f -> %s%s\n",
+            now / 1e9, ms, picture, c->draws_ns / 1e6, c->draws, c->links, c->link_ns / 1e6,
             (unsigned long long)c->uploads, c->upload_ns / 1e6, c->upload_bytes / 1024.0, c->alloc_ns / 1e6,
             (unsigned long long)c->reused, c->surfaces,
             c->surface_ns / 1e6, c->copies, c->imports, c->converts, c->collect_ns / 1e6, c->scan_ns / 1e6, present, pace, swap,
-            next->surfaces, before, wait, verdict);
+            next->surfaces, before, (unsigned long long)next->idle_uploads, idle, next->idle_bytes / 1024.0, wait,
+            verdict, profiled);
 }
 
 /* ---- shaders (native.wgsl, translated line for line for the untextured step 1 subset) ---- */
@@ -276,6 +290,9 @@ static const char *native_fragment_source =
     /* The sampled texture's own size, which the host knows: no textureSize anywhere, and a
        bilinear fetch would have asked for it four times over. */
     "uniform ivec2 texels_size;\n"
+    /* A decoded texture's first texel in its GL texture: a slot of an atlas page (textures.c),
+       0, 0 when it has a texture of its own. The bounds stay its own size. */
+    "uniform ivec2 texels_origin;\n"
     "#ifdef TEXELS\n"
     "uniform usampler2D native_texels;\n"
     "#else\n"
@@ -325,7 +342,7 @@ static const char *native_fragment_source =
     "#ifdef TEXELS\n"
     "uint load_texels(ivec2 xy) {\n"
     "    ivec2 size = texels_size;\n"
-    "    uint w = texelFetch(native_texels, clamp(xy, ivec2(0), size - 1), 0).x;\n"
+    "    uint w = texelFetch(native_texels, texels_origin + clamp(xy, ivec2(0), size - 1), 0).x;\n"
     "    return (all(greaterThanEqual(xy, ivec2(0))) && all(lessThan(xy, size))) ? w : 0u;\n"
     "}\n"
     /* A decoded texel's RGBA bytes in GS units (texel_bytes). */
@@ -632,6 +649,7 @@ static int find_draw_uniforms(DrawProgram *d, const char *sampler_name, GLint un
 {
     if (!d->id) return 0;
     d->u_texels_size = glGetUniformLocation(d->id, "texels_size");
+    d->u_texels_origin = glGetUniformLocation(d->id, "texels_origin");
     d->u_target_size = glGetUniformLocation(d->id, "target_size");
     d->u_flags = glGetUniformLocation(d->id, "flags");
     d->u_scale = glGetUniformLocation(d->id, "nscale");
@@ -1429,10 +1447,12 @@ static const char *convert_source =
     "    if (any(lessThan(xy, ivec2(0))) || any(greaterThanEqual(xy, size))) return vec4(0.0);\n"
     "    return texelFetch(t, ivec2(xy.x, size.y - 1 - xy.y), 0);\n"
     "}\n"
+    /* base_rect: the decoded texture's origin in its GL texture (an atlas slot) and its size. */
+    "uniform ivec4 base_rect;\n"
     "uint load_base(ivec2 xy) {\n"
-    "    ivec2 size = textureSize(convert_base, 0);\n"
+    "    ivec2 size = base_rect.zw;\n"
     "    if (any(lessThan(xy, ivec2(0))) || any(greaterThanEqual(xy, size))) return 0u;\n"
-    "    return texelFetch(convert_base, xy, 0).x;\n"
+    "    return texelFetch(convert_base, base_rect.xy + xy, 0).x;\n"
     "}\n"
     "uint bits_per_pixel(uint psm) {\n"
     "    if (psm == 1u || psm == 49u) return 24u;\n"
@@ -1573,6 +1593,7 @@ static int ensure_convert(DhdrNative *n)
     if (failed) return 0;
     n->convert_program = link_program(NULL, NULL, NULL, convert_source);
     if (!n->convert_program) { failed = 1; return 0; }
+    n->convert_base_rect = glGetUniformLocation(n->convert_program, "base_rect");
     static uint32_t inverse[8192];
     inverse_table(inverse);
     glGenBuffers(1, &n->convert_inverse);
@@ -1623,11 +1644,18 @@ static GLuint run_convert(DhdrNative *n, const DhdrPicture *p, int32_t i, uint32
         n->converted[i].w = w; n->converted[i].h = h;
     }
     GLuint base = v->base ? dhdr_tex_gl(v->base) : 0;
+    int32_t base_x = 0, base_y = 0;
+    uint32_t base_w = 1, base_h = 1;   /* the dummy's */
+    if (base) {
+        dhdr_tex_origin(v->base, &base_x, &base_y);
+        dhdr_tex_size(v->base, &base_w, &base_h, NULL);
+    }
     glBindBuffer(GL_UNIFORM_BUFFER, n->convert_constants);
     glBufferData(GL_UNIFORM_BUFFER, sizeof constants, &constants, GL_STREAM_DRAW);   /* orphaned */
     glBindBufferBase(GL_UNIFORM_BUFFER, 0, n->convert_constants);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, n->convert_inverse);
     glUseProgram(n->convert_program);
+    glUniform4i(n->convert_base_rect, base_x, base_y, (GLint)base_w, (GLint)base_h);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, base ? base : dhdr_tex_dummy_texels());
     for (int s = 0; s < 4; s++) {
@@ -1830,6 +1858,7 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
         unsigned key = PROGRAM_TEXELS;
         GLuint texture = 0, sampler = 0;
         uint32_t tw_texels = 1, th_texels = 1, source_scale = 1;
+        int32_t origin[2] = { 0, 0 };   /* a decoded texture's atlas slot (dhdr_tex_origin) */
         if (k->texture_surface >= 0 && (uint32_t)k->texture_surface < DHDR_NATIVE_SURFACE_COUNT &&
             !(flags & 2048u)) {
             NativeSurface *src = &n->surfaces[k->texture_surface];
@@ -1856,6 +1885,7 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
         } else if (!(flags & 2048u) && k->texture_surface < 0 && k->convert < 0 && k->texture &&
                    (texture = dhdr_tex_gl(k->texture))) {
             dhdr_tex_size(k->texture, &tw_texels, &th_texels, NULL);
+            dhdr_tex_origin(k->texture, &origin[0], &origin[1]);
             if (flags & 32u) key |= PROGRAM_BILINEAR;
         } else if (!(flags & 2048u) && k->texture_surface < 0 && k->convert >= 0) {
             /* A conversion, run again for each run of draws (render.rs's last_convert rule: the
@@ -1901,6 +1931,11 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
             if (bound_program != d->id) { glUseProgram(d->id); bound_program = d->id; program_changes++; }
             glUniform2i(d->u_texels_size, (GLint)tw_texels, (GLint)th_texels);
             d->h_texels_size[0] = (int32_t)tw_texels; d->h_texels_size[1] = (int32_t)th_texels;
+        }
+        if (d->u_texels_origin >= 0 && (d->h_texels_origin[0] != origin[0] || d->h_texels_origin[1] != origin[1])) {
+            if (bound_program != d->id) { glUseProgram(d->id); bound_program = d->id; program_changes++; }
+            glUniform2i(d->u_texels_origin, origin[0], origin[1]);
+            d->h_texels_origin[0] = origin[0]; d->h_texels_origin[1] = origin[1];
         }
         if (bound_program != d->id) {
             glUseProgram(d->id);
@@ -2051,6 +2086,22 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
     out->display_width = n->display_width;
     out->display_height = n->display_height;
     return 1;
+}
+
+/* native_core.inc's render thread, while it waits for the next field with the context lock held:
+   one queued new texture uploaded (textures_gl.h, finding 145). 0 when there was none or no
+   context yet. */
+int dhdr_switch_idle(DhdrNative *n)
+{
+    if (!n || !n->ready || !gl_ready()) return 0;
+    uint64_t count, ns, bytes, count1, ns1, bytes1;
+    dhdr_tex_idle_stats(&count, &ns, &bytes);
+    int did = dhdr_tex_idle_upload();
+    dhdr_tex_idle_stats(&count1, &ns1, &bytes1);
+    g_cost.idle_uploads += count1 - count;
+    g_cost.idle_ns += ns1 - ns;
+    g_cost.idle_bytes += bytes1 - bytes;
+    return did;
 }
 
 int dhdr_native_picture(DhdrNative *n, const DhdrPicture *p, DhdrPictureResult *out)
