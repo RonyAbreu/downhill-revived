@@ -23,7 +23,7 @@
 
 #include "sound_gaussian.h"
 
-int32_t snd_gaussian_sample(const int16_t samples[4], unsigned phase)
+static inline __attribute__((always_inline)) int32_t gaussian(const int16_t samples[4], unsigned phase)
 {
     const int16_t *coefficients = snd_gaussian_table[phase & 255];
     /* Reconstruct four signed-32 products, then shift each independently.
@@ -36,6 +36,8 @@ int32_t snd_gaussian_sample(const int16_t samples[4], unsigned phase)
     product = _mm_add_epi32(product, _mm_shuffle_epi32(product, _MM_SHUFFLE(2,3,0,1)));
     return _mm_cvtsi128_si32(product);
 }
+
+int32_t snd_gaussian_sample(const int16_t samples[4], unsigned phase) { return gaussian(samples, phase); }
 
 extern volatile int32_t D_004CD380[]; /* disc-read status (iop.c, finding 020) */
 
@@ -169,7 +171,8 @@ void snd_adsr_release(SndAdsr *e)
     if (e->phase < 3) { e->phase = 3; e->counter = 0; }
 }
 
-int32_t snd_adsr_tick(SndAdsr *e)
+/* Inlined into the mixer's loops; snd_adsr_tick is the same, for the tests and the grains. */
+static inline __attribute__((always_inline)) int32_t adsr_tick(SndAdsr *e)
 {
     if (!e->direct && e->phase < 4) {
         uint32_t inc;
@@ -211,6 +214,8 @@ int32_t snd_adsr_tick(SndAdsr *e)
     }
     return e->level;
 }
+
+int32_t snd_adsr_tick(SndAdsr *e) { return adsr_tick(e); }
 
 /* ---------------- bank (.BNK, 989snd SBlk) ----------------
    The file attributes describe metadata and sample chunks. Version-1 sound
@@ -581,7 +586,7 @@ static int32_t voice_interpolated(Voice *v)
     int16_t window[4];
     int i;
     if (v->sample <= BLOCK_SAMPLES - 4)
-        return snd_gaussian_sample(v->decoded + v->sample, v->frac >> 8);
+        return gaussian(v->decoded + v->sample, v->frac >> 8);
     if (v->sample > BLOCK_SAMPLES - 4 && !v->preview_ready) {
         uint32_t next = v->block + 1;
         SndAdpcm decoder = v->dec;
@@ -597,7 +602,7 @@ static int32_t voice_interpolated(Voice *v)
         int at = v->sample + i;
         window[i] = at < BLOCK_SAMPLES ? v->decoded[at] : v->preview[at - BLOCK_SAMPLES];
     }
-    return snd_gaussian_sample(window, v->frac >> 8);
+    return gaussian(window, v->frac >> 8);
 }
 
 static uint8_t stream_decode_block(const Stream *s, uint32_t block, int ch,
@@ -615,7 +620,7 @@ static int32_t stream_interpolated(Stream *s, int ch)
     int16_t window[4];
     int i;
     if (s->sample <= BLOCK_SAMPLES - 4)
-        return snd_gaussian_sample(s->pcm[ch] + s->sample, s->frac >> 4);
+        return gaussian(s->pcm[ch] + s->sample, s->frac >> 4);
     if (s->sample > BLOCK_SAMPLES - 4 && !s->preview_ready) {
         const Stream *next = s;
         uint32_t block = s->block + 1;
@@ -639,7 +644,7 @@ static int32_t stream_interpolated(Stream *s, int ch)
         int at = s->sample + i;
         window[i] = at < BLOCK_SAMPLES ? s->pcm[ch][at] : s->preview[ch][at - BLOCK_SAMPLES];
     }
-    return snd_gaussian_sample(window, s->frac >> 4);
+    return gaussian(window, s->frac >> 4);
 }
 
 static void stream_mix_parameters(Stream *s)
@@ -686,26 +691,25 @@ static void snd_debug_voices(void)
     if (grain_samples % 48000 == 0) fflush(snd_voice_trace);
 }
 
-/* Advances every voice and stream by one output sample into mix[2]. */
-static void mix_sample(int32_t mix[2])
+/* The mixer works in segments: the samples up to the next 200-sample driver tick (handlers_tick,
+   stream_parameters_tick, duckers_tick), at most SEGMENT. Inside one the voices are independent
+   of each other and of the streams (only a tick or an RPC starts, stops or changes one), and the
+   sums are integer, so each voice runs its whole segment at once: its state stays in registers
+   rather than being reloaded for every output sample (finding 146). The order of every voice's
+   own steps is the per-sample mixer's, so the PCM and what the driver reads back are unchanged. */
+#define SEGMENT 200
+
+/* One voice over the segment's n samples into dry[k] and wet[k] (its core's reverb input).
+   count and gain (DHD_SND_GAIN_TRACE only, else NULL): the voices that sounded at each sample
+   and the largest absolute voice volume among them. A voice that falls silent stays silent for
+   the rest of the segment (phase 4 and used = 0 change only by a tick or an RPC). */
+static void voice_run(Voice *v, int n, int32_t (*dry)[2], int32_t (*wet)[2], int *count, int *gain)
 {
-    int i;
-    int nvoices = 0, nstreams = 0, voice_gain = 0;
-    int32_t components[3][2] = {{0,0},{0,0},{0,0}};
-    int32_t wet[2][2] = {{0,0},{0,0}};
-    snd_debug_voices();
-    if (grain_samples && grain_samples % 200 == 0) {
-        handlers_tick(); stream_parameters_tick();
-        if (grain_samples % 800 == 0) duckers_tick();
-    }
-    grain_samples++;
-    mix[0] = mix[1] = 0;
-    for (i = 0; i < SND_VOICES; i++) {
-        Voice *v = &voices[i];
+    int k;
+    for (k = 0; k < n; k++) {
         int32_t s, level;
-        if (!v->used || v->paused)
-            continue;
-        if (v->env.phase == 4) continue; /* silent, but still allocated until driver polling */
+        if (!v->used) return;
+        if (v->env.phase == 4) return; /* silent, but still allocated until driver polling */
         /* SPU2 reads four source samples per output frame until its FIFO is
            more than 12 ahead. Reading the last END word stops a nonlooping
            voice before the pending FIFO tail is played. Static bank data is
@@ -717,25 +721,25 @@ static void mix_sample(int32_t mix[2])
             if (v->prefetch_write >= (v->adpcm_len / 16) * BLOCK_SAMPLES) {
                 v->env.phase = 4; v->env.level = 0;
                 if (!v->owner) v->used = 0;
-                continue;
+                return;
             }
         }
-        level = snd_adsr_tick(&v->env);
+        level = adsr_tick(&v->env);
         if (v->env.phase == 4) {
             if (!v->owner) v->used = 0;
-            continue;
+            return;
         }
-        nvoices++;
         s = voice_interpolated(v);
         if (v->owner && ((v->gain[0].reg | v->gain[1].reg) & 0x8000)) {
             v->vol_l = snd_volume_tick(&v->gain[0]);
             v->vol_r = snd_volume_tick(&v->gain[1]);
         }
-        if (snd_gain) {
+        if (count) {
             int left = v->vol_l < 0 ? -v->vol_l : v->vol_l;
             int right = v->vol_r < 0 ? -v->vol_r : v->vol_r;
-            if (left > voice_gain) voice_gain = left;
-            if (right > voice_gain) voice_gain = right;
+            count[k]++;
+            if (left > gain[k]) gain[k] = left;
+            if (right > gain[k]) gain[k] = right;
         }
         /* Gaussian's absolute coefficient sum is at most 32643, so its
            four signed-16 inputs and the clamped ADSR fit a signed-32 product.
@@ -743,8 +747,8 @@ static void mix_sample(int32_t mix[2])
         s = (s * level) >> 15;
         {
             int32_t left = (s * v->vol_l) >> 15, right = (s * v->vol_r) >> 15;
-            if (!(v->tone.flags & 16)) { mix[0] += left; mix[1] += right; }
-            if (v->tone.flags & (1 | 16)) { wet[v->core][0] += left; wet[v->core][1] += right; }
+            if (!(v->tone.flags & 16)) { dry[k][0] += left; dry[k][1] += right; }
+            if (v->tone.flags & (1 | 16)) { wet[k][0] += left; wet[k][1] += right; }
         }
         v->frac += v->step;
         while (v->frac >= 0x10000) {
@@ -771,80 +775,107 @@ static void mix_sample(int32_t mix[2])
         if (!v->owner && v->releasing && v->env.phase == 4)
             v->used = 0;
     }
-    components[0][0] = mix[0]; components[0][1] = mix[1];
-    for (i = 0; i < SND_STREAMS; i++) {
-        Stream *s = &streams[i];
-        int ch, level;
-        if (!s->used || s->paused || grain_samples <= s->play_at)
-            continue;
-        nstreams++;
-        level = snd_adsr_tick(&s->env);
-        if (!s->decoded) {
-            for (ch = 0; ch < (int)s->info.channels; ch++) {
-                uint8_t flags;
-                flags = stream_decode_block(s, s->block, ch, &s->dec[ch], s->pcm[ch]);
-                if (ch == 0 && (flags & 4)) {
-                    s->loop_block = s->block;
-                }
-                if (ch == 0) {
-                    s->repeat = (flags & 3) == 3;
-                    s->ended = (flags & 1) != 0;
-                }
-            }
-            s->decoded = 1;
-        }
-        stream_mix_parameters(s);
-        {
-            /* Retail group gain is quadratic (IOP 0x1B144). Group 15
-               bypasses group scaling; 16 is the final master control. */
-            for (ch = 0; ch < (int)s->info.channels; ch++) {
-                int32_t left = s->mix_gain[ch][0], right = s->mix_gain[ch][1];
-                int32_t sample = (stream_interpolated(s, ch) * level) >> 15;
-                mix[0] += snd_q15(sample, left);
-                mix[1] += snd_q15(sample, right);
-            }
-        }
-        /* libsd streams use a quantized SPU2 Q12 pitch register. Predictor
-           history advances only when entering a new ADPCM block. */
-        s->frac += s->pitch;
-        while (s->frac >= 4096 && s->used) {
-            s->frac -= 4096;
-            s->source_samples++;
-            if (++s->sample == BLOCK_SAMPLES) {
-                s->sample = 0;
-                s->block++;
-                s->decoded = 0;
-                s->preview_ready = 0;
-                if (s->ended || s->block * 16 >= s->info.channel_bytes) {
-                    /* 989snd maps RPC flag 4 to stream flag 0x400. Its
-                       EOF loader rewinds the original LSN/data cursor before
-                       considering the next cue, without re-keying the voice. */
-                    if (s->flags & 4) {
-                        s->block = 0;
-                        s->source_samples = 0;
-                    } else if (s->queue) {
-                        stream_next(s);
-                    } else if (s->info.loop_byte || (!s->disc_managed && s->repeat)) {
-                        s->block = s->info.loop_byte ? s->info.loop_byte / 16 : s->loop_block;
-                        s->source_samples = s->block * BLOCK_SAMPLES;
-                    } else
-                        s->used = 0;
-                }
-            }
-        }
+}
+
+/* Advances every voice and stream by n output samples (one segment) into mix[k]. */
+static void mix_segment(int32_t (*mix)[2], int n)
+{
+    static int32_t wet[2][SEGMENT][2];
+    static int count[SEGMENT], gain[SEGMENT];
+    int i, k;
+    snd_debug_voices();
+    if (grain_samples && grain_samples % 200 == 0) {
+        handlers_tick(); stream_parameters_tick();
+        if (grain_samples % 800 == 0) duckers_tick();
     }
-    components[1][0] = mix[0] - components[0][0];
-    components[1][1] = mix[1] - components[0][1];
-    for (i = 0; i < 2; i++) {
-        int32_t output[2];
-        reverb_sample(&reverbs[i], wet[i], output);
-        if (output[0] || output[1]) snd_wet_samples[i]++;
-        mix[0] += snd_q15(output[0], reverb_depth[i][0]);
-        mix[1] += snd_q15(output[1], reverb_depth[i][1]);
+    memset(mix, 0, (size_t)n * sizeof mix[0]);
+    memset(wet, 0, sizeof wet);
+    if (snd_gain) { memset(count, 0, sizeof count); memset(gain, 0, sizeof gain); }
+    for (i = 0; i < SND_VOICES; i++) {
+        Voice *v = &voices[i];
+        if (v->used && !v->paused)
+            voice_run(v, n, mix, wet[v->core], snd_gain ? count : NULL, snd_gain ? gain : NULL);
     }
-    components[2][0] = mix[0] - components[0][0] - components[1][0];
-    components[2][1] = mix[1] - components[0][1] - components[1][1];
-    snd_debug_gain_frame(grain_samples, components, nvoices, nstreams, voice_gain);
+    for (k = 0; k < n; k++) {
+        int nstreams = 0;
+        int32_t components[3][2];
+        grain_samples++;
+        components[0][0] = mix[k][0]; components[0][1] = mix[k][1];
+        for (i = 0; i < SND_STREAMS; i++) {
+            Stream *s = &streams[i];
+            int ch, level;
+            if (!s->used || s->paused || grain_samples <= s->play_at)
+                continue;
+            nstreams++;
+            level = adsr_tick(&s->env);
+            if (!s->decoded) {
+                for (ch = 0; ch < (int)s->info.channels; ch++) {
+                    uint8_t flags;
+                    flags = stream_decode_block(s, s->block, ch, &s->dec[ch], s->pcm[ch]);
+                    if (ch == 0 && (flags & 4)) {
+                        s->loop_block = s->block;
+                    }
+                    if (ch == 0) {
+                        s->repeat = (flags & 3) == 3;
+                        s->ended = (flags & 1) != 0;
+                    }
+                }
+                s->decoded = 1;
+            }
+            stream_mix_parameters(s);
+            {
+                /* Retail group gain is quadratic (IOP 0x1B144). Group 15
+                   bypasses group scaling; 16 is the final master control. */
+                for (ch = 0; ch < (int)s->info.channels; ch++) {
+                    int32_t left = s->mix_gain[ch][0], right = s->mix_gain[ch][1];
+                    int32_t sample = (stream_interpolated(s, ch) * level) >> 15;
+                    mix[k][0] += snd_q15(sample, left);
+                    mix[k][1] += snd_q15(sample, right);
+                }
+            }
+            /* libsd streams use a quantized SPU2 Q12 pitch register. Predictor
+               history advances only when entering a new ADPCM block. */
+            s->frac += s->pitch;
+            while (s->frac >= 4096 && s->used) {
+                s->frac -= 4096;
+                s->source_samples++;
+                if (++s->sample == BLOCK_SAMPLES) {
+                    s->sample = 0;
+                    s->block++;
+                    s->decoded = 0;
+                    s->preview_ready = 0;
+                    if (s->ended || s->block * 16 >= s->info.channel_bytes) {
+                        /* 989snd maps RPC flag 4 to stream flag 0x400. Its
+                           EOF loader rewinds the original LSN/data cursor before
+                           considering the next cue, without re-keying the voice. */
+                        if (s->flags & 4) {
+                            s->block = 0;
+                            s->source_samples = 0;
+                        } else if (s->queue) {
+                            stream_next(s);
+                        } else if (s->info.loop_byte || (!s->disc_managed && s->repeat)) {
+                            s->block = s->info.loop_byte ? s->info.loop_byte / 16 : s->loop_block;
+                            s->source_samples = s->block * BLOCK_SAMPLES;
+                        } else
+                            s->used = 0;
+                    }
+                }
+            }
+        }
+        components[1][0] = mix[k][0] - components[0][0];
+        components[1][1] = mix[k][1] - components[0][1];
+        for (i = 0; i < 2; i++) {
+            int32_t output[2];
+            reverb_sample(&reverbs[i], wet[i][k], output);
+            if (output[0] || output[1]) snd_wet_samples[i]++;
+            mix[k][0] += snd_q15(output[0], reverb_depth[i][0]);
+            mix[k][1] += snd_q15(output[1], reverb_depth[i][1]);
+        }
+        components[2][0] = mix[k][0] - components[0][0] - components[1][0];
+        components[2][1] = mix[k][1] - components[0][1] - components[1][1];
+        snd_debug_gain_frame(grain_samples, components, snd_gain ? count[k] : 0, nstreams,
+                             snd_gain ? gain[k] : 0);
+    }
 }
 
 #ifndef SND_NO_HOST
@@ -854,7 +885,8 @@ void movie_audio(int32_t *mix, int frames);  /* adds the movie's sound, moves it
 
 static void render(int16_t *stereo, int samples)
 {
-    int i;
+    static int32_t mix[SEGMENT][2];
+    int i, k, n;
 #ifndef SND_NO_HOST
     /* A movie's PCM (finding 055), added like a voice; its clock is these rendered samples. */
     int32_t movie[1024 * 2];
@@ -864,20 +896,22 @@ static void render(int16_t *stereo, int samples)
         host_service_movie_audio(GADDR(movie), samples);
     }
 #endif
-    for (i = 0; i < samples; i++) {
-        int32_t mix[2];
-        mix_sample(mix);
+    for (i = 0; i < samples; i += n) {
+        n = SEGMENT - (int)(grain_samples % SEGMENT);
+        if (n > samples - i) n = samples - i;
+        mix_segment(mix, n);
+        for (k = 0; k < n; k++) {
+            int32_t *m = mix[k];
 #ifndef SND_NO_HOST
-        if (with_movie) { mix[0] += movie[i * 2]; mix[1] += movie[i * 2 + 1]; }
+            if (with_movie) { m[0] += movie[(i + k) * 2]; m[1] += movie[(i + k) * 2 + 1]; }
 #endif
-        if (mix[0] > 32767) { mix[0] = 32767; snd_mix_clipped[0]++; }
-        if (mix[0] < -32768) { mix[0] = -32768; snd_mix_clipped[0]++; }
-        if (mix[1] > 32767) { mix[1] = 32767; snd_mix_clipped[1]++; }
-        if (mix[1] < -32768) { mix[1] = -32768; snd_mix_clipped[1]++; }
-        mix[0] = snd_q15(mix[0], master_vol);
-        mix[1] = snd_q15(mix[1], master_vol);
-        stereo[i * 2] = (int16_t)mix[0];
-        stereo[i * 2 + 1] = (int16_t)mix[1];
+            if (m[0] > 32767) { m[0] = 32767; snd_mix_clipped[0]++; }
+            if (m[0] < -32768) { m[0] = -32768; snd_mix_clipped[0]++; }
+            if (m[1] > 32767) { m[1] = 32767; snd_mix_clipped[1]++; }
+            if (m[1] < -32768) { m[1] = -32768; snd_mix_clipped[1]++; }
+            stereo[(i + k) * 2] = (int16_t)snd_q15(m[0], master_vol);
+            stereo[(i + k) * 2 + 1] = (int16_t)snd_q15(m[1], master_vol);
+        }
     }
     rendered_samples += (uint32_t)samples;
 }
