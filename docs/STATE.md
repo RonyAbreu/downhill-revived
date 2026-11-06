@@ -620,9 +620,23 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   undoes it). Measured, same track, against the main build of that day (whose CPU side differed
   and which ran with the profiler on): race 41.6 -> 43.3 fields/s, max 236 -> 191 ms. Left: four
   fields of 60-102 ms in a five-minute session, each 2-10 MiB of new textures at a race's load,
-  which only an upload thread with a shared GL context would take off the render thread. The
+  since taken off (below). The
   one approximated blend the game uses, `(Cd - 0) * As + Cd`, is now exact on Switch (flag
   4096, DstColor, One); the player reports particles, smoke and power-ups drawn properly.
+- **NX3, the race-load spikes (done; finding 145, second round).** A shared GL context on an
+  upload thread is not possible here: devkitPro's Mesa 20.1 nouveau gives every context the
+  screen's one pushbuf, with no lock. The profiler now keeps a window of samples for each slow
+  field (`[profile window N]`, `profile_report.py --windows`). The uploads' cost was nvservices
+  IPC for buffer objects (a new one per texture, a staging one per glTexSubImage2D), not pixels:
+  decoded textures now take slots of R32UI atlas pages written by a draw from the upload ring
+  (a texture buffer), and new textures are uploaded while the render thread waits for a field
+  (`DHD_SWITCH_UPLOAD = atlas`, the default; `idle`, `render`, `direct` the earlier forms). The
+  CPU threads' 187-243 ms fields were the sharp font (`font_sharp_view` and the button icons) made
+  on the GS worker; on the Switch it is now made on a thread of its own. Measured, same track: no
+  renderer field over 50 ms (was four of 60-113 ms at the race's start), 10 MiB of new textures
+  in 11.7 ms instead of 59, the session's longest field 91 ms instead of 243, race max 75 ms.
+  Left: a 90 ms field at the load where the GS worker decodes 10 MiB of textures texel by texel,
+  and about one 57-77 ms field in 30 s of racing whose cause the windows do not show.
 - **EXIT GAME's crash (fixed).** Atmosphère's crash report: SDL's main thread in
   `SWITCH_PollTouch -> hidGetTouchScreenStates -> diagAbortWithResult` (2345-0008).
   `gs_pump_messages` calls `exit(0)` from the game thread with every other thread still running,
