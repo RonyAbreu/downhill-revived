@@ -213,7 +213,8 @@ static void pool_put(const DhdrTexture *t)
 enum { RING_BYTES = 8 << 20, RING_HALF = RING_BYTES / 2 };
 static GLuint g_ring;
 static GLsync g_ring_fence[2];
-static size_t g_ring_at;      /* the next free byte */
+static size_t g_ring_at;      /* the next free byte, inside half g_ring_half */
+static int g_ring_half;       /* the half being written (0 or 1) */
 static int g_ring_off = -1;   /* -1 not decided yet */
 
 /* Room for `bytes` in the ring: its offset, or (size_t)-1 to upload directly. */
@@ -231,12 +232,18 @@ static size_t ring_reserve(size_t bytes)
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
         if (!g_ring) { g_ring_off = 1; return (size_t)-1; }
     }
-    size_t half = g_ring_at / RING_HALF, end = (half + 1) * RING_HALF;
+    /* The half is kept, not worked out from g_ring_at: rounded up to 256, g_ring_at can land
+       exactly on the end of the buffer, and a half computed from it would be 2 -- past both the
+       buffer and g_ring_fence, which is how the first version of this wrote over the pool's
+       count and crashed (finding 144). */
+    int half = g_ring_half;
+    size_t end = (size_t)(half + 1) * RING_HALF;
     if (g_ring_at + bytes > end) {   /* this half is full: fence it, move to the other */
         if (g_ring_fence[half]) glDeleteSync(g_ring_fence[half]);
         g_ring_fence[half] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         half ^= 1;
-        g_ring_at = half * RING_HALF;
+        g_ring_half = half;
+        g_ring_at = (size_t)half * RING_HALF;
         if (g_ring_fence[half]) {
             glClientWaitSync(g_ring_fence[half], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
             glDeleteSync(g_ring_fence[half]);
@@ -410,7 +417,7 @@ void dhdr_tex_shutdown(void)
     for (int i = 0; i < 2; i++)
         if (g_ring_fence[i]) { glDeleteSync(g_ring_fence[i]); g_ring_fence[i] = 0; }
     if (g_ring) glDeleteBuffers(1, &g_ring);
-    g_ring = 0; g_ring_at = 0;
+    g_ring = 0; g_ring_at = 0; g_ring_half = 0;
     for (unsigned i = 0; i < 8; i++) {
         if (g_samplers[i]) glDeleteSamplers(1, &g_samplers[i]);
         g_samplers[i] = 0;
