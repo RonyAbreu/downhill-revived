@@ -11,7 +11,13 @@
      pass a narrow smoothstep around their middle, about one texel of the large texture wide.
    The renderer draws it in place of the original with mipmaps (as a texture pack's replacement;
    a pack that has the font wins). Nothing is written to disk. dhd.ini font = original keeps the
-   game's texture. The renderer makes the texture (replace_texture.h). */
+   game's texture. The renderer makes the texture (replace_texture.h).
+
+   On the Switch (FONT_SHARP_ASYNC, font_sharp.h) a copy is made on a thread of its own: it takes
+   150-190 ms of an A57 (the magnification and the button icons), which on the GS worker held a
+   whole field that long at the boot, the menus and each race's load (finding 145). There the
+   first decode of a font starts the copy and draws the font as the game has it; the decodes
+   after it pick the copy up once it is made (font_sharp_waiting). */
 #include <SDL3/SDL_atomic.h>  /* SDL_SpinLock, SDL_strcasecmp; the web build swaps in its one-thread stub */
 #include <math.h>
 #include <stdio.h>
@@ -20,6 +26,9 @@
 #include "font_sharp.h"
 #include "memory.h"
 #include "../include/guest.h"
+#ifdef FONT_SHARP_ASYNC
+#include <SDL3/SDL_thread.h>
+#endif
 
 #define SHARP_SCALE 8        /* magnification of the font texture */
 #define SHARP_MAX_SIDE 1024  /* largest side made: the 512x512 menu font, 32x32 cells, is doubled */
@@ -175,7 +184,7 @@ static void halve(const uint8_t *src, unsigned w, unsigned h, uint8_t *dst)
             }
 }
 
-static void *make(const ReplaceDevice *device, const uint32_t *pixels, unsigned w, unsigned h)
+static void *make(const ReplaceDevice *device, const uint32_t *pixels, unsigned w, unsigned h, int style)
 {
     unsigned f = SHARP_SCALE;
     while (f > 1 && (w * f > SHARP_MAX_SIDE || h * f > SHARP_MAX_SIDE)) f /= 2;
@@ -212,7 +221,6 @@ static void *make(const ReplaceDevice *device, const uint32_t *pixels, unsigned 
                 o[0] = p & 255, o[1] = p >> 8 & 255, o[2] = p >> 16 & 255, o[3] = p >> 24 & 255;
             }
     free(src);
-    int style = latched_style >= 0 ? latched_style : font_sharp_icon_style();
     if (style && icons_paint) icons_paint(big, f, pixels, w, h, solid, style);
     uint8_t *level = big;
     unsigned lw = W, lh = H;
@@ -227,10 +235,117 @@ static void *make(const ReplaceDevice *device, const uint32_t *pixels, unsigned 
     return view;
 }
 
+/* A finished copy into the cache (cache_lock held), evicting the least recently used. */
+static void cache_put(const ReplaceDevice *device, uint64_t key, void *view, unsigned oldest)
+{
+    if (cache[oldest].view) cache_release(cache[oldest].view);
+    cache[oldest].key = key; cache[oldest].view = view; cache[oldest].used = ++cache_clock;
+    cache_release = device->release;
+}
+
+#ifdef FONT_SHARP_ASYNC
+/* The copies being made: a thread each, its own copy of the decoded pixels. A finished one's
+   view goes to the cache by the next font_sharp_view; its thread is waited for then (or at exit),
+   never detached (libnx keeps a detached thread's stack until the process ends, finding 146). */
+#define SHARP_JOBS SHARP_CACHE
+typedef struct {
+    SDL_Thread *thread;
+    const ReplaceDevice *device;
+    uint32_t *pixels;
+    unsigned w, h;
+    int style;
+    uint64_t key;
+    void *view;
+    SDL_AtomicInt done;
+    int failed;   /* made, but not a font (NULL): remembered so the key is not tried again */
+} SharpJob;
+static SharpJob jobs[SHARP_JOBS];
+static uint64_t failed_keys[SHARP_CACHE];
+static unsigned failed_next;
+
+static int SDLCALL job_main(void *argument)
+{
+    SharpJob *j = argument;
+    j->view = make(j->device, j->pixels, j->w, j->h, j->style);
+    SDL_SetAtomicInt(&j->done, 1);
+    return 0;
+}
+
+/* cache_lock held: finished jobs into the cache, their threads waited for (already returned). */
+static void jobs_reap(void)
+{
+    for (unsigned i = 0; i < SHARP_JOBS; i++) {
+        SharpJob *j = &jobs[i];
+        if (!j->thread || !SDL_GetAtomicInt(&j->done)) continue;
+        SDL_WaitThread(j->thread, NULL);
+        j->thread = NULL;
+        free(j->pixels);
+        j->pixels = NULL;
+        if (j->view) {
+            unsigned oldest = 0;
+            for (unsigned k = 0; k < SHARP_CACHE; k++)
+                if (!cache[k].view || (cache[oldest].view && cache[k].used < cache[oldest].used)) oldest = k;
+            cache_put(j->device, j->key, j->view, oldest);
+        } else {
+            failed_keys[failed_next++ % SHARP_CACHE] = j->key;
+        }
+        j->view = NULL;
+    }
+}
+
+static int job_running(uint64_t key)
+{
+    for (unsigned i = 0; i < SHARP_JOBS; i++)
+        if (jobs[i].thread && jobs[i].key == key) return 1;
+    return 0;
+}
+
+int font_sharp_waiting(uint64_t key)
+{
+    SDL_LockSpinlock(&cache_lock);
+    jobs_reap();
+    int waiting = job_running(key);
+    SDL_UnlockSpinlock(&cache_lock);
+    return waiting;
+}
+
+/* At exit: every copy still being made finished, so no thread of ours outlives the process's
+   end (the Switch's loader runs the Homebrew Menu in this same process). */
+static void jobs_finish(void)
+{
+    for (unsigned i = 0; i < SHARP_JOBS; i++)
+        if (jobs[i].thread) { SDL_WaitThread(jobs[i].thread, NULL); jobs[i].thread = NULL; }
+}
+
+/* cache_lock held: a copy of pixels started on a thread. 0 when none could start (all busy). */
+static int job_start(const ReplaceDevice *device, const uint32_t *pixels, unsigned w, unsigned h, uint64_t key, int style)
+{
+    static int registered;
+    for (unsigned i = 0; i < SHARP_JOBS; i++) {
+        SharpJob *j = &jobs[i];
+        if (j->thread) continue;
+        j->pixels = malloc((size_t)w * h * 4);
+        if (!j->pixels) return 0;
+        memcpy(j->pixels, pixels, (size_t)w * h * 4);
+        j->device = device; j->w = w; j->h = h; j->key = key; j->style = style; j->view = NULL;
+        SDL_SetAtomicInt(&j->done, 0);
+        if (!registered) { registered = 1; atexit(jobs_finish); }
+        j->thread = SDL_CreateThread(job_main, "font", j);
+        if (!j->thread) { free(j->pixels); j->pixels = NULL; return 0; }
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 void *font_sharp_view(const ReplaceDevice *device, const uint32_t *pixels, unsigned w, unsigned h, uint64_t key)
 {
     void *view = NULL;
+    int style = latched_style >= 0 ? latched_style : font_sharp_icon_style();
     SDL_LockSpinlock(&cache_lock);
+#ifdef FONT_SHARP_ASYNC
+    jobs_reap();
+#endif
     unsigned oldest = 0;
     for (unsigned i = 0; i < SHARP_CACHE; i++) {
         if (cache[i].view && cache[i].key == key) {
@@ -241,12 +356,18 @@ void *font_sharp_view(const ReplaceDevice *device, const uint32_t *pixels, unsig
         }
         if (!cache[i].view || (cache[oldest].view && cache[i].used < cache[oldest].used)) oldest = i;
     }
-    if (!view && (view = make(device, pixels, w, h))) {
-        if (cache[oldest].view) cache_release(cache[oldest].view);
-        cache[oldest].key = key; cache[oldest].view = view; cache[oldest].used = ++cache_clock;
-        cache_release = device->release;
+#ifdef FONT_SHARP_ASYNC
+    /* Not made yet: start it (unless it is being made, or was found to be no font), and draw the
+       game's own font meanwhile. Without pixels (a later decode asking) only the cache counts. */
+    int failed = 0;
+    for (unsigned i = 0; i < SHARP_CACHE; i++) failed |= failed_keys[i] == key && key;
+    if (!view && pixels && !failed && !job_running(key)) job_start(device, pixels, w, h, key, style);
+#else
+    if (!view && pixels && (view = make(device, pixels, w, h, style))) {
+        cache_put(device, key, view, oldest);
         device->retain(view);
     }
+#endif
     SDL_UnlockSpinlock(&cache_lock);
     return view;
 }

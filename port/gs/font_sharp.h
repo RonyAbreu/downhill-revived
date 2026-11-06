@@ -17,6 +17,15 @@ int font_sharp_match(uint64_t tex0);
    nothing. One device per process. */
 void *font_sharp_view(const ReplaceDevice *device, const uint32_t *pixels, unsigned w, unsigned h, uint64_t key);
 
+/* FONT_SHARP_ASYNC (the Switch, finding 145): font_sharp_view does not make a missing copy
+   itself but starts it on a thread of its own and returns NULL, so the caller draws the game's
+   font until a later font_sharp_view (pixels may then be NULL) finds it made.
+   font_sharp_waiting: 1 while the copy for key is still being made. */
+#if defined(__SWITCH__)
+#define FONT_SHARP_ASYNC 1
+int font_sharp_waiting(uint64_t key);
+#endif
+
 /* The button icons (button_icons.c, finding 134; native builds only): style says which icons the
    menus' atlas gets now (0 the game's own), paint puts them into the copy. Without them (the
    browser) the copy is the font's alone. */

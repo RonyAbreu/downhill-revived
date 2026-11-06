@@ -76,6 +76,7 @@ typedef struct {
     uint64_t used;        /* last field that drew with it */
     TexPackEntry *pack;   /* its replacement (texpack.c), once looked up (pack_checked) */
     int pack_checked;
+    int sharp_waiting;    /* FONT_SHARP_ASYNC: its sharp copy is being made; asked for at each use */
 } NativeTexture;
 
 /* A render target or depth buffer: GS memory from page `page`, `bw` pages wide. */
@@ -610,7 +611,16 @@ static NativeTexture *native_decode(Native *n, Gs *g, uint64_t tex0, unsigned w,
     unsigned slot = (unsigned)(key % NATIVE_TEXTURES);
     for (unsigned probe = 0; probe < 16; probe++) {
         NativeTexture *t = &n->textures[(slot + probe) % NATIVE_TEXTURES];
-        if (t->texture && t->key == key) { t->used = n->field; n->stats.cache_hits++; return t; }
+        if (t->texture && t->key == key) {
+            t->used = n->field; n->stats.cache_hits++;
+#ifdef FONT_SHARP_ASYNC
+            if (t->sharp_waiting) {   /* the copy started at its decode: made by now? */
+                t->sharp = font_sharp_view(&n->replace, NULL, w, h, key);
+                if (t->sharp || !font_sharp_waiting(key)) t->sharp_waiting = 0;
+            }
+#endif
+            return t;
+        }
     }
     /* Free the oldest of the probed slots unless a queued or rendering field may use it. */
     NativeTexture *victim = NULL;
@@ -639,6 +649,9 @@ static NativeTexture *native_decode(Native *n, Gs *g, uint64_t tex0, unsigned w,
     if (!made) return NULL;
     victim->key = key; victim->used = n->field;
     victim->pack = NULL; victim->pack_checked = 0;
+#ifdef FONT_SHARP_ASYNC
+    victim->sharp_waiting = sharp && !victim->sharp;
+#endif
     n->stats.decoded++; n->stats.decoded_texels += (uint64_t)w * h;
     return victim;
 }
