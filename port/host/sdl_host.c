@@ -237,6 +237,11 @@ int sdl_host_main(int (*game)(void *), void *arg)
         gamepad_thread_update();
         touch_host_tick();
         gs_window_tick();
+#ifdef __SWITCH__
+        /* EXIT GAME (port/host/switch_main.c): the exit runs here, on the thread that pumps the
+           events, after the game thread has ended itself. */
+        { int switch_quit_asked(void); if (switch_quit_asked()) exit(0); }
+#endif
     }
     int code = 0;
     SDL_WaitThread(thread, &code);

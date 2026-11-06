@@ -560,6 +560,20 @@ static uint32_t freeze_word(uint32_t ee)
     return host_readable(p, 4) ? *(volatile const uint32_t *)p : 0xFFFFFFFFu;
 }
 
+/* host_freeze_watch_stop: the watch told to end, and its end. The Switch needs it gone before
+   libnx returns to the Homebrew Menu, which runs in this same process (port/host/switch_main.c);
+   elsewhere it simply lasts as long as the process. */
+static SDL_Semaphore *freeze_stop;
+static int freeze_ended;
+
+void host_freeze_watch_stop(unsigned ms)
+{
+    if (!freeze_stop) return;
+    SDL_SignalSemaphore(freeze_stop);
+    for (unsigned waited = 0; waited <= ms && !__atomic_load_n(&freeze_ended, __ATOMIC_ACQUIRE); waited++)
+        SDL_Delay(1);
+}
+
 static int SDLCALL freeze_watch(void *unused)
 {
     extern uint64_t kernel_vsync_count;
@@ -568,7 +582,10 @@ static int SDLCALL freeze_watch(void *unused)
     int armed = 0;
     (void)unused;
     for (;;) {
-        SDL_Delay(1000);
+        if (SDL_WaitSemaphoreTimeout(freeze_stop, 1000)) {   /* told to end (a second's wait otherwise) */
+            __atomic_store_n(&freeze_ended, 1, __ATOMIC_RELEASE);
+            return 0;
+        }
         uint64_t field = *(volatile uint64_t *)&kernel_vsync_count;
         if (field != last || !armed) {
             armed |= last && field != last;
@@ -783,7 +800,8 @@ void host_init(void)
     if (getenv("DHD_WATCH") || state_trace_watch_spec())
         SDL_WaitThread(SDL_CreateThread(watch_arm, "watch", NULL), NULL);
     if (dump) SDL_DetachThread(SDL_CreateThread(watchdog, "watchdog", (void *)(uintptr_t)atoi(dump)));
-    SDL_DetachThread(SDL_CreateThread(freeze_watch, "freeze watch", NULL));
+    freeze_stop = SDL_CreateSemaphore(0);
+    if (freeze_stop) SDL_DetachThread(SDL_CreateThread(freeze_watch, "freeze watch", NULL));
 }
 
 #ifdef __SWITCH__

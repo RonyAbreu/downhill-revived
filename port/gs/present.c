@@ -577,7 +577,14 @@ void gs_window_close(void)
 /* The window's events are the SDL thread's (sdl_host.c); here the game ends once the window closed. */
 void gs_pump_messages(void)
 {
+#ifdef __SWITCH__
+    /* On the Switch the exit runs on the main thread (switch_main.c), which then pumps no more
+       events while libnx's teardown closes HID under them; this thread waits there for good. */
+    void switch_quit(void);
+    if (window_closed) switch_quit();
+#else
     if (window_closed) exit(0);
+#endif
 }
 
 /* The window's drawable size in pixels (the renderer's GsWindow.size, any thread): 0 x 0 without a

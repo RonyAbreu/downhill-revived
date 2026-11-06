@@ -153,9 +153,10 @@ void switch_clocks_stop(void)
    enough to share changes with the scene and with the resolution. A scheduler free to move them
    beats a map chosen in advance.
 
-   dhd.ini's DHD_SWITCH_CORES = on asks for the layout anyway: the native renderer a core to
-   itself, vu another, gs and game the third. It is kept for measuring, not because it is known
-   to help. With fewer than three cores nothing is pinned. */
+   dhd.ini's DHD_SWITCH_CORES = on asks for the layout below anyway: game a core to itself, vu
+   another, gs and the native renderer the third. It is kept for measuring, not because it is
+   known to help. switch_main.c reads it from dhd.ini before the first thread is named (the
+   launcher's own pass over dhd.ini comes later). With fewer than three cores nothing is pinned. */
 
 static int core_list(int *cores, int max)
 {

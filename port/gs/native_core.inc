@@ -270,6 +270,7 @@ typedef struct Native {
     unsigned pending_count, free_count;
     uint64_t handed, rendered;
     int quit, resize;
+    int ended;   /* the render thread has returned (set by it, read with __atomic_load_n) */
     NativeWindow window;
     float aspect;  /* the picture's shape in the window (DHD_ASPECT): width/height, 0 stretched, -1 its pixels */
     float wide;    /* widescreen's shape, or 0: fields of 2D only (loading screens) are shown 4:3 */
@@ -2463,8 +2464,9 @@ static int SDLCALL native_thread(void *argument)
     dhdr_exact_set_submitter(native_exact_run, n);
     fprintf(stderr, "gs: exact submits run on the render thread\n");
 #endif
-    if (n->interp) { native_interp_thread(n); return 0; }
-    while (native_render_next(n)) {}
+    if (n->interp) native_interp_thread(n);
+    else while (native_render_next(n)) {}
+    __atomic_store_n(&n->ended, 1, __ATOMIC_RELEASE);
     return 0;
 }
 #endif
@@ -2760,6 +2762,28 @@ static void native_profile(Native *n)
 static void native_exit_report(void);
 static Native *native_reported;
 static void native_exit_report(void) { if (native_reported) native_profile(native_reported); }
+
+#if defined(__SWITCH__) && !defined(NATIVE_INLINE)
+/* The Switch's exit (port/host/switch_main.c): the render thread told to quit and waited for,
+   up to `ms` milliseconds, so it has ended -- not merely stopped -- before libnx returns to the
+   Homebrew Menu. A thread of ours still alive then is still alive in the menu that the loader
+   puts into the same process: one woke into code no longer there (an instruction abort in
+   sphaira's process, finding 144). 1 when it ended. */
+int gs_native_halt(unsigned ms)
+{
+    Native *n = native_reported;
+    if (!n || !n->thread) return 1;
+    native_mutex_lock(&n->queue_lock);
+    n->quit = 1;
+    native_cond_broadcast(&n->queue_changed);
+    native_mutex_unlock(&n->queue_lock);
+    for (unsigned waited = 0; waited <= ms; waited++) {
+        if (__atomic_load_n(&n->ended, __ATOMIC_ACQUIRE)) return 1;
+        SDL_Delay(1);
+    }
+    return 0;
+}
+#endif
 
 /* DHD_ASPECT: 4:3 (a television's picture, the default), 16:9 or any W:H, stretch, pixels, or
    wide: widescreen's shape (port/hle/widescreen.c; 4:3 when widescreen is off). Read again

@@ -584,6 +584,52 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   reach is about 55 fields/s. The process gets three cores (`switch: 3 cores for this process`).
   Scale 2 is a different picture: the render thread is 35.5 ms a field there and is the limit,
   so it has a core to itself and gs and game share the third.
+- **NX3, scale 2 is the scanout, not the fill (measured, fix untested).** With
+  `DHD_GL_TIMES = 2` (a glFinish after each phase, so the GPU's time lands in its phase) a race
+  at scale 2 gives `draws 12-16 ms, scanout 24.02 ms` a picture, and the menus `scanout 30.00
+  ms`. The two scanouts are 1024x896 and 1280x896, and 30/24 is exactly 1280/1024: a cost in
+  proportion to the pixels, about 38 Mpixel/s, for a compute shader that reads a texel and
+  writes one. At `DHD_GL_TIMES = 1` that GPU time had shown up as the CPU blocking inside the
+  draw loop (`draws 37-41 ms`), which is why the draws looked fill-bound above. The same shader
+  as a draw (one triangle into the display texture's framebuffer) measured the same 24.04 and
+  30.02 ms, so the stage is not the cost; what is left per pixel is `at / ds` and `at % ds`,
+  the integer divisions that cost the draws 100x before `PROGRAM_SCALE_ONE`. The draw now takes
+  the quotient in float (exact at these sizes). `DHD_SWITCH_SCANOUT` picks a form -- `draw`
+  (the default), `int` (the integer divisions), `compute`, `none` -- and `cycle` moves to the
+  next at each `DHD_GL_TIMES` line, so one run measures all four. **Measured on hardware:**
+  `scanout (draw) 0.53-0.63 ms`, `(int) 24.04-30.02 ms`, `(compute) 24.01-30.03 ms`,
+  `(none) 0.02 ms` -- the integer divisions were the whole cost, 45x. With it, scale 2 went from
+  25 to 31-35 fields/s (a run that spent three quarters of its windows in the slow forms), and
+  the limit moved to the CPU: `cpu:vu` and `cpu:game` (vu 22-28 ms, game 20-27 ms busy a field
+  in a race). `native_geometry_loop` is already SSE (NEON through simde), so what is left there
+  needs a profile on hardware, not a blind rewrite.
+- **NX3, thread pinning measured with the right map: worse at scale 2.** Once dhd.ini's
+  `DHD_SWITCH_CORES = on` was actually read (it never was: the first thread is named before the
+  launcher applies dhd.ini, so switch_main.c now reads it first, as it does the clocks), a race
+  at scale 2 fell from 25-26 to 17-20 fields/s, `limit=cpu:gs` with gs 43-57 ms busy: at scale 2
+  the native renderer is 37 ms a field, and the map shares its core with gs. The map was chosen
+  from scale 1 (renderer 3-4 ms); it stays off by default.
+- **EXIT GAME's crash (fixed, untested).** Atmosphère's crash report: SDL's main thread in
+  `SWITCH_PollTouch -> hidGetTouchScreenStates -> diagAbortWithResult` (2345-0008).
+  `gs_pump_messages` calls `exit(0)` from the game thread with every other thread still running,
+  and libnx's teardown closed HID under SDL's event pump; `switch_shutdown` (the clocks back)
+  was never reached. A first fix ended with `svcExitProcess` from the last exit handler: the
+  log reached `switch: the process ends` and the clocks came back, but Horizon still showed its
+  error screen (the loader wants its program back). The exit is now an ordinary one run on the
+  main thread (`switch_quit`, through `sdl_host_run`), so the thread that pumps SDL's events is
+  the one exiting; the last exit handler stops the render thread between two pictures
+  (`gs_native_halt`, its context lock) and closes SDL's audio before libnx's teardown, which
+  returns to the Homebrew Menu. Measured: the log ends `the process ends (back to the loader)`
+  and the error screen still came -- the two crash reports are now **sphaira's** (the Homebrew
+  Menu, loaded into the same process), one of them a thread with our workers' 0x21000 stack
+  running unmapped code: a thread of ours left alive. Every thread now ends before the return:
+  the game thread ends itself (`switch_quit`, `threadExit`) and the main loop exits; the render
+  thread is told to quit and waited for (`gs_native_halt`); the freeze watch, which woke every
+  second for ever, waits on a semaphore it can be stopped with (`host_freeze_watch_stop`); the
+  VU and GS workers and the clock keeper were already joined. Verified on hardware: EXIT GAME
+  returns to the Homebrew Menu with no error screen and no new crash report.
+  `DHD_SWITCH_EXIT = kernel` keeps the svcExitProcess ending. In 2x with the scanout fixed: 41-47
+  fields/s in races, `cpu:game`/`cpu:vu`, render 3-4 ms.
 - Where the two scales stand on hardware (menus, clocks at `max`): scale 1 about 47 fields/s and
   playable, limited by the VU thread; scale 2 about 24, limited by the render thread, with the
   draws 40-43 ms a picture against 1-12 at scale 1 -- four times the pixels for about four times

@@ -89,10 +89,18 @@ typedef struct DrawProgram {
     int32_t h_tex_offset[2], h_texels_size[2];
 } DrawProgram;
 
+/* The scanout's forms (DHD_SWITCH_SCANOUT): a draw with the divisions in float (the default), the
+   same draw with integer divisions, the compute shader, and none at all (the display texture
+   keeps its last picture: for measuring what the scanout costs, not for play). */
+enum { SCAN_DRAW, SCAN_INT, SCAN_COMPUTE, SCAN_NONE, SCAN_FORMS };
+static const char *const scanout_names[SCAN_FORMS] = { "draw", "int", "compute", "none" };
+
 struct DhdrNative {
     DrawProgram programs[PROGRAM_COUNT];
-    GLuint scanout_program;
-    GLint u_da, u_db, u_ds;
+    /* The scanout's forms (scanout_mode): SCAN_DRAW, SCAN_INT, SCAN_COMPUTE. */
+    struct { GLuint id; GLint da, db, ds; } scanout[3];
+    int scanout_mode;          /* SCAN_*, from DHD_SWITCH_SCANOUT */
+    int scanout_cycle;         /* DHD_SWITCH_SCANOUT = cycle: the next form at each times line */
     GLuint present_program;
     GLint u_rect;
     GLuint vao, vbo, ibo;
@@ -391,6 +399,51 @@ static const char *scanout_source =
     "    imageStore(screen, ivec2(tid), vec4(c, 1.0));\n"
     "}\n";
 
+/* The same scanout as a draw: one triangle over the display texture's framebuffer, the fragment's
+   pixel standing for the compute invocation's id (framebuffer row 0 is texture row 0, so the
+   display texture comes out exactly as the compute form writes it).
+
+   On the Switch (Mesa's nouveau, Tegra X1) the compute form measured 24 ms of GPU a picture at
+   1024x896 and 30 ms at 1280x896 (DHD_GL_TIMES = 2, finding 144): a cost in proportion to the
+   pixels. The same shader as a draw measured the same 24 and 30 ms, so the stage was not it.
+   What is left per pixel is `at / ds` and `at % ds`: four integer divisions, and this GPU has no
+   integer divide -- the same cost texel_xy had in the draws (107 ms to 1.2 ms once
+   PROGRAM_SCALE_ONE folded its divisions away, STATE.md NX3). So the quotient is taken in float:
+   (at + 0.5) / ds is never within 1/16 of a whole number for a whole `at` and ds <= 8, far
+   wider than a float's error at these sizes, so its floor is the exact quotient, and the
+   remainder follows from it.
+
+   SCANOUT_INT_DIV compiles the integer form, for DHD_SWITCH_SCANOUT = int and cycle
+   (scanout_mode below), which measure the forms against one another on hardware. */
+static const char *scanout_vertex_source =
+    "#version 430 core\n"
+    "void main() {\n"
+    "    vec2 corner = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+    "    gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n";
+static const char *scanout_fragment_source =   /* after a prefix carrying #version */
+    "layout(binding = 0) uniform sampler2D source;\n"
+    "uniform uvec4 da;\n"
+    "uniform uvec4 db;\n"
+    "uniform uint ds;\n"
+    "out vec4 color;\n"
+    "void main() {\n"
+    "    uvec2 tid = uvec2(gl_FragCoord.xy);\n"
+    "    uvec2 at = uvec2(tid.x, tid.y >> db.w);\n"
+    "    uvec2 origin = uvec2(da.w, db.x);\n"
+    "#ifdef SCANOUT_INT_DIV\n"
+    "    uvec2 q = at / ds, r = at % ds;\n"
+    "#else\n"
+    "    uvec2 q = uvec2(floor((vec2(at) + 0.5) / float(ds)));\n"
+    "    uvec2 r = at - q * ds;\n"
+    "#endif\n"
+    "    uvec2 xy = ((origin + q) & uvec2(2047u)) * ds + r;\n"
+    "    ivec2 size = textureSize(source, 0);\n"
+    "    vec3 c = (int(xy.x) < size.x && int(xy.y) < size.y)\n"
+    "           ? texelFetch(source, ivec2(int(xy.x), size.y - 1 - int(xy.y)), 0).rgb : vec3(0.0);\n"
+    "    color = vec4(c, 1.0);\n"
+    "}\n";
+
 /* The present quad, as render_gl.c's exact present: a triangle strip from gl_VertexID, rect's xy
    the clip-space top-left corner and zw the bottom-right one. */
 static const char *present_vertex_source =
@@ -522,12 +575,27 @@ static int ensure_gl_objects(DhdrNative *n)
 {
     if (n->ready) return 1;
     if (!gl_ready()) return 0;
-    n->scanout_program = link_program(NULL, NULL, NULL, scanout_source);
+    n->scanout[SCAN_DRAW].id = link_program(scanout_vertex_source, "#version 430 core\n", scanout_fragment_source, NULL);
+    n->scanout[SCAN_INT].id = link_program(scanout_vertex_source, "#version 430 core\n#define SCANOUT_INT_DIV\n",
+                                           scanout_fragment_source, NULL);
+    n->scanout[SCAN_COMPUTE].id = link_program(NULL, NULL, NULL, scanout_source);
     n->present_program = link_program(present_vertex_source, NULL, present_fragment_source, NULL);
-    if (!n->scanout_program || !n->present_program) return 0;
-    n->u_da = glGetUniformLocation(n->scanout_program, "da");
-    n->u_db = glGetUniformLocation(n->scanout_program, "db");
-    n->u_ds = glGetUniformLocation(n->scanout_program, "ds");
+    if (!n->scanout[SCAN_DRAW].id || !n->scanout[SCAN_INT].id || !n->scanout[SCAN_COMPUTE].id ||
+        !n->present_program)
+        return 0;
+    for (int i = 0; i < 3; i++) {
+        n->scanout[i].da = glGetUniformLocation(n->scanout[i].id, "da");
+        n->scanout[i].db = glGetUniformLocation(n->scanout[i].id, "db");
+        n->scanout[i].ds = glGetUniformLocation(n->scanout[i].id, "ds");
+    }
+    {   /* getenv, not SDL_getenv: dhd.ini reaches the environment after SDL took its copy */
+        const char *s = getenv("DHD_SWITCH_SCANOUT");
+        n->scanout_mode = SCAN_DRAW;
+        if (s && !strcmp(s, "int")) n->scanout_mode = SCAN_INT;
+        else if (s && !strcmp(s, "compute")) n->scanout_mode = SCAN_COMPUTE;
+        else if (s && !strcmp(s, "none")) n->scanout_mode = SCAN_NONE;
+        else if (s && !strcmp(s, "cycle")) n->scanout_cycle = 1;
+    }
     n->u_rect = glGetUniformLocation(n->present_program, "rect");
     glGenVertexArrays(1, &n->vao);
     glGenBuffers(1, &n->vbo);
@@ -541,8 +609,8 @@ static int ensure_gl_objects(DhdrNative *n)
     glEnableVertexAttribArray(2);
     glVertexAttribIPointer(2, 4, GL_UNSIGNED_BYTE, sizeof(DhdrVertex), (void *)offsetof(DhdrVertex, rgba));
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, n->ibo);
-    fprintf(stderr, "gs native: GL native renderer ready (step 3: textures, depth and blending; "
-                    "no render-target sampling, no texture copies yet)\n");
+    fprintf(stderr, "gs native: GL native renderer ready (scanout: %s)\n",
+            n->scanout_cycle ? "cycle, the next form at each DHD_GL_TIMES line" : scanout_names[n->scanout_mode]);
     n->ready = 1;
     return 1;
 }
@@ -572,7 +640,7 @@ void dhdr_native_destroy(DhdrNative *n)
         glDeleteVertexArrays(1, &n->vao);
         for (int i = 0; i < PROGRAM_COUNT; i++)
             if (n->programs[i].id) glDeleteProgram(n->programs[i].id);
-        glDeleteProgram(n->scanout_program);
+        for (int i = 0; i < 3; i++) glDeleteProgram(n->scanout[i].id);
         glDeleteProgram(n->present_program);
         dhdr_tex_shutdown();
     }
@@ -672,10 +740,34 @@ static int scan_out(DhdrNative *n, const DhdrPicture *p)
     if (!d[5] || !d[6] || d[5] > 8192 || d[6] > 8192) return 0;
     ensure_display_texture(n, d[5], d[6]);
     if (!n->display_texture) return 0;
-    glUseProgram(n->scanout_program);
-    glUniform4ui(n->u_da, d[0], d[1], d[2], d[3]);
-    glUniform4ui(n->u_db, d[4], d[5], d[6], d[7]);
-    glUniform1ui(n->u_ds, d[8]);
+    int mode = n->scanout_mode;
+    if (mode == SCAN_NONE) return 1;
+    if (mode != SCAN_COMPUTE) {
+        /* The draw forms: every state the draw loop may have left is set here, so the present
+           pass after it starts from plain state too. The draw loop's own held state assumes
+           the depth test and blending off, as left here. */
+        glBindFramebuffer(GL_FRAMEBUFFER, n->display_fbo);
+        glViewport(0, 0, (GLsizei)d[5], (GLsizei)d[6]);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_BLEND);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glUseProgram(n->scanout[mode].id);
+        glUniform4ui(n->scanout[mode].da, d[0], d[1], d[2], d[3]);
+        glUniform4ui(n->scanout[mode].db, d[4], d[5], d[6], d[7]);
+        glUniform1ui(n->scanout[mode].ds, d[8]);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s->texture);
+        glBindVertexArray(n->vao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        return 1;
+    }
+    glUseProgram(n->scanout[SCAN_COMPUTE].id);
+    glUniform4ui(n->scanout[SCAN_COMPUTE].da, d[0], d[1], d[2], d[3]);
+    glUniform4ui(n->scanout[SCAN_COMPUTE].db, d[4], d[5], d[6], d[7]);
+    glUniform1ui(n->scanout[SCAN_COMPUTE].ds, d[8]);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s->texture);
     glBindImageTexture(1, n->display_texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
@@ -974,9 +1066,10 @@ static uint64_t phase_end(int level)
     return SDL_GetTicksNS();
 }
 
-static void report_times(uint64_t draws_ns, uint64_t scan_ns, uint64_t collect_ns, uint64_t draws,
-                         uint64_t programs, uint64_t textures, uint64_t fconvert, uint64_t fsurface,
-                         uint64_t fother)
+/* 1 when it printed a line (the window it summed is over). */
+static int report_times(uint64_t draws_ns, uint64_t scan_ns, uint64_t collect_ns, uint64_t draws,
+                        uint64_t programs, uint64_t textures, uint64_t fconvert, uint64_t fsurface,
+                        uint64_t fother, const char *scanout)
 {
     static uint64_t pictures, a_draws_ns, a_scan_ns, a_collect_ns, a_draws, a_programs, a_textures;
     static uint64_t a_fconvert, a_fsurface, a_fother;
@@ -989,21 +1082,22 @@ static void report_times(uint64_t draws_ns, uint64_t scan_ns, uint64_t collect_n
     /* 300 pictures or five seconds, whichever comes first: at 60 fields a second that is a line
        every five seconds, and at three (the rate this was written to explain) it still is, rather
        than one line every hundred seconds. */
-    if (++pictures < 300 && now - since < 5000000000ull) return;
+    if (++pictures < 300 && now - since < 5000000000ull) return 0;
     since = now;
     uint64_t uploads, upload_ns, bytes;
     dhdr_tex_upload_stats(&uploads, &upload_ns, &bytes);
     double n = (double)pictures;
     fprintf(stderr, "gs native: per picture over %u: draws %.2f ms (%.0f draws, %.0f program changes, "
-                    "%.0f texture binds), scanout %.2f ms, collect %.2f ms | uploads %.1f (%.2f ms, "
+                    "%.0f texture binds), scanout (%s) %.2f ms, collect %.2f ms | uploads %.1f (%.2f ms, "
                     "%.0f KiB) | flat %.1f convert, %.1f surface, %.1f other\n",
             (unsigned)pictures, a_draws_ns / n / 1e6, a_draws / n, a_programs / n, a_textures / n,
-            a_scan_ns / n / 1e6, a_collect_ns / n / 1e6, (uploads - was_uploads) / n,
+            scanout, a_scan_ns / n / 1e6, a_collect_ns / n / 1e6, (uploads - was_uploads) / n,
             (upload_ns - was_upload_ns) / n / 1e6, (bytes - was_bytes) / n / 1024.0,
             a_fconvert / n, a_fsurface / n, a_fother / n);
     was_uploads = uploads; was_upload_ns = upload_ns; was_bytes = bytes;
     pictures = a_draws_ns = a_scan_ns = a_collect_ns = a_draws = a_programs = a_textures = 0;
     a_fconvert = a_fsurface = a_fother = 0;
+    return 1;
 }
 
 int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint32_t *indices, uint32_t index_count,
@@ -1258,8 +1352,11 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
     int shown = p->movie_on ? scan_out_movie(n, p->movie_width, p->movie_height, p->movie) : scan_out(n, p);
     if (times) {
         t3 = phase_end(times);
-        report_times(t1 - t0, t3 - t2, t2 - t1, out->draws, program_changes, texture_binds,
-                     flat_convert, flat_surface, flat_other);
+        /* A movie frame is no scanout: its pictures are summed under the form in use anyway. */
+        if (report_times(t1 - t0, t3 - t2, t2 - t1, out->draws, program_changes, texture_binds,
+                         flat_convert, flat_surface, flat_other, scanout_names[n->scanout_mode]) &&
+            n->scanout_cycle)
+            n->scanout_mode = (n->scanout_mode + 1) % SCAN_FORMS;
     }
     out->shown = shown != 0;
     out->display_width = n->display_width;
