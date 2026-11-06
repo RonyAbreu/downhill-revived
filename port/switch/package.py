@@ -58,6 +58,20 @@ def switch_version():
     return found.group(1)
 
 
+def nro_icon(data):
+    """The icon in an NRO's asset section, or None: the NRO's size is the u32 at 0x18; the asset
+    header follows it ("ASET", a version, then the icon's offset and size as u64s, offsets from the
+    header's start)."""
+    import struct
+    if len(data) < 0x20:
+        return None
+    base = struct.unpack_from('<I', data, 0x18)[0]
+    if data[base:base + 4] != b'ASET' or len(data) < base + 0x18:
+        return None
+    offset, size = struct.unpack_from('<QQ', data, base + 8)
+    return data[base + offset:base + offset + size] if size else None
+
+
 def nro_problems(nro, name, settings):
     """Everything wrong with the .nro, as a list of lines (empty: fit to publish). Each line says
     enough to tell a leak from a false positive without running the scan again by hand."""
@@ -69,6 +83,12 @@ def nro_problems(nro, name, settings):
         problems.append('no NRO0 header: this is not a Switch homebrew file')
     if b'dhd-port %s ' % name.encode() not in data:
         problems.append('not built from version %s (its own version string is not in it)' % name)
+    icon = nro_icon(data)
+    if icon is None:
+        problems.append('no icon in the NRO assets')
+    elif icon != (ROOT / 'port' / 'switch' / 'icon.jpg').read_bytes():
+        problems.append('its icon is not port/switch/icon.jpg (a local assets/switch-icon.jpg? build the '
+                        'release with DHD_SWITCH_ICON=own)')
     if switch_version().encode() not in data:
         problems.append('not built as Downhill Switch %s (switch_version.h changed since?)' % switch_version())
     # The strings, each with what is around it, so a match can be judged without running the scan

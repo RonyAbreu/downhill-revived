@@ -574,7 +574,16 @@ def main():
             field = lambda key: re.search(r'#define\s+DHD_SWITCH_%s\s+"([^"]+)"' % key, ident).group(1)
             nacp = work/'dhd.nacp'
             run([DEVKITPRO/'tools/bin/nacptool', '--create', field('NAME'), field('AUTHOR'), field('VERSION'), nacp])
-            run([DEVKITPRO/'tools/bin/elf2nro', elf, exe, '--nacp=' + str(nacp)])
+            # The Homebrew Menu's icon, a 256x256 JPEG: port/switch/icon.jpg, Downhill Switch's own
+            # art, unless assets/switch-icon.jpg is there -- a player's own picture for their own
+            # build (assets/ is never committed; package.py refuses a .nro without the own icon).
+            # DHD_SWITCH_ICON=own builds with the own icon even then (a release build).
+            local_icon = ROOT/'assets/switch-icon.jpg'
+            own_only = os.environ.get('DHD_SWITCH_ICON') == 'own'
+            icon = local_icon if local_icon.is_file() and not own_only else ROOT/'port/switch/icon.jpg'
+            print('switch icon: ' + ('assets/switch-icon.jpg (local, not for a release)' if icon == local_icon
+                                     else 'port/switch/icon.jpg'), flush=True)
+            run([DEVKITPRO/'tools/bin/elf2nro', elf, exe, '--nacp=' + str(nacp), '--icon=' + str(icon)])
         elif t.mac:
             # ld64: -dead_strip as --gc-sections; no -rdynamic (exporting every symbol keeps the
             # module-side code of fps.c alive, which names guest data the host does not have); -S: no
