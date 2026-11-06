@@ -19,10 +19,10 @@ game program byte for byte, built for the PC with the PS2 hardware replaced by n
   pacing, 1x to 8x resolution, Hor+ widescreen at any shape, windowed, borderless or fullscreen.
 - Online races for 2 to 10 players (experimental), public or private with a code; after your
   finish you watch the others ride to the line.
-- PC SETTINGS in the game's own OPTIONS menu, a sharp font, Unlock All, the movies, memory card
-  saves, PCSX2 texture packs, mouse in the menus, Discord Rich Presence.
+- REVIVED SETTINGS in the game's own OPTIONS menu, a sharp font, Unlock All, the movies, memory
+  card saves, PCSX2 texture packs, mouse in the menus, Discord Rich Presence.
 - Controllers (Xbox, DualSense, DualShock 4, Switch Pro, 8BitDo and most others) and full
-  keyboard play.
+  keyboard play, with your own keys and buttons (in the game or the launcher).
 - Automatic updates that never touch your settings or saves.
 
 The full list and the known gaps: [docs/PLAYING.md](docs/PLAYING.md).
@@ -44,6 +44,10 @@ or their zips. None of the downloads is signed by a developer certificate:
 [docs/PLAYING.md](docs/PLAYING.md#installing) says how to allow them and where your files go. You
 need Windows 10/11 64-bit (or an Apple silicon Mac, or Linux with glibc 2.35+ and Vulkan) and a
 Direct3D 12 or Vulkan graphics card.
+
+Android (experimental): the `-android-experimental.apk` for arm64 phones and tablets on Android 11
+or later, with touch controls; no online races on phones yet. The release page says how to
+install it.
 
 ## Legal notice
 

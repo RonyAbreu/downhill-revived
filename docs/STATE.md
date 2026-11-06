@@ -1,784 +1,189 @@
 # State
 
-Goal: readable, **matching** C/C++ decompilation of Downhill Domination (PS2, USA `SCUS_971.77`):
-source that rebuilds the retail executable byte for byte. Later it can serve as the base for a PC
-port. PCSX2 is the behavioural reference.
+What is true now, per area, and where to read more. The dated log of what each lane changed is
+`docs/STATE-LOG.md`; the findings index is `docs/findings/README.md` (read its area map, then the
+current findings it names). This file names files instead of copying values that live in code:
+the version is `port/include/version.h`, the oldest release the server accepts is `MIN_VERSION`
+in `online/server/wrangler.jsonc`, player defaults are `port/render/settings/src/table.rs`.
 
-Progress: `python tools/report.py` (objdiff report `progress/report.json`, README table).
-2026-10-12: game 98.17% and engine 92.61% of code matched, 4,526 of 4,593 functions (the SDK and
-libgcc regions are library code and stay assembly). Left: 28 functions in the queue, 7
-hand-written, 164 eight-byte remnants that aren't functions.
+## The project
 
-## Phase 0 — compiler identification (done)
-`docs/findings/002-compiler-sn-prodg.md`. Game code: **SN ProDG 3.01** — cc1 "2.95.3 SN BUILD
-1.36" + SN assembler `ps2eeas`, **`-O2 -G8 -fopt-stack`**; C++ `-fno-exceptions` (finding 003).
-Library regions are identified (finding 003, `config/libmatch.txt`) and not decompiled.
+- **Matching decompilation** of Downhill Domination (PS2, USA `SCUS_971.77`): readable C/C++ that
+  rebuilds the retail executable byte for byte. PCSX2 is the behavioural reference.
+- **Downhill Revived**, the PC port built from that source: `port/`, applied at build time, so
+  `src/` keeps matching. Released for Windows, with macOS, Linux and Android as experimental
+  builds (`port/release/`, the GitHub releases).
 
-## Phase 1 — project skeleton (done)
-`docs/findings/003-build-system.md`. The retail image rebuilds byte-identical from splat asm +
-C/C++ (`python tools/configure.py && python -m ninja` → MATCH), checked by `tools/check_image.py`.
-Tooling: `tools/queue.py` (work queue + claims), `tools/try_func.py` (per-function trial build,
-with a fast compile-only check first), `tools/diff_func.py`, `tools/promote.py` (into `src/` only
-if the whole image still matches; refuses TU merges that would turn C back into asm),
-`tools/lost_check.py`, `tools/unit_merge.py` (merge existing units into a wider translation
-unit), m2c drafts. Guide for contributors: `docs/WORKER.md`.
+## Matching decomp: finishing
 
-## Phase 2 — decompilation (finishing; 28 functions left)
-Functions are claimed from the queue, decompiled one at a time against the retail bytes and
-promoted only when `try_func` prints MATCH and the whole image still matches. Finding 004
-covers how the assembler addresses small data, finding 007 what made trials fast.
+- Compiler: SN ProDG 3.01 (cc1 "2.95.3 SN BUILD 1.36" + `ps2eeas`), `-O2 -G8 -fopt-stack`; C++
+  `-fno-exceptions` (findings 002, 003). A few files differ: SCE ee-gcc 2.9 (`-sce29`) and
+  `-fno-opt-stack` / `-O0` clusters (finding 010, `docs/WORKER.md`).
+- Build: `python tools/configure.py && python -m ninja`, checked by `tools/check_image.py`
+  (finding 003). Workflow: `tools/queue.py`, `try_func.py`, `promote.py` (findings 007, 009);
+  contributors read `docs/WORKER.md`.
+- Progress: `python tools/report.py` (objdiff, `progress/report.json`, the README table). On
+  2026-10-12 game 98.17 % and engine 92.61 % of code matched; the queue's last functions have
+  behaviour-equivalent C under `#ifdef NONMATCHING` (finding 074; `configure.py --nonmatching`).
+- Library regions (libgcc, the SCE SDK, libc) are identified (`config/libmatch.txt`) and stay
+  assembly. Hand-written asm (`config/handwritten.txt`) stays `.s`; `.vutext`/DVP overlays stay
+  binary.
+- Open: what the `engine` region 0x201000-0x243000 is (engine/middleware, same toolchain); real
+  TU boundaries (merge single-function units when `$gp` data or `.rodata` ownership shows them;
+  func_001F24B8 and func_001C8380 have matching C waiting for their TU); turning shared structs
+  into classes.
 
-2026-10-06: `func_00134CC8` and `func_00240358` promoted after exact function and
-whole-image checks. The latter required integration into its existing full translation unit.
-Finding 009 distinguishes an assigned-function implementation from a matching assembly stub,
-and records serialization of report generation with source promotion. A fresh full-image check
-matched all eight checked sections.
+## The port: how it is built
 
-2026-10-11: six more matches (00137300, 00137B70, 00148F60, 001554C0, 00171B28,
-00228BE8), including two translation-unit merges. The rebuilt image matches all eight
-checked retail sections.
+- **One portable core:** `port/tools/build_wasm.py` compiles every `src/` unit (rewritten by
+  `port/tools/transform.py` with the patches of `port/patches*.py`; a patch in code the port
+  doesn't compile is refused, finding 165), the asm-only functions
+  recompiled to C (`recomp.py`), the module-side runtime and HLE and the data image into one
+  wasm32 module, `build/wasm/dhd_core.wasm` (findings 081, 082).
+- **One host build script:** `port/tools/build_host64.py --target win-x64|linux-x64|macos-arm64|
+  android-arm64` (wasm2c, the 64-bit host `port/host64` + `port/host`, the Rust library; finding
+  099). `port/tools/build.py` runs core + host in one command. Setup: `docs/BUILDING.md`; what
+  each step costs and what is cached: its "Build times" section (finding 151).
+- **Browser:** `port/web/build.py build/wasm/dhd_core.wasm` (findings 083, 087).
+- **Android:** `port/android/build_apk.py` (debug, `--release` with the release key named by the
+  `DHD_ANDROID_*` variables; findings 091, 143).
+- **Launcher:** `port/launcher` (Tauri; settings, rider name, updates, disc choice; finding 093;
+  native window buttons on macOS, finding 150).
+- **Releases:** `port/tools/package_release.py` builds, checks and packages each platform
+  (`docs/BUILDING.md`, "Releases"; the `release` skill).
+- Retired, do not bring back: the 32-bit i686 build, the Direct3D 11 renderer, the C wgpu-native
+  renderer, the browser's JS renderer, the game's own updater and start window (findings 088, 093).
 
-2026-10-21 (finding 074): the 25 functions not matched yet have behaviour-equivalent C under
-`#ifdef NONMATCHING` next to their `INCLUDE_ASM` (18 new single-function units). The default build
-keeps the asm and still matches; `python tools/configure.py --nonmatching` builds the C into
-build-nonmatching/ (links, not checked; sizes and the moved ranges are in the finding).
-func_00220DA0 is now listed in config/handwritten.txt (trapping adds, pmfhi/pmflo).
+## The port: how it runs the game
 
-Open items:
-- `engine` region 0x201000–0x243000 (1,202 functions): same toolchain and flags as game code;
-  what it is (engine/middleware) is still open.
-- Real TU boundaries: single-function units are merged when evidence appears (shared `$gp`
-  data, `.rodata` ownership). func_001F24B8 and func_001C8380 have matching C that still needs
-  its translation unit worked out before it can be promoted.
-- Per-file flags: two small clusters were compiled `-O0 -fno-opt-stack` (0x21E9A8–0x21EAA0,
-  0x2212A0–0x221608); rule in WORKER.md.
-- Language: the game is C++ (exception tables, vtables, `this`-style calls). Matching is done in
-  whatever form is fastest (mostly C, byte-identical to the method form); a later phase turns
-  shared structs into classes and merges functions into reconstructed TUs.
-- Hand-written assembly (e.g. func_0021B8A8: registers saved to the scratchpad, `$gp` used as
-  scratch) stays `.s`.
-- `.vutext`/DVP overlays (VU microcode) stay binary for now.
+- `port/hle/` replaces the PS2 system: EE kernel (threads as fibers, `port/host64/fiber.c`),
+  crt0, SIF RPC, disc and file I/O, DMA, VIF0/VIF1, timers, pads, memory card, the sound driver
+  (989snd replaced by `sound.c`, findings 022, 133), movies (`movie.c`, libmpeg2, finding 055).
+- The game data image is read at start from the player's `SCUS_971.77` (SHA-1 checked,
+  `game_data.c`); the executable holds only the words the port changes (finding 053).
+- Inline asm runs on an emulated EE/FPU/VU0 register file (`port/runtime/ps2asm.c`,
+  `ps2asm_aot.py`); EE float rounding follows PCSX2's (finding 026). VU0 microprograms are native
+  or compiled (`vu0_micro.c`, `vu0_aot.py`); VU1 runs compiled blocks plus native kernels
+  (`vu1_aot.py`, `vu1_native_clip.py`), checked against PCSX2's interpreter (findings 030, 090).
+- GS: GS memory and registers in C (`port/gs/`); the Rust renderer (`port/render`, wgpu: DX12 or
+  Vulkan on Windows, Metal on Apple, Vulkan on Linux and Android, WebGPU in the browser) behind
+  the shared C front ends `gpu_exact.inc` (exact: the PS2's pixels, the reference) and
+  `native_core.inc` (native, upscaled, the player default). Findings 084-086, 088, 131.
+- **The game clock:** one delta-time clock at every frame rate, 60 included and online: each
+  paced frame steps by the real time since the last, between one step at the selected rate and two
+  fields (finding 139, `port/hle/fps.c`, `port/hle/kernel.c`). Deterministic runs keep the
+  original clock, so state traces are unchanged. Replays, the attract demo and ghosts run on a
+  field grid (finding 142).
+- Host services: one code path on SDL3 for every platform (finding 099): `host_sdl.c` (files,
+  clock, frame waits, display, threads, the error box), `sdl_host.c` (SDL's loop on the main
+  thread, the game on its own thread), `present.c` (the window), `sound_out_sdl.c` (one sound
+  output), controllers through SDL only (findings 059, 134), touch controls on phones
+  (`port/hle/touch.c`, finding 141).
+- dhd.log on every platform, with `perf:` lines on speed and what limits it (finding 129) and
+  `net:` lines online (finding 135). What the game can detect goes in the log. Each start keeps
+  the one before as dhd-previous.log; on Android the log says how the run before ended (Android's
+  exit record and tombstone), and a crash dialog and the icon's shortcut share it (finding 152).
 
-## Phase 3 — PC port: Downhill Revived (shipping)
-Plan: `docs/findings/015-pc-port-plan.md`. Port code lives in `port/` and is applied at build
-time; the matching sources and checks don't change. Build steps and requirements:
-`docs/BUILDING.md`. Players' text: `port/release/README.txt`. The round-by-round log of how the
-port got here (2026-10-12 to 2026-10-25) is in the findings (015-088) and in this file's history
-(`git show v0.3.1:docs/STATE.md`).
+## What players get
 
-Releases: 0.3.1 (2026-10-25) is the last 32-bit release (tag `v0.3.1`; it can always be
-rebuilt from there). 0.4.0 is the first 64-bit release, the build below; 0.3.1's updater installs
-it unchanged (finding 088, CL3).
-
-### The builds
-- One portable game core: `port/tools/build_wasm.py` compiles every `src/` unit (rewritten at
-  build time by `port/tools/transform.py`, with the PC patches of `port/patches*.py`), the
-  asm-only functions recompiled to C (`port/tools/recomp.py`), the module-side runtime and HLE
-  and the data image's fixups into one wasm32 module, `build/wasm/dhd_core.wasm` (findings 081,
-  082). Everything comes from the checkout, `asm/` and `assets/vutext.bin`.
-- One build script for every platform (finding 099, Mac and Linux): `port/tools/build_host64.py
-  --target win-x64|linux-x64|macos-arm64|android-arm64` (default win-x64), with what differs per
-  target in its TARGETS table (compiler and flags, linker, SDL3's build, the Rust triple, the output:
-  `build/host64-exe/dhd64.exe`, `build/host64-linux/dhd64`, `build/host64-macos/dhd64`,
-  `build/android/lib/arm64-v8a/libmain.so`). The same host units everywhere (host64_census's, with
-  the POSIX host and texture-pack stub off Windows, Android's start there), guard-page bounds checks
-  and the plain call-depth global on every target, the Rust renderer everywhere (`gpu_null.c` is
-  gone). Guest pages are 16 KiB on every platform (`HOST64_PAGE`: commits, the null page, the EE
-  stack guards), so the committed layout does not change with the OS page.
-- The EE kernel's fibers are one module on every platform (`port/host64/fiber.c`: the 64 slots,
-  the guest and native stacks and their guards, the root; finding 099, "Fibers"); only the
-  register switch differs per CPU and ABI (`fiber_win64.c`, `fiber_sysv64.c`, `fiber_arm64.c`,
-  the table's `fiber`). Windows uses the same hand-written switch, not SwitchToFiber.
-  `build_host64.py [--target T] --fiber-test` checks them alone (`selftest_fiber.c`).
-- Windows x64: `port/tools/package_release.py` runs `build_host64.py` (wasm2c, the x64 host
-  `port/host64` + `port/host`, the Rust renderer) and writes the players' zip
-  (`build/release/DownhillRevived-<version>-win.zip`, `latest.json`) after its checks: version,
-  no absolute path, no server but `dhd.skuza.app`, no retail bytes (`scan_retail.py`), Windows
-  DLL imports only, the Rust library (`check_rust_lib.py`), pinned `dxcompiler.dll`, generated
-  Rust crate notices. It builds only from committed source.
-  Guest RAM mirrors: the OS views plus `memory_access.h`, with one inline window test per base
-  value per access site (`prepare_wasm2c.py split_accesses`) and the fold out of line (finding 090 OP1).
-- Browser: `port/web/build.py build/wasm/dhd_core.wasm` (into `build/web/`). The graphics side
-  (VIF1/VU1, GS front end, renderer) runs in its own worker on shared memory by default
-  (`--no-threads` for one worker; finding 087, BS2). It draws only with the Rust renderer
-  (`--renderer rust` is still accepted; the JS/WebGPU renderer `www/gpu.js` is gone, finding 088
-  CL5). Speed toward 60 fps: finding 087. Its PC SETTINGS (finding 087 WO1): resolution 1x-8x
-  (applied at once), scaling, widescreen, font, frame rate (60-144 paced to the core's period).
-  dhd.ini there is `dhd_settings` built on its own (`rustgs.py build --target
-  wasm32-unknown-unknown --crate dhd_settings`, by build.py; its own memory: layout rule P1);
-  `node port/web/check_settings.mjs [--iso PATH]` runs the crate's corpus and the game's settings
-  page through it in headless Chrome against the native results (finding 102).
-- macOS arm64 (`--target macos-arm64`, on a Mac with Xcode's tools; macOS 11 and later): the POSIX
-  host with SDL3 static (Cocoa, Core Audio) and the Rust library (Metal, rustgs.py on the Mac).
-  `package_release.py --platform mac` makes `Downhill Revived.app` (ad-hoc signed) in the -mac-experimental.zip.
-  Built and run on an M1 (2026-10-27): finding 099. On the M1 Air the native renderer
-  holds 59.9 fields/s on the title, in the menus and in a race at the player's settings (GPU about
-  half busy); the 12 fields/s first seen were the exact renderer, which a run without dhd.ini
-  gets (finding 099, "The M1's speed"). `DHD_GPU_TIMES=N`: the native renderer's GPU time by
-  pass kind from timestamp queries, logged every N frames.
-- Linux x64 (`--target linux-x64`, on Linux or in WSL, linked with lld): the shared host with SDL3
-  (X11, Wayland, PipeWire/PulseAudio/ALSA) and the Rust library (Vulkan; rustgs.py on the machine,
-  or cross-built on Windows for WSL). `package_release.py --platform linux` makes the -linux-experimental.zip.
-- Android arm64 (finding 091): `build_host64.py --target android-arm64` makes `libmain.so` (wasm2c core, the
-  POSIX host on arm64, the Rust renderer on Vulkan, SDL3 as `libSDL3.so`) and
-  `port/android/build_apk.py` a debug-signed APK with Gradle (no Android Studio). On the Mi 11i:
-  title, menus and a race draw right, background/foreground works; the first race measurement was
-  about 25 fields/s, and findings 107/112 brought it to 115 fields/s at 1x uncapped (93 at 2x), so
-  60 is reachable there at 1x. A low-end Unisoc T612 phone (Realme, finding 126) does 36-40
-  fields/s at 1x and 14 at 2x and cannot hold 60. `port/tools/phone_throttle.py --apply t612`
-  makes the rooted Mi 11i match it at 1x paced 60 (39.6 fields/s, same thread split; `--restore`
-  puts the phone back), with render scale ~2x/~5-6x standing in for the Mali's 1x/2x. On that
-  profile two pacing changes and a GS fast path took 1x paced 60 from 39.6 to 55.0 fields/s
-  (median field 16.65 ms); finding 127 has the breakdown and what is left for 60. A gamepad or the
-  keyboard, or the touch controls (finding 141, branch `feat/touch-controls`; built and unit-tested,
-  in-game checks pending): Thumb zones (floating stick, PEDAL with flick attacks, HOP / BRAKE / SLIDE,
-  a trick stick in the air) and Classic pad, every touch plain pad input; the rules in
-  `port/hle/touch.c`, drawn by the Rust renderer's overlay, the settings on SETTINGS > Touch Controls;
-  the game is read for the rider's air flag and the race HUD hook only. The v0.7.7..main review's
-  touch findings are fixed (finding 141, "Review fixes"): the touch queue never loses a lift, L3 /
-  R3 edits load back, Back on the pause question, tilt without a sensor keeps the stick, the
-  legend's PREV / NEXT and the row hints on their own line, the status bar after tilt's rotation.
-  The second round's too (finding 141, "Second review round"): a controller on the pause menu
-  takes it over (the overlay no longer sticks on Restart / Quit's question), a tap the game never
-  read (quick, or in a stall) still goes and a double tap stays two presses (PEDAL, ✕, camera),
-  a fixed stick steers from the touch-down, a full queue keeps a finger's first move, a failed
-  tilt-sensor ask backs off. `DHD_TOUCH_MOUSE=1` makes the
-  mouse a finger on a PC. No online play on phones yet (finding 143: no ONLINE row, every
-  connection refused). The release APK (`build_apk.py --release`, signed with the release key the
-  `DHD_ANDROID_*` variables name) and the once-a-day update notice: finding 143.
-- Retired (finding 088): the 32-bit i686 build (`link.py`, `build_clean.py`, the x87/FP-trap
-  runtime), the Direct3D 11 renderer, the C wgpu-native renderer and the browser's JS renderer.
-  No D3D11 fallback.
-
-### How the port runs the game
-- `port/hle/` replaces the PS2 system: EE kernel (threads as fibers, semaphores, interrupts),
-  crt0, SIF RPC, disc and file I/O (`DHD_ISO`), DMA, VIF0/VIF1, timers, pads, memory card
-  (`mc.c`), the sound driver (989snd replaced by `sound.c`, finding 022), movies (`movie.c`,
-  libmpeg2, finding 055).
-- The game data image is read at start from the player's `SCUS_971.77` and checked by SHA-1
-  (`game_data.c`); the exe holds only the words the port changes (finding 053, section 4).
-- Inline asm runs on an emulated EE/FPU/VU0 register file (`port/runtime/ps2asm.c`, plus
-  `ps2asm_aot.py`); EE float rounding follows PCSX2's (toward zero, FTZ/DAZ, finding 026,
-  `eefloat.py`). VU0 microprograms are native (finding 016); VU1 runs AOT blocks (`vu1_aot.py`,
-  MAC/status updates no flag read can see made lazily) and native geometry kernels
-  (`vu1_native_clip.py`, `vu1_native_*.h`), checked against PCSX2's interpreter
-  (`test_vu1_pcsx2.py`) and on captured run sequences against our interpreter
-  (`vu1_seq_diff.py`, x64; finding 090 VU1R).
-- GS (`port/gs/`): GS memory and registers in C; the Rust renderer (`port/render`, wgpu: DX12
-  or Vulkan, WARP last; WebGPU in the browser) behind the shared C front ends `gpu_exact.inc`
-  (exact: the PS2's pixels) and `native_core.inc` (native: upscaled, the default). Glue:
-  `gpu_rust.c`, `gpu_rust_native.inc`, `port/web/gpu_rust_web*.{c,inc}`, with what both share in
-  `gpu_rust_shared.inc` (findings 085, 086, 088).
-- Host services (`port/host`): one code path on SDL3 (`sdl3.py`, static) for Windows, macOS
-  (arm64), Linux (x64) and Android (arm64), finding 099 (2026-10-27, branch `desk/integrate`;
-  round 2 with the Mac/Linux, fibers, texture pack, settings, glue, test and disc branches on
-  `desk/integrate2`, 2026-10-28, checked on all five platforms; round 3 on `desk/integrate3`,
-  2026-10-28: Discord Rich Presence (finding 106), DHD_GPU_TIMES, the error box on the main thread,
-  the launcher ending on SIGTERM/SIGINT on macOS and Linux, and a pacing queue that never drained:
-  a key reached the screen 90 ms after it was pressed on the title, 11 ms now; round 4 on
-  `desk/integrate4`, 2026-10-28: online takes the USA disc's game files (dhd_disc, finding 098),
-  the rider-select skip at high fps and the launcher's Linux parts from PR #13, Vulkan drivers
-  with no conformance (dzn in WSL2); 132 host_api imports):
-  - Threads, locks and atomics are SDL3's and C11's (`native_thread.h`; `win32_compat.h` is gone).
-  - The OS services are one shared file (`host_sdl.c`: files, folders, clock and frame waits that
-    sleep to a millisecond before and then spin, display, threads, the error box), with UTF-8 paths
-    everywhere (`host_os.h`; dhd.exe's manifest sets the UTF-8 code page, so the environment the
-    launcher passes is UTF-8 too). `host_win32.c` / `host_posix.c` keep only the machine parts:
-    guest memory protection, the fault guard, FP control, the exe path and code range, memory
-    regions, environment writes, the heartbeat and the exit.
-  - SDL's loop is the process's main thread on every platform (`sdl_host.c`: macOS needs Cocoa
-    there, and the error box runs there too); the game runs on its own thread (64 MiB stack). One window path (`present.c`): the only
-    platform part turns SDL's window into the renderer's window (Win32 HWND, X11 or Wayland,
-    Android's ANativeWindow, Apple's CAMetalLayer); wgpu runs DX12 or Vulkan on Windows, Metal on
-    Apple, Vulkan on Linux and Android, in RGBA8 or BGRA8, whichever the surface offers
-    (`rustgs.py check --target aarch64-apple-darwin`).
-  - One sound output, SDL3's audio stream (`sound_out_sdl.c`; WASAPI, Core Audio, PipeWire/ALSA or
-    AAudio under it); headless runs open no device. Controllers through SDL only (the XInput and
-    raw-HID fallbacks are gone), the keyboard (finding 059), text input.
-  - One network client, `dhd_net` in Rust (below). The game has no disc dialog: the launcher picks
-    the disc (Android: its document picker, `android_main.c`).
-  - dhd.log on every platform when the starter gave no console, terminal, pipe or file: in
-    `DHD_DATA_DIR` (the launcher's data folder) when set, else beside the game; Windows copies it
-    through a pipe and thread (finding 097), the POSIX hosts through one shared pipe and thread
-    (logcat too on Android). Its first line names the release and the build (finding 098). The
-    default texture-pack folder follows `DHD_DATA_DIR` as well.
-  - Texture packs (finding 057, "One decoder"; branch `desk/texpack`): one `texpack.c` on every
-    platform, over the host's folders and files, with the PNGs decoded by the Rust library
-    (`png` crate, `dhdr_png_*`); WIC and `texpack_linux.c` are gone.
-  The macOS parts follow public PR #6 (by dxdramar: the Metal surface, BGRA8, the main-thread
-  loop); they are rebuilt here as shared code, a few `__APPLE__` lines in the POSIX files (the exe
-  path, the Mach-O code range, guest RAM without memfd, the fiber switch's symbols, the arm64
-  ucontext, thread names and times, the frame wait's time-constraint sleep).
-  From public PR #13 (by n0buholic, Linux; branch `fix/pr13-ports`, finding 099 "From PR #13"):
-  the high-FPS RIDER SELECTED / shop-flight skip (`patches_fps.py`, `test_rider_skip.py`), the
-  launcher's "no update package for this platform" state, its restore on Wayland and Linux
-  WebKitGTK defaults, and the game window's app id and icon on Linux and macOS.
-
-### What players get
-PC SETTINGS in the game's options, saved to dhd.ini (finding 064): resolution and scale,
-borderless/windowed, Hor+ widescreen with the HUD anchored (finding 056) and no 4:3 screens
-left: loading cards and movies fill the window with their own picture blurred at the sides
-(finding 140), frame rate (a cap: the
-game steps by the real time since the last frame at every rate, findings 067, 139), texture packs in PCSX2's format (finding 057), the sharp
-font (finding 058), movies, vibration, EXIT GAME. The launcher (`port/launcher`, finding 093)
-holds the settings, the rider name and the updates on every platform; the game has no updater
-or start window of its own (2026-10-27). It decides the one data folder for the player's files
-(the system's app-data folder for an installed copy: the Windows setup's `installed.txt`, an app
-bundle, an AppImage; else the game's folder when it is a plain writable folder, else app data; passed
-as `DHD_SETTINGS`, `DHD_MEMCARD_DIR` and `DHD_DATA_DIR`), updates from per-platform assets in
-`latest.json` (a macOS update swaps the whole .app, an AppImage the whole file), and checks HTTPS with rustls and bundled
-webpki-roots, the game's rule. dhd.ini has one implementation, the Rust crate `dhd_settings`
-(`port/render/settings`, finding 101): its keys, defaults, choices, reading rules and line-keeping
-saves serve the game (through the Rust static library; PC SETTINGS through a generated table), the
-launcher and the browser (the crate's own small wasm module, `build/web/dhd_settings.wasm`;
-`settings.js` keeps only IndexedDB and what the browser can't offer; finding 102). The rider
-name's rule is the crate's too (the launcher, and the online menu through the same table). Discord Rich Presence (finding
-106, setting `discord`, on by default): the profile shows the menus, the race with its track and
-place, the career, an online room or race, through Discord's local IPC (`dhd_presence` in the Rust
-library, no SDK; the core sends its state through `host_service_presence`). Online races: below. The port's own pages (PC SETTINGS, the exit question, ONLINE and the
-race room) share one centred layer in the game's popup style (`menu_page.c`), and the mouse works
-in them and in the game's own popups: hover selects, left click X, right click back, the wheel
-scrolls or changes values (finding 092; the shell's own menus are not bridged yet).
-
-### Checks and tools
-- Texture packs: `python port/tools/test_texpack.py` (synthetic PNGs: PCSX2 names, the folder,
-  every PNG kind's pixels and mips, damaged files, budget, a loader/eviction stress).
-- Unit tests: `python port/tools/test_runtime.py` (after `build_wasm.py`). Test programs run where
-  the game runs their code (`port/tools/testprog.py`, finding 104): the core's C as wasm32 guest
-  programs through wasm2c, the host's on the 64-bit host. `abi_check.py --check` audits the game's
-  calls as the wasm32 core compiles them.
-- Renderer: replay goldens recorded locally (`gs_golden.py record`/`compare`; they hold pictures
-  of the game, so they are not in the repository), `replay_gs.py`, `test_gs_wgpu.py`,
-  `test_native_transfers.py`, `web_gs_replay.mjs` for the browser, `gs_verdict.py` (the pass rule)
-  and `harness_negative.py` (its negative controls).
-- Game state: per-field state traces (`port/hle/state_trace.c`, `state_trace_run.py`,
-  `state_diff.py`, `trace_columns.py`; `codeptrs_guard.py`), the wasm offset scan
-  (`wasm_offset_scan.py`, run by `build_wasm.py`), `test_fps_race.py` for high rates,
-  `rate_drift.py` (the race at 30-240 steps a second against 60) and `slow_race.py` (a slow PC
-  made with `DHD_SLOW_FRAME`: game speed, bursts and sound; finding 139).
-- Retail comparisons with PCSX2 (`compare_pcsx2.py`, `race_compare.py`, finding 024), online race
-  runs (`online_race.py`), timing (`bench_race.py`,
-  `sample_profile.py`); crash and trap reports name RVAs with `host64_rva.py`. The tools start the
-  game and its helpers through `owned_process.py` (a job object or process group: the whole tree
-  ends with the run, on a timeout, an error or Ctrl+C; finding 103).
-
-### Release steps
-Bump `port/include/version.h`, `build_wasm.py`, `package_release.py`, publish the zip and
-`latest.json` as `v<version>`, then raise `MIN_VERSION` in
-`online/server/wrangler.jsonc` and deploy when older versions should stop racing (finding 054,
-section 6; finding 088, CL3). macOS and Linux (finding 093, Release): `package_release.py
---platform mac|linux --game PATH` on that machine (the mac zip is signed there), then
-`--merge` its `latest.json` into the Windows one; publish every zip with the one `latest.json`.
-Installers (finding 125, after 0.7.5): the same runs also make each platform's installer from the
-checked files (`port/tools/installers.py`; `--no-installer` skips it): the per-user Windows setup
-(`-win-setup.exe`, Inno Setup 7 via `innosetup.py`, `port/release/installer/windows.iss`), the
-macOS DMG (on the Mac) and the Linux AppImage (`-linux-experimental.AppImage`, Tauri's bundle with
-WebKitGTK inside; its `linux-appimage` entry goes into latest.json and `--merge` carries it).
-Publish them next to the zips; installed copies keep the player's files in the system's app-data
-folder and update from the zips (the AppImage from its own entry). None is code-signed.
-Android (finding 143): `package_release.py --platform android` with the release key's
-`DHD_ANDROID_*` variables builds, checks and adds the `-android-experimental.apk` (latest.json's
-`android` entry); every run writes `SHA256SUMS`. The release page gets `port/release/ANDROID-NOTES.md`.
-Since 0.7.0 the mac and linux zips are `-mac-experimental.zip` and `-linux-experimental.zip`
-(finding 093, "0.7.0": built and checked on all three, published 2026-10-28; Linux is linked on
-Ubuntu 22.04 and runs on glibc 2.35 and later, which `package_release.py` checks).
-
-2026-10-26 (finding 090, SP3): native GS vertex conversion and texture-page key iteration
-cost less CPU; one x64 race A/B measured GS busy 4.571 -> 3.807 ms/field.
-Exact, native and interpolated replay goldens and all 198 transfer golden items match;
-x64 packaging and the Rust browser build/layout pass. Exact/probe paths and game core unchanged.
-
-2026-10-26 (finding 090, SP6): fixed a retired-queue observation race that could wait after
-completion; added opt-in per-field cycles and host/GPU stall attribution. One race pair observed p99 73.803 -> 17.763 ms (not an isolated speedup estimate), with unchanged-counter
-timeouts 2,443 -> 513. All 4,500 race state-trace fields match with the existing mask; x64 packaging,
-Rust browser build/layout and GS FIFO stress pass. Details and the legacy VIF fixture link limit
-are in finding 090. No game core or GPU operation changed.
-
-2026-10-26 (finding 090, SP7): x64 core and packaging pass. Two race pairs retain padded queue counters
-and the 512-pause retired/full-ring spin policy: 104.548 -> 141.226 and
-121.783 -> 124.349 fields/s. EE spin falls in both; second-pair p99 worsens
-21.869 -> 24.024 ms. Run-to-run variability prevents an isolated speedup claim.
-Full busy/spin/park tables and limitations are in the SP7 section.
-
-2026-10-26 (finding 090, FPS1): at 240 the two counters that stayed per-update now
-advance per field behind `port_fps_high()`: the particle/effects frame clock
-`D_0029DBAC` (dust, snow and spray waves, glow phases) and the sound/skat queue age
-`obj->x60C`; the rate audit (`DHD_RATE_AUDIT`, off by default) now measures them at a quarter
-of their 60 Hz travel per update (0.250 and 1.002 against 1.000 and 4.004 before), which is
-time-based motion at 240. Boot 600- and race 5000-field state traces against the base build
-match in every column with the mask unchanged (3); x64 packaging, Rust browser build and layout
-pass.
-Measured words, attribution and the audit's false positives are in the FPS1 section.
-
-2026-10-28 (finding 105): the exact renderer no longer runs out of GPU memory while minimised
-(0.6.4 died at the menu after 30-60 s, 0xC0000409): each frame waits for the previous frame's
-GPU work (`Exact::frame_end`), and an out-of-memory device error now ends with a log line, an
-error box and exit code 1. 5 minutes minimised through menus and a race: memory flat.
-
-2026-11-01 (finding 128): online rooms keep Ready across track changes (TRACK CHANGED line), MOSH
-only by the host's pick, and the shop's bike, jersey and bike-colour pages online (issue 18).
-Server tests 64/64; two local games on hidden desktops: each saw the other's choice in its log.
-
-2026-11-02 (finding 132): the online room names tracks as the game does (retail's event names
-read from the player's data image, e.g. "Mt. Midoule FR", "Mosh Pit (Arena)") everywhere it
-shows one, and the track picker shows the selected track's loading-page picture, read from the
-player's disc at run time (nothing in the repository; no generated art needed). Checked on the
-hidden desktop: all 23 picker views, a race afterwards; the lead's checks are in the finding.
-
-2026-10-31 (finding 124): PERU no longer logs "vu1: microprogram at 0x1F50 didn't end" (0.7.4,
-0.7.5: about a million interpreted VU1 steps in a frame after earlier races). The weather object's
-four per-view batch records were never initialised, so a zero-density emitter left an old particle
-float there, which the microprogram read as thousands of particles (PCSX2 runs the same input as
-long). A `port/patches.py` patch clears them in `func_00226D08`; with stale pool data seeded, a
-PERU state trace of the fixed build equals the unfixed build's clean run from the constructor on.
-Opt-in VU1 diagnostics: `DHD_VU_CAPTURE_FAILURE`, `DHD_VU_CAPTURE_ENTRY`, `DHD_VU_CAPTURE_EE`.
-
-2026-11-01 (finding 129): every player's dhd.log says how fast the game ran and what held it back
-(`port/gs/perf_log.c`, on by default, `DHD_PERF_LOG=0` off): at start the GPUs with their kind and
-the one used, the present mode, and a `perf: render` line (scale, picture and window size, rate,
-pacing, V-Sync, refresh, GPU timer); every 30 s of race or menus in front, and per kind at exit, a
-`perf:` line with fps against the requested, 1% low, frames over 1.2x the budget, each thread's
-CPU and busy ms per field, the render thread's wait in the present, the GPU's ms per frame (one
-frame in 8 timed by DHD_GPU_TIMES' queries) and `limit=gpu|cpu:<thread>|vsync|none`. The graphics
-queue's wait counters now count by default. Boot state trace unchanged; 1x uncapped 243.3 -> 241.1
-fields/s (one run each). Windows only built and run; no lines in the browser.
-
-2026-11-01 (finding 130): Windows `DHD_WGPU_ADAPTER=integrated|discrete` selects hardware through
-DXGI's power/performance preference order, with the player default unchanged. The Ryzen 5 7600
-iGPU holds the nominal 60 fps target at 4x, up from baseline 3x. The dedicated-VRAM guard can
-clamp high requests; `DHD_SCALE_MEMORY_MB` supplies a logged developer estimate for UMA measurements.
-Exact bounded integer scanout, duplicated-row reuse and power-of-two texture pipeline specialisation
-reduce 4x uncapped FXC GPU time from 18.81 to 11.73 ms (50.52 to 78.48 fps, fresh controls).
-The full matrix's true 8x improves from 13.79 to 22.19 fps, GPU 71.80 to 43.81 ms; 5x/6x/8x
-remain below 60. Final Vulkan is slower at 2x and effectively tied at 8x. Renderer/host GS tests,
-oracle replays, strict fixed-stream 8x comparisons on both GPUs/APIs and boot traces pass.
-Finding 130 contains the final paced/unlocked tables, 1% lows and pass splits; wall-time stalls
-remain, and the RTX-connected monitor's transport cost is not isolated. Player defaults unchanged.
-
-2026-11-02 (finding 133, issue #19): Mt. Liddellroch's ambience is no longer too loud. 989snd's END
-grain (type 24) stops its sound and releases its voices (retail IOP 0x5A60 -> 0xFE04); the port only
-ended the program, so `E_TREE_WHOOSH`'s wind loop, started at every tree passed, never stopped (35
-copies at once a minute into the race; PCSX2: 5). Sound records' solo flag and instance limits
-(byte +5, flags 8/0x10/0x20; 0x4A34, 0xF34C, 0x10038) now apply as in retail. Against a PCSX2
-recording of the same race (a capture hook in the comparison adapter): Liddellroch FR race 0-60 s
--24.71 dBFS PCSX2, -22.54 before, -25.18 after; ambient voice power +13.3 dB -> +3.4 dB (most of
-the rest is samples shared with rider sounds); Mt. Midoule FR -25.03 PCSX2, -24.77 before, -25.02.
-`DHD_SND_VOICE_TRACE` dumps each sounding voice for such comparisons. State traces: the END fix
-changes only the PCM column; with the limits the race trace's RAM also differs, in the sound queue
-and handle words only (the game keeps the refused plays' replies).
-
-2026-11-02 (finding 135): rooms are made near their creator and everyone can see where they are.
-`/v1/rooms/new` gives the room's Durable Object a location hint from the creator's continent and
-country (`online/server/src/region.ts`), the room learns its own colo from a Cloudflare trace, the
-welcome and a new `where` message say where the player and the room are, and the public list
-carries each room's region in the asker's region's order (0.7.6's Quick Race then prefers a near
-room too). dhd.log gets `net:` lines: on joining (this PC's Cloudflare location, country, the
-room's location), every 30 s in a room or race and on leaving (own ping median and worst, every
-other player's ping and region; another player's country is never sent). The list rows and the room's header show the region
-(`PLAYERS 2/10 - EU SERVER`). The list's ENDS IN / NEXT IN / RACING times no longer count from the
-epoch before a room is joined (0.7.6 showed ENDS IN 29893031:32): the list carries the server's
-`now`. Server tests 73/73; two games on hidden desktops logged every line.
-
-2026-11-02 (finding 136): the resolution scale the GPU allows is no longer hidden. dhd.log has
-one line with the scale in use, `capped` when it is under the one asked, the limit and its reason
-with the figures (`resolution scale 4x, capped: 8x asked, this GPU allows up to 4x (graphics
-memory: ...)`), Match window too. PC SETTINGS offers every scale and marks the ones over the
-limit (`8x (running 4x: GPU memory)`, footer `This GPU's memory allows up to 4x`); the launcher
-reads the last run's line from dhd.log and says the same under Resolution (`Your GPU's memory
-allows up to 4x; 8x runs at 4x`, choices `8x (runs at 4x)`). The cap's rule is unchanged. Boot
-state trace unchanged.
-
-2026-11-02 (finding 134, issues #20 and #27): controllers. A stick dead zone setting
-(`stick_dead_zone`: Game, the PS2's own, about 36% of the travel, by default; or 5-50%, the travel
-past it spread over the bytes that steer in proportion, `port/hle/stick.h`), in PC SETTINGS and a
-new Controls tab in the launcher with a live picture of the controller's sticks and what the rider
-gets. Button icons (`prompts`: Auto from player 1's controller, PlayStation, Xbox, Nintendo): the
-game's face-button icons drawn as our own dark discs with the letter in the game's font, L1/R1/L2/R2
-as LB/RB/LT/RT (L/R/ZL/ZR), at draw time in the text packet (`port/hle/prompts.c`). `DownhillRevived
---play` starts the game at once without the launcher's window (Steam shortcuts, the Steam Deck).
-Boot state trace with default settings equal to next/0.7.7's.
-
-2026-11-02 (finding 131): the native renderer's draw pass from first principles. A diagnostic,
-`DHD_GPU_STATS`, gives GPU time and pixels shaded per kind of draw: a race frame shades about four
-screens of pixels, two of them one blended terrain kind, at three times the cost per pixel of a
-plain fill. Each draw now gets a pipeline specialised for its state (built on a worker thread; the
-generic one draws until it is ready), texel bounds tests stay but cost what they must, and decoded
-textures are R32Uint texels read by one gather per bilinear footprint. The Ryzen 5 7600 iGPU now
-holds 60 fps paced at 5x (was 4x); GPU time per frame is 22-24% lower at every scale (4x uncapped
-76.5 -> 102.6 fps, 12.02 -> 9.11 ms; 8x 21.5 -> 28.0 fps, 45.13 -> 35.30 ms; DXC alike). The RTX at
-8x is unchanged (CPU-bound; GPU 1.92 -> 1.68 ms). Oracle goldens, the replay matrix on both GPUs
-and APIs, `test_gs_wgpu.py` and the native-transfer tests pass; VRAM is identical everywhere. One
-picture change remains for a decision: a `round()` that makes the generic and specialised shaders
-agree draws some pixels one step differently on DX12 than before (none on Vulkan; DXC up to 0.6% of
-a menu picture's pixels at 4x, about 0.003% of race pixels). The AMD iGPU varies a few pixels from
-run to run (also before; no application race found, finding 131 lists the checks).
-
-2026-11-02 (finding 137, issue #30): no more clones in online rooms. A game whose connection
-dropped rejoins with the same hello; the server gave a member back by name only when that member
-had no socket, but with a dead connection its old socket stays open on the server for minutes, so
-the rejoin became a second member (and a host's rights stayed with the dead copy). Now a hello
-takes back the same-named member whose socket has been quiet 4 s (waiting up to that when it spoke
-just before), a 1006 drop outside a race keeps the member 20 s for its rejoin, and a socket silent
-20 s is dropped. Server only: deploying it fixes 0.7.7. Server tests 81/81.
-2026-11-03 (review fix): the name rule let any player with the same name take a member over, host
-included. Now the server sends each member a random rejoin token in its welcome, the game sends it
-back in its rejoin's hello, and only the token takes a member back (at once, no 4 s wait); a
-same-name hello without it is a new member. Needs the next release's client and MIN_VERSION.
-
-2026-11-02 (finding 138): the launcher's update check has a backup. When GitHub's releases API fails
-(no connection to api.github.com, its 60-an-hour limit, 5xx, a bad answer), the launcher asks the
-online server's new `GET /v1/latest`. That endpoint serves the newest release's `latest.json`,
-fetched from GitHub's release download, kept fresh for 5 minutes, with the last good copy kept for
-when GitHub fails, and checked to name only this repository's release assets. No release step.
-A player's own `update_url` works as before, without a backup. The bottom bar now says what went
-wrong in one line ("No internet connection.", "GitHub is limiting update checks from your
-connection; try again in an hour.", "Couldn't reach GitHub or the backup server (your connection
-timed out)...", "Update failed: the download couldn't reach GitHub (...)"). The full errors go to
-the new `launcher.log`. Server tests 88/88, launcher tests 27 pass. The endpoint needs a server
-deploy.
-
-2026-11-02 (finding 139): one delta-time game clock. Every paced frame, at every frame rate (60
-included) and online, the game steps by the real time since the last frame, between one step at
-the selected rate and two fields, smoothed so the steps add up to wall time; no debt, no
-fast-forward. It replaces the fixed 1/60 step at 60 (slow motion below 60 fps), the one-field cap
-above 60 with its repaid debt (the speed ramps), the online extra fields and `DHD_PACE=wall`. The
-mixer gets wall time, so the sound keeps its speed too. Slow PC made on the RTX desktop
-(`DHD_SLOW_FRAME`): at 45 fps the game went from x0.75 to x0.999 at FPS 60 and 120, the worst
-second at 85 fps from x0.87-x1.13 to x0.97-x1.04, the sound's time-stretching from 57 to 5-6 s a
-minute. Two-field steps broke 12 of finding 067's per-frame counters (the post-race countdown never
-ended, the action lock stuck, ...) and made riders "airborne" on every bump (at 30 steps a second
-nobody finished the scripted race): fixed. The race at 30-144 steps a second now finishes with no
-trend against 60 (player -7..+6%, AI mean -0.5..+4.1%: the race's own chaos, finding 067).
-Deterministic runs keep the original clock: the state trace is unchanged. V-Sync keeps three swapchain buffers, so a missed refresh no longer halves 120 to 60.
-Ghosts/replays stay off on the delta-time clock, now at 60 too (finding 142 brings them back).
-
-2026-11-03 (finding 142): race replays, the attract demo and the time trial's ghost work again on
-the delta-time clock, at every rate. The recorder is an input recording the replay re-simulates
-and checks (the player's z every 60 samples), so an offline race now runs on a field grid: one
-sample per field of race clock (60 a race second at every rate, the format and the seven-minute
-buffer unchanged), the step chosen when a field ends as a code in 1/120 field in the sample's
-step byte, the pad read when a field ends, one-field steps from the load to GO; a replay forces
-the recorded codes and paces its pictures by them. Headless race + replay (`replay_check.py`):
-exact for all ten riders at 45 (frame clock) and paced 144 with uneven frames. The attract demo's
-camera cuts and two-minute end count fields; the ghost samples every 8 fields at every rate.
-State trace unchanged. Replays saved on the original clock (PS2, port up to 0.7.7) do not play on
-the delta-time clock: since the review fixes they say so over the countdown and end at GO.
-
-2026-11-03 (review fixes, findings 139 and 142): about twenty units read the integer steps a
-second as their time step (1/rate: the rigid-body integrator, the contact solver); the delta-time
-clock truncated it, 59 at paced 60, so bodies moved 1.2-1.6 % too far online, in the menus and in
-the attract demo. They now read the exact step (`port_step_seconds` / `port_step_rate`). The
-pacing grids (`pace()`, the slow stretch) re-anchor when the frame period changes (a 9.7 s wait
-at the load after 144 fps, 0.8 s on a replay's step change). The item list timer's flag clear
-and 60 mark fire on two-field steps. Old-clock replays explain themselves. The headless browser
-runner answers the touch service.
-
-2026-11-03 (finding 143): the next release can ship an experimental Android APK. `build_apk.py
---release` builds it not debuggable, without R8, signed with a release key the environment names
-(RSA 4096, certificate SHA-256 D7:61:3E:E0:...:AE:1B, kept by the maintainer outside the
-repository) and checks it with apksigner and aapt; `package_release.py --platform android` puts it
-in the release folder with the licence texts inside, a `latest.json` `android` entry and
-`SHA256SUMS`. A phone has no launcher, so the game checks once a day (the server's `/v1/latest`,
-then GitHub's latest.json; the HTTPS client follows redirects now) and shows one line, tap to open
-the release page; nothing is downloaded. Online play is offered on Windows, macOS and Linux only:
-one host switch (`host_service_net_offered`) hides ONLINE and refuses every connection on Android
-and in the browser. Desktop state traces unchanged.
-Review fixes (finding 143, "Review fixes"): the first start checks and copies on a worker thread
-(a cloud document no longer freezes the screen; a streamed document is copied first, then
-checked), a short copy fails (the source's size, else the ISO volume's), each copy owns its
-temporary file; the release check takes only the release key's certificate
-(`--new-signing-key` for a deliberate change); a stale server answer no longer hides a newer
-GitHub release from the update notice. Second round (finding 143): the update page can't leave
-the repository by dot segments or backslashes (game, phone, server; the launcher's rule), and
-`build_apk.py --check` refuses a wrong package in words. Finding 139: the item list's timer rests
-at 0, not -1, on a two-field step.
-
-### Open
-- Browser speed: about 25-30 fields/s on the title, 17-25 in a race before finding 087's work;
-  the game's worker is CPU-bound.
-- Finding 067's high-rate (120/144) AI and physics equivalence limits.
-
-## Phase 4 — Nintendo Switch homebrew (in progress)
-
-Plan: `docs/findings/144-switch-port-plan.md` (milestones NX0-NX4). A homebrew `.nro` for
-Atmosphère from the same portable core as every other target: `build/wasm/dhd_core.wasm` through
-wasm2c, the host units, and `--target switch-arm64` in `port/tools/build_host64.py`. As on
-Android, the player brings their own USA disc image; nothing of the game is in the `.nro`.
-Work lives on the `switch/port` branch, not on `main`.
-
-Build: `port/switch/Dockerfile` (devkitPro devkitA64, libnx) and `port/switch/build.sh`, which
-builds devkitPro's SDL3 fork first (`port/switch/build_sdl3.sh`, branch `switch-sdl-3.4`) and
-then `build_host64.py --target switch-arm64` into `build/host64-switch/dhd.nro`. Pass the object
-cache's volume (`docker run -v "$PWD:/src" -v dhd-objcache:/objcache ...`): the Dockerfile names
-it in `DHD_OBJCACHE_DIR`, which `tools/objcache.py` needs before it caches anything off Windows.
-Without it every build compiles all 62 objects (23 minutes here, `vu0_interp.c` alone taking
-seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss, 3 minutes.
-
-- **NX0, plan (done).** Finding 144: what Horizon changes against the other targets, and why
-  there is no Rust on it (`aarch64-nintendo-switch-freestanding` is no_std; wgpu needs std), so
-  the whole `dhdr_*` ABI needs a C backend.
-- **NX1, the core on Switch, no picture (done).** The `.nro` builds and runs: the game reaches
-  the title, sound plays, pads and the hardware are seen. No Rust at all — `port/switch/
-  render_gl.c`, `render_native.c`, `render_stubs.c` and `rust_shims.c` stand in for the Rust
-  library, `port/host/host_switch.c` for `host_win32.c`, `port/host/switch_main.c` for the
-  launcher (there is none), `port/host64/guest_memory_switch.c` for guest RAM. Guest memory is
-  one flat block committed on demand (`svcSetMemoryPermission`), taken from the heap's start when
-  needed, not one 2 GiB reservation; wasm2c bounds checks replace the guard pages, and
-  `DHD_DEFER_READS=0` makes GS reads synchronous. `dhd.log` is written from main's start.
-- **NX2, picture (steps 1-3 done bar surface sampling).** Step 1: `render_gl.c` makes an OpenGL 4.3 core
-  context (Mesa nouveau over SDL's EGL window, devkitPro's glad) and is the device, the exact
-  renderer and presentation — the movies and the CPU scanout show, 4:3 in the middle of the
-  screen; `DHDR_WINDOW_SWITCH` (7) is the window kind. `render_native.c` then reimplements the
-  native renderer's GL half in C from `native.wgsl`: the vertex transform and the untextured
-  pixel path as GLSL, one FBO per GS surface, a compute scanout and the same present quad.
-  Its GL objects are built on first use (`ensure_gl_objects`), because `dhdr_native_create` runs
-  before any context exists. Step 2 adds textures: `port/switch/textures.c` is `DhdrTexture` (a
-  decoded texture as R32UI texels, a replacement as RGBA8 mips with the eight samplers of the
-  Rust renderer's `shared.rs`), made as a CPU copy on whichever thread asks for it and uploaded
-  the first time the render thread samples it, with a dead list drained between pictures; the
-  fragment shader gained `native.wgsl`'s texel fetch, replacement sample and TFX combine, in two
-  compilations (texels and sampled) because GL has no specialisation constants. Step 3 adds the depth test and
-  blending as `pipelines.rs`'s key describes them: the Z surface is attached to the colour
-  surface's framebuffer, the vertex stage maps WebGPU's [0, 1] clip Z onto OpenGL's [-1, 1]
-  (`glClipControl` is core only in 4.5), a new depth surface clears to zero because the GS tests
-  GREATER against it, and a draw blending on As is split in two, since this device offers no
-  dual-source blending. Since then (finding 145): sampling a surface (its own target through a
-  copy) and conversions, the texture copies and ALPHA_UPLOAD, the Z probe, and the reversed
-  triangle order the alpha pass of a GREATER-with-writes draw wants; nothing listed is left.
-  PNG was then still a refusal
-  (`render_stubs.c`), so texture packs and the button icons do not load; the sharp font, which
-  is no PNG, does.
-- **NX3, speed (measured, in progress).** `DHD_GL_TIMES` (render_native.c) prints the render
-  thread's time by phase every five seconds. First measurement on hardware, menus at scale 1:
-  `draws 107.62 ms (57 draws, 2 program changes, 52 texture binds), scanout 0.05 ms, collect
-  0.00 ms | uploads 0.0 (0.00 ms, 0 KiB)`. So neither the compute scanout nor texture churn
-  costs anything worth naming, and the whole field goes into the draws — about 1.9 ms each for
-  57 of them. The cost tracks the pixel count (scale 2 is four times the pixels and about a
-  quarter of the rate, 3.1 against 11.9 fields/s), so it is the fragment stage, not the driver's
-  per-call work. What came of that: the GL texture's size is a uniform rather than a
-  `textureSize` query made four times over per bilinear fetch, and the fragment stage is
-  compiled per variant (`PROGRAM_TEXELS`, `PROGRAM_BILINEAR`, `PROGRAM_ALPHA_TEST`, linked on
-  first use) in place of the specialisation constants WebGPU gives the Rust path — a point
-  sampled draw no longer carries three extra fetches, and a draw with no alpha test no longer
-  carries a `discard` that costs every pixel its early depth rejection.
-- **NX3, the clocks (done).** Horizon hands a homebrew the handheld defaults -- CPU 1020 MHz,
-  GPU 307.2 MHz, EMC 1331.2 MHz -- and nothing raised them, which is the ~150 Mpixel/s of
-  effective fill the measurement above works out to. `port/switch/clocks.c` raises them through
-  clkrst (pcv before 8.0.0) to the rates Horizon uses for its own boost modes, not past stock:
-  CPU 1785, GPU 768 (921.6 with `DHD_SWITCH_CLOCKS = max`), EMC 1600 MHz. Docking, the HOME menu
-  and sleep each put them back and there is no one event for the three, so a thread writes them
-  again every two seconds; the originals are restored at exit. `DHD_SWITCH_CLOCKS = off` leaves
-  every clock alone, which is also what to use under sys-clk so the two do not fight.
-- **NX3, the fragment stage (done, and the limit moved).** `texel_xy` did two integer divisions
-  a texel, and a GPU has no integer divide, so a bilinear fetch paid eight long sequences per
-  pixel; every draw here has S = E = 1, so `PROGRAM_SCALE_ONE` compiles them away. Measured on
-  hardware at scale 1 with the clocks raised, the same menus: `draws` went from 107 ms to
-  **1.2 ms** and the render thread's busy time from ~70 to **3.3 ms** a field. The limit is now
-  `cpu:vu` at **46.8 fields/s**, with the VU thread 18.2 ms busy against a 16.7 ms budget.
-  Together with the clocks, scale 1 is playable and scale 2 is not yet.
-- **NX3, the rest (open).** The VU thread is the limit, and at 18.2 ms on a 1785 MHz A57 it is
-  about what finding 127 measured on a T612 (13-14 ms), so it is not a Switch-specific fault:
-  `native_geometry_loop` and `native_clip_run` are the costs, and finding 127's "what is left"
-  is the work. The one Switch lever still untried is thread placement, since Horizon starts
-  every thread on the process's default core (`switch_thread_core` in clocks.c); a field at
-  21.4 ms against a heaviest thread of 18.2 ms is the queueing that costs, so the ceiling it can
-  reach is about 55 fields/s. The process gets three cores (`switch: 3 cores for this process`).
-  Scale 2 is a different picture: the render thread is 35.5 ms a field there and is the limit,
-  so it has a core to itself and gs and game share the third.
-- **NX3, scale 2 is the scanout, not the fill (measured, fix untested).** With
-  `DHD_GL_TIMES = 2` (a glFinish after each phase, so the GPU's time lands in its phase) a race
-  at scale 2 gives `draws 12-16 ms, scanout 24.02 ms` a picture, and the menus `scanout 30.00
-  ms`. The two scanouts are 1024x896 and 1280x896, and 30/24 is exactly 1280/1024: a cost in
-  proportion to the pixels, about 38 Mpixel/s, for a compute shader that reads a texel and
-  writes one. At `DHD_GL_TIMES = 1` that GPU time had shown up as the CPU blocking inside the
-  draw loop (`draws 37-41 ms`), which is why the draws looked fill-bound above. The same shader
-  as a draw (one triangle into the display texture's framebuffer) measured the same 24.04 and
-  30.02 ms, so the stage is not the cost; what is left per pixel is `at / ds` and `at % ds`,
-  the integer divisions that cost the draws 100x before `PROGRAM_SCALE_ONE`. The draw now takes
-  the quotient in float (exact at these sizes). `DHD_SWITCH_SCANOUT` picks a form -- `draw`
-  (the default), `int` (the integer divisions), `compute`, `none` -- and `cycle` moves to the
-  next at each `DHD_GL_TIMES` line, so one run measures all four. **Measured on hardware:**
-  `scanout (draw) 0.53-0.63 ms`, `(int) 24.04-30.02 ms`, `(compute) 24.01-30.03 ms`,
-  `(none) 0.02 ms` -- the integer divisions were the whole cost, 45x. With it, scale 2 went from
-  25 to 31-35 fields/s (a run that spent three quarters of its windows in the slow forms), and
-  the limit moved to the CPU: `cpu:vu` and `cpu:game` (vu 22-28 ms, game 20-27 ms busy a field
-  in a race). `native_geometry_loop` is already SSE (NEON through simde), so what is left there
-  needs a profile on hardware, not a blind rewrite.
-- **NX3, thread pinning measured with the right map: worse at scale 2.** Once dhd.ini's
-  `DHD_SWITCH_CORES = on` was actually read (it never was: the first thread is named before the
-  launcher applies dhd.ini, so switch_main.c now reads it first, as it does the clocks), a race
-  at scale 2 fell from 25-26 to 17-20 fields/s, `limit=cpu:gs` with gs 43-57 ms busy: at scale 2
-  the native renderer is 37 ms a field, and the map shares its core with gs. The map was chosen
-  from scale 1 (renderer 3-4 ms); it stays off by default.
-- **NX3, the long fields (measured; the renderer's part done but one).** Finding 145. Any
-  render-thread cycle over `DHD_SLOW_FIELD_MS` (50) logs where it went, ending in the culprit.
-  On hardware the 124-242 ms fields are the **CPU threads** (the render thread waited that long
-  for a field, its picture under 1 ms). The renderer's own were program links inside a field
-  (every program is now linked and drawn with at start-up, 27 in 1.56 s;
-  `DHD_SWITCH_PRELINK = 0` undoes it) and texture uploads at a race's load. Released textures'
-  GL objects are pooled and the pixels go through an unpack ring (`DHD_SWITCH_UPLOAD = direct`
-  undoes it). Measured, same track, against the main build of that day (whose CPU side differed
-  and which ran with the profiler on): race 41.6 -> 43.3 fields/s, max 236 -> 191 ms. Left: four
-  fields of 60-102 ms in a five-minute session, each 2-10 MiB of new textures at a race's load,
-  which only an upload thread with a shared GL context would take off the render thread. The
-  one approximated blend the game uses, `(Cd - 0) * As + Cd`, is now exact on Switch (flag
-  4096, DstColor, One); the player reports particles, smoke and power-ups drawn properly.
-- **EXIT GAME's crash (fixed).** Atmosphère's crash report: SDL's main thread in
-  `SWITCH_PollTouch -> hidGetTouchScreenStates -> diagAbortWithResult` (2345-0008).
-  `gs_pump_messages` calls `exit(0)` from the game thread with every other thread still running,
-  and libnx's teardown closed HID under SDL's event pump; `switch_shutdown` (the clocks back)
-  was never reached. A first fix ended with `svcExitProcess` from the last exit handler: the
-  log reached `switch: the process ends` and the clocks came back, but Horizon still showed its
-  error screen (the loader wants its program back). The exit is now an ordinary one run on the
-  main thread (`switch_quit`, through `sdl_host_run`), so the thread that pumps SDL's events is
-  the one exiting; the last exit handler stops the render thread between two pictures
-  (`gs_native_halt`, its context lock) and closes SDL's audio before libnx's teardown, which
-  returns to the Homebrew Menu. Measured: the log ends `the process ends (back to the loader)`
-  and the error screen still came -- the two crash reports are now **sphaira's** (the Homebrew
-  Menu, loaded into the same process), one of them a thread with our workers' 0x21000 stack
-  running unmapped code: a thread of ours left alive. Every thread now ends before the return:
-  the game thread ends itself (`switch_quit`, `threadExit`) and the main loop exits; the render
-  thread is told to quit and waited for (`gs_native_halt`); the freeze watch, which woke every
-  second for ever, waits on a semaphore it can be stopped with (`host_freeze_watch_stop`); the
-  VU and GS workers and the clock keeper were already joined. Verified on hardware: EXIT GAME
-  returns to the Homebrew Menu with no error screen and no new crash report.
-  `DHD_SWITCH_EXIT = kernel` keeps the svcExitProcess ending. In 2x with the scanout fixed: 41-47
-  fields/s in races, `cpu:game`/`cpu:vu`, render 3-4 ms. One later exit (with the profiler on)
-  crashed inside sphaira's own code, a null read, after our log had ended; the next two did not.
-  The exit now lists the threads of the process still there besides the main one
-  (`switch_thread_census`, clocks.c: `svcGetThreadList` on the loader's process handle -- 0
-  lists every thread on the console), named when they are ours, so another such crash can be
-  told apart from a sphaira fault.
-- **NX3, the CPU threads measured on the console (2026-11-06).** `DHD_SWITCH_PROFILE = 1`
-  (port/switch/profile.c) samples the named threads about 1,000 times a second from a thread of
-  its own: it pauses each one (`svcSetThreadActivity`), reads its PC and LR
-  (`svcGetThreadContext3`), and for a sample in a kernel wait walks its frame records a few calls
-  up while it is still paused. It writes `profile.txt` beside dhd.log at exit, which
-  `port/switch/profile_report.py` symbolizes against dhd.elf. Every 10 s it logs each thread's
-  share of the wall clock run (the kernel's `ThreadTickCount`), waiting and ready-but-not-running.
-  What it found at scale 2, races:
-  - The game thread spent 22% of its samples waiting for the VU/GS chain, 7% of it spinning in
-    `idle_wait` (512 pauses before each sleep) on three cores the other threads want. The spin is
-    now 0 on the Switch (`DHD_QUEUE_SPINS`, graphics_queue.c): 40.9 -> 45.0 fields/s in a race,
-    41.6 -> 49.7 in the menus.
-  - The VU and GS threads then lost 5-7% each to a lock: `wake` read the semaphore's value
-    before signalling it, and newlib's semaphore is a mutex and a condition variable, the mutex
-    held by the sleeper's own `sem_wait`. `wake` now keeps an atomic "signalled" flag per
-    semaphore, cleared by the sleeper before it announces itself, so it takes the mutex only to
-    post: the lock fell to 0.2-0.3% of each thread.
-  - Ready-but-not-running stays at 2-9%: placement is not the limit, the work is. On a long race
-    the game thread now runs 93-96% of the wall clock (`limit=cpu:game`), the VU 80-94% and the GS
-    55-73%: the three cores are nearly full. 41.6-43.3 fields/s there, the menus 44-49.
-  - What is left on the game thread: the recompiled EE (`rc_func_0021B8A8` 7.5%, `00213C08`
-    4.5%, `0021CC44` 2.9%), VU0 macro code (`ps2_vu0_run`, `native0_transform`, `vu0c_*`, about
-    7%), and **the sound mixer, about 9%** (`render`, `reverb_sample`, `snd_adsr_tick`), which
-    runs on the game thread inside the core. On the VU thread: `native_clip_run` 9%,
-    `ps2_vu1_run` 8.6%, `unpack_stream` 7.5%, `vif_feed` 5.9%, and `memset` 3.2% (two thirds of
-    it the 512-byte `component_ready` clear at every `native_clip_run`, the rest `ps2_vu1_run`'s
-    1 KB state clear 90,000 times a second).
-  - The CPU and renderer work merged (no profiler), same track: race **43.8 fields/s, low1%
-    24.5, worst field 186 ms**, menus 47.5; EXIT GAME back to the menu with no crash. The exit's
-    census listed `game`, `native` and one unnamed thread: the first two had ended (threadExit,
-    the render thread's quit) but were never joined, so the list cannot yet tell a thread that
-    ended from one still running.
-- Where the two scales stand on hardware (menus, clocks at `max`): scale 1 about 47 fields/s and
-  playable, limited by the VU thread; scale 2 about 24, limited by the render thread, with the
-  draws 40-43 ms a picture against 1-12 at scale 1 -- four times the pixels for about four times
-  the cost, so scale 2 is fill-bound and will not reach 60 on this GPU.
-- A race at scale 2 (the first measured) is a different shape from the menus: every thread is
-  heavy, a field's busy times being game 25-33 ms, vu 24-44, gs 15-22 and the native renderer
-  14-33, which is about 100 ms of work over three cores. That floor alone is 33 ms a field, so
-  30 fields/s is the ceiling there however the threads are placed; 19-25 is what it does, and
-  `limit=` moves between render, vu and game from one half-minute to the next. The draws are
-  340-546 a picture against about 50 in the menus, but the time does not follow the count (495
-  draws in 38.8 ms against 52 in 41.0), so it is still pixels rather than calls. The game clock
-  runs at about x0.75 there: the port slows the game rather than dropping input (finding 139).
-  A race at scale 1 is a different matter: 40-46 fields/s with the game clock at x0.994-x0.998
-  and the sound clock at x0.999, so the race runs at real speed rather than the x0.75 slow
-  motion scale 2 falls into. The renderer is all but free there (3.3-4.1 ms a field, the draws
-  2.3-4.7 ms a picture for 300-576 draws), and the limit is `cpu:game` or `cpu:vu`, those two
-  being 18-24 ms each. **Scale 1 is the playable mode; scale 2 is for looking at.** Past this
-  needs finding 127's work on the VU and EE, not the renderer.
-- The sound going quiet when a race started is fixed, and it was not the sound bank: the trace
-  showed no `989snd` failure and the mixer producing its 48,000 samples a second throughout.
-  SDL's audio thread was starved -- Horizon starts it at the ordinary priority among four
-  threads wanting more than three cores, beside fields of 227 ms -- and it now raises itself to
-  0x2B from inside the audio callback, the only place that thread can be reached
-  (`switch_audio_thread`, as switch-hero does). Verified on hardware: a whole race with the
-  callback running 100 times a second, none idle, and the underruns stopping at 4. Clocks through `clkrst` (`pcv` before 8.0.0) restored on exit and
-  reapplied after dock/HOME/sleep, deferring to sys-clk; then profiling on hardware and the work
-  of findings 107/112/127, plus NEON paths and thread placement over the four A57 cores. An
-  overclocked Switch is about 0.6x the Unisoc T612 of findings 126/127 single-thread, 0.35x at
-  the stock 1020 MHz, so well under 60 fields/s is expected at first.
-- **NX4, packaging (done).**
-  `python port/switch/package.py` checks the `.nro` and zips it with the SD card's own layout
-  (`switch/downhill-revived/`: the `.nro`, `port/release/switch-dhd.ini` as `dhd.ini`,
-  `port/release/SWITCH-NOTES.txt` as `README.txt`, `LICENSE.txt`, `THIRD-PARTY-NOTICES.txt` and
-  `SWITCH-THIRD-PARTY-NOTICES.txt`: the licences and copyright notices of what only the `.nro`
-  links statically -- libnx, newlib, the GCC runtime, Mesa (every copyright line of the sources
-  whose objects `dhd.map` shows linked), libdrm_nouveau, glad, libpng, zlib), beside an
-  unzipped copy and a `SHA256SUMS`. It is separate from `package_release.py` because that one
-  publishes -- `latest.json`, which the launchers and Android's update notice read -- and the
-  Switch build has no launcher and no update check; its checks are imported rather than copied.
-  It passes. The two things it first refused were neither a leak nor game data (finding 144,
-  "Packaging"): `/downhill-revived`, the checkout's folder without its drive, matched the game's
-  own SD path and repository address, which `package_release.OWN_PATHS` now blanks (those two
-  strings only); and three runs of the retail `.rodata` were zlib's DEFLATE length table and
-  fdlibm's float pi/2 reduction tables, which devkitPro's static `libz.a` and newlib `libm.a`
-  carry too, now in `scan_retail.PUBLIC`.
-
-Off on Horizon, as on Android: online play (`host_service_net_offered` is 0), the disc check for
-online, and presence. `dhd.ini` is read by the C reader, not the Rust `dhd_settings` crate.
-
-## Facts
-
-- `.text` 0x10a000–0x263bc0 (~1.35 MB), stripped. C++ (only 4 TUs with exception info).
-- 5,690 functions (splat): game 3,534, engine 1,202, sdk/libc/libm 802, libgcc 147, crt0 5.
-- `_gp` = 0x2A40F0. Single PT_LOAD at file offset 0x1000.
-- Disc: `SYSTEM.CNF` BOOT2 = `cdrom0:\SCUS_971.77;1`, VER 1.00.
-
-## Environment
-Windows (Git Bash or PowerShell); the build runs natively. Toolchain: `python
-tools/setup_toolchain.py` (pinned + hashed in `toolchain.lock.json`: SN ProDG 3.01, ps2dev
-binutils 2.45.1, SDK 2.4 libs for identification). m2c: clone into `tools/ext/m2c`. The retail ELF
-is not in the repo: extract it from your own disc (`7z e "<USA iso>" SCUS_971.77` into `iso/`,
-sha256 adfda7b7…f0cf0c).
+- REVIVED SETTINGS at the top of the game's options, with Display, Graphics, Controls, Online
+  and Game tabs (finding 163), saved to dhd.ini (findings 064, 101): resolution scale
+  (capped by GPU memory and said so, finding 136), window mode, widescreen with the HUD anchored
+  and no 4:3 screens left (findings 056, 140), frame rate 60-240 or Monitor (findings 067, 139),
+  V-Sync, texture packs in PCSX2's format (finding 057), the sharp font (finding 058), movies,
+  vibration, stick dead zone and button icons (finding 134), the keys and controller buttons for
+  the PS2 pad's buttons, per player, in the game and the launcher (Controls, finding 157), FPS &
+  Ping counter (finding 120), online name size (finding 163), Unlock All (finding 095), EXIT GAME. dhd.ini has one implementation, the Rust crate
+  `dhd_settings` (`port/render/settings`), used by the game, the launcher and the browser.
+- The launcher holds settings, rider name and updates on every desktop platform, decides the one
+  data folder (`DHD_SETTINGS`, `DHD_MEMCARD_DIR`, `DHD_DATA_DIR`), updates from `latest.json`
+  with a backup through the server's `/v1/latest` (findings 093, 125, 138). A phone has no
+  launcher: the game checks once a day and shows a notice (finding 143).
+- Discord Rich Presence on the desktop (finding 106). The mouse works in the port's pages and the
+  game's popups (finding 092).
 
 ## Online play
-Shipped since 0.1.0; the original plan is `docs/ONLINE-PLAN.md` (historical). The round log is in
-findings 039-047, 053-054, 065 and 072 and in this file's history.
+
+- Offered on Windows, macOS and Linux; not on Android or in the browser
+  (`host_service_net_offered`, finding 143).
+- **State sync, never lockstep:** each PC runs its own one-player race at its own frame rate and
+  shows the others, and on guests the host's AI riders, as puppet riders moved from snapshots
+  (`port/hle/puppet.c`, findings 044, 047, 114). Hits are events; each game times its own finish.
+  Track pickups are shared events (finding 144); a player who leaves becomes an AI rider.
 - Server: `online/server/` (Cloudflare Workers + Durable Objects) at `wss://dhd.skuza.app`, the
-  game's built-in default (dhd.ini `server =` or `DHD_NET_SERVER` override it). Lobbies, join
-  codes, the public list, the race relay (10 players per room by default), desync reports, usage stats
-  in Workers Analytics Engine. New rooms take a location hint from their creator's region, and
-  the welcome, a `where` message and the list say where rooms and players are (finding 135).
-  `MIN_VERSION` (`wrangler.jsonc`, now 0.7.0) turns older clients
-  away with "update to play online". Protocol: `docs/online-protocol.md`. Steps:
-  `online/server/README.md`.
-- Offered on Windows, macOS and Linux; not on Android or in the browser (finding 143: the host's
-  `host_service_net_offered`, no ONLINE row there).
-- Client: `port/net/` (lobby client, hashes; `net.h`) over `port/net/ws.h`, the WebSocket and HTTPS
-  client of every native build: the Rust crate `dhd_net` (`port/render/net`, tungstenite over rustls
-  on ring, Mozilla's roots bundled by webpki-roots; no OS certificate store, no proxy), linked into
-  the one Rust library (`dhd_render`'s native build, rustgs.py). The browser has its own WebSocket.
-  Races use state sync, not input lockstep (finding 041 has why): each PC runs its own one-player
-  race and shows the others, and on guests the host's AI riders, as puppet riders written from
-  snapshots (`port/hle/puppet.c`, finding 044). Each player sends all its riders in one message.
-  Grid, rider/bike looks, the countdown on the server's clock, hits between humans, finishes and
-  results are shared (finding 047); a player who leaves becomes an AI rider.
-- In the game's own menus: name and code entry, public list, rider picker (finding 065); restart,
-  new level and rematch flows (finding 072). Create/Join waits on ONLINE, then the rider screen
-  once and the room over it, with no bounce and no second title flight (finding 092); then the
-  shop's own BIKES / JERSEYS / BIKE COLOR pages, every bike and jersey offered, each player's
-  choice (bike colour too) worn by their puppet on the other PCs (finding 128).
-- The room (finding 128): Ready means "count me in for the next race": a new track or computer
-  riders on/off keep it, cheats on/off clear it; ready players see TRACK CHANGED. MOSH PIT (the
-  arena) only comes when the host picks it (the server's pickOnly; NEXT / RANDOM skip it).
-- The disc: online needs the USA disc's game files (the hash of every ISO 9660 file's path, size
-  and contents, `dhd_disc` in port/render/disc, shared by the game and the launcher; redump
-  30393's files), so a good dump that differs only outside the files is taken. An image whose
-  files differ is turned away on ONLINE with lines saying why and what to do, and dhd.log has both
-  hashes and the first different file (finding 098). dhd.log's first line names the release and
-  the build.
-- Tests: `port/net/build_tests.py` (unit and loopback), the server's own tests (`npm test`),
-  `port/tools/online_race.py` (two local games through a relay, optionally `nettool` bots).
+  game's default (dhd.ini `server =` or `DHD_NET_SERVER` override it). Rooms of up to 10
+  (finding 123) that live across races (findings 118, 119), 25 tracks with Salt City MX and TD
+  (finding 166), Ready for the next race and MOSH by
+  the host's pick (finding 128), rooms placed near their creator (finding 135), rejoin by token
+  (finding 137). Protocol: `docs/online-protocol.md`; steps: `online/server/README.md`.
+- Abuse guard (finding 161): a kill switch in the moderation database (`moderate.mjs online
+  off`), limits per address, caps per member, and
+  bans by address hash or install id with a 14-day moderation log in D1, worked from
+  `online/server/tools/moderate.mjs` (no admin endpoint). No player gets another's address, its
+  hash or install id.
+- Race frames (finding 158): over Cloudflare Realtime SFU DataChannels, STATE unordered with no
+  retransmissions and EVENT reliable; the room sets up each racer's session and passes only that
+  racer's SDP. If UDP doesn't connect in 2 s, Cloudflare TURN over TLS on 443 with credentials
+  minted for that racer. 30 snapshots a second; the puppets' delay adapts per sender (50-150 ms).
+  Protocol 3.
+- Client: `port/net/` over `port/net/ws.h`, the Rust crate `dhd_net` (`port/render/net`:
+  tungstenite over rustls for the lobby, str0m for the SFU with a vendored RustCrypto adapter,
+  its own TURN client; webpki roots, no OS certificate store).
+- Online needs the USA disc's game files (a hash of every ISO 9660 file, `dhd_disc`; finding 098).
+- Releases with online or pacing changes need a real race between two different machines both
+  ways (single-PC tests have hidden bugs before).
+
+## Nintendo Switch: Downhill Switch (branch `switch/port`)
+
+- A homebrew `.nro` for Atmosphere's Homebrew Menu, released from the fork
+  `RonyAbreu/downhill-switch` as **Downhill Switch** (`port/switch/switch_version.h`: name,
+  author, version, SD card folder). Plan and round log: finding 167; the renderer's long fields:
+  finding 168. The dated history before the 0.7.12 merge is `git show 7ae183e:docs/STATE.md`
+  (its Phase 4).
+- Build: `port/switch/Dockerfile` (devkitA64, libnx) and `port/switch/build.sh`, which builds
+  devkitPro's SDL3 and then `build_host64.py --target switch-arm64` from `build/wasm/dhd_core.wasm`.
+  No Rust on Horizon: the C units `port/switch/render_gl.c`, `render_native.c`, `textures.c` stand
+  in for `dhd_render`, OpenGL 4.3 on Mesa nouveau. One Docker build at a time on a workstation:
+  two at once hung Docker Desktop's engine.
+- Runs the whole game with the native renderer, sound, pads, rumble, memory cards and EXIT GAME.
+  Online is off, as on phones (`host_service_net_offered`).
+- Speed at scale 2 with `DHD_SWITCH_CLOCKS = max`, same track: 43.8 fields/s in a race, worst
+  field 186 ms, menus 47.5 (`limit=cpu:game`). The three cores Horizon gives a game are nearly
+  full: the game thread runs 93-96% of the wall clock, VU 80-94%, GS 55-73%; ready-but-not-running
+  stays 2-9%, so placement is not the limit. What paid: a float scanout (integer division on
+  Maxwell cost 24-30 ms a picture), no producer spin and a lock-free wake in
+  `port/hle/graphics_queue.c`, programs linked at start-up, and the texture uploads off the
+  render thread's critical path.
+- `DHD_SWITCH_PROFILE = 1` samples the named threads on the console (`port/switch/profile.c`,
+  `profile.txt` beside dhd.log, `port/switch/profile_report.py`); every exit lists the threads
+  left (`switch_thread_census`).
+- Exit: hbloader loads the Homebrew Menu into the same process, so every thread must be joined
+  and every service and mapping given back before the return. Open: a relaunch from the Homebrew
+  Menu right after EXIT GAME can still crash.
+- Open: the rider's shadow can draw flat for part of a race; the sound mixer is about 9% of the
+  game thread and can't leave it while the core is single-threaded.
+
+## Checks and tools
+
+- One entry point: `python tools/check.py docs|quick|port|matching|server` (root AGENTS.md,
+  "Done means"). Docs alone: `python tools/check_docs.py`.
+- Unit tests: `python port/tools/test_runtime.py` (after `build_wasm.py`); test programs run where
+  the game runs their code (finding 104). Renderer: `test_gs_wgpu.py`, replay goldens recorded
+  locally (`gs_golden.py`), `test_native_transfers.py`. Game state: per-field state traces
+  (`port/hle/state_trace.c`, `state_trace_run.py`, `state_diff.py`), `test_fps_race.py`,
+  `rate_drift.py`, `slow_race.py`, `replay_check.py`. Server: `npm test` in `online/server`.
+  Online: `port/net/build_tests.py`, `port/tools/online_race.py`. Retail comparisons with PCSX2:
+  `compare_pcsx2.py`, `race_compare.py` (finding 024). Everything, with setup variables:
+  `docs/TESTING.md`.
+
+## Open
+
+- Phones: on the low-end profile (Realme RMX3930 (Unisoc T612), reproduced on a throttled Mi 11i)
+  2x races hold 60 with the profile-guided build and reach about 59.5 at the race start without
+  it; 4x does not hold 60 at the race start (GPU-bound). Findings 127, 146-149 say what is left;
+  finding 156 says where a frame's time goes on the phone and the desktops, and what replacing the
+  VU1 and GS emulation with native rendering would remove.
+- Browser speed is below 60 in races (finding 087).
+- High-rate handling differs a little from 60 by the race's own chaos, with no trend (finding
+  139, after finding 067's limits).
+- Rich Presence on macOS and Linux is built but not run against Discord there (finding 106).

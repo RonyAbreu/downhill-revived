@@ -15,7 +15,7 @@
      clock and every PC starts the countdown then, so the GOs land together (the frame clock
      slips by the wait, kernel_pace_slip).
    - In the race this PC's controller rides rider 0, from the grid place the host has for this
-     player. About 20 times a second it sends a snapshot of the riders it runs (its own; the host
+     player. About 30 times a second it sends a snapshot of the riders it runs (its own; the host
      also the AI riders) as STATE frames; the other humans, and on the other PCs the AI, are
      puppets in AI rider slots (each PC at its player's frame rate, 60-240: snapshots carry race
      time, and every count here is of race ticks, 1/60 s fields, or wall time, never of frames;
@@ -26,6 +26,7 @@
      AI rider (findings 044, 047). Room finishers stay to watch until the server closes the race
      or they choose BACK TO THE ROOM / LEAVE THE ROOM (finding 122). */
 #include "hle.h"
+#include "../runtime/portable.h"
 #include "../gs/present.h"
 #include "../net/net.h"
 #include "../include/version.h"
@@ -274,11 +275,11 @@ extern void func_001B45F8(void *timer, int kind, int ticks);  /* the race-end co
    port/hle/puppet.c's. */
 enum {
     EVENT_VERSION = 2, EVENT_HIT = 1, EVENT_LOADED = 2, EVENT_SETUP = 3, EVENT_START = 4, EVENT_GO = 5,
-    EVENT_FINISH = 6, EVENT_RESULTS = 7  /* 8 was 0.7.3's rematch (TRY AGAIN / NEW LEVEL in the race) */
+    EVENT_FINISH = 6, EVENT_RESULTS = 7, EVENT_PICKUP = 9  /* 8 was 0.7.3's rematch (TRY AGAIN / NEW LEVEL in the race) */
 };
-enum { SNAPSHOT_TICKS = 3 };  /* a snapshot every 3 race ticks: 20 a second at any frame rate */
+enum { SNAPSHOT_TICKS = 2 };  /* a snapshot every 2 race ticks: 30 a second at any frame rate */
 enum { NRIDERS = 10, START_LEAD_MS = 1500 };
-_Static_assert(2 + NRIDERS * 256 <= NET_FRAME_MAX, "all owned riders fit one STATE frame");
+_Static_assert(2 + 834 <= NET_FRAME_MAX, "one independent rider snapshot fits one STATE frame");
 #define RACE_CLOCK EE32(0x43EEC8)
 /* The race object D_0043EEC0 (func_0019F210): +8 the race clock, +0x1C finish times (race ticks)
    and +0x58 finished flags by rider slot, +0x62 finishes to apply on the next step. */
@@ -334,6 +335,8 @@ static struct {
     int watch_slot, watch_paused, watch_direction;
     int watched;                /* the camera has left this PC's rider: its HUD stays hidden */
     double watch_finished_at;
+    int saved_zoom, saved_zoom_rate; /* this PC's camera setting before watching (watch_cut) */
+    double cut_wait_at;         /* a cut waits while the watched rider crashes (since then) */
     unsigned ai_sent;
     int last_race_id;
     double leave_at;
@@ -580,6 +583,58 @@ static void send_event(const void *payload, int n)
 static void put32(uint8_t *o, int32_t v) { memcpy(o, &v, 4); }
 static int32_t get32(const uint8_t *i) { int32_t v; memcpy(&v, i, 4); return v; }
 
+/* Pickup pool: retail allocates 150 entries in level-file order (001961D8).
+   Only the index travels, never a pointer. Type, track and exact spawn xyz guard it. */
+#include "online_pickup.h"
+int hle_puppet_owner(int global);
+#define PICKUP_POOL 0x4348F0
+#define PICKUP_COUNT EE32(PICKUP_POOL + 0xC00)
+static uint8_t *pickup_entry(int id) { return EE_PTR(PICKUP_POOL + 0x18 + id * 20); }
+static uint8_t *pickup_node(uint8_t *p) { return *(uint8_t **)(p + 8); }
+
+int hle_online_pickup_allowed(void *rider)
+{
+    if (!online_mode() || !on.started) return 1;
+    for (int i = 0; i < hle_online_race_riders(); i++)
+        if (rider == RIDER(i)) return hle_puppet_owned(i);
+    return 0;
+}
+
+void hle_online_pickup_taken(void *pickup, void *rider)
+{
+    if (!online_mode() || !on.started || EE32(MENU) != LOAD_MENU || !race_running()) return;
+    for (int id = 0; id < PICKUP_COUNT && id < 150; id++) {
+        uint8_t *p = pickup_entry(id);
+        if (p != pickup) continue;
+        for (int slot = 0; slot < hle_online_race_riders(); slot++) {
+            if (rider != RIDER(slot) || !hle_puppet_owned(slot)) continue;
+            uint8_t e[PICKUP_EVENT_SIZE];
+            pickup_encode(e, id, hle_puppet_global(slot), *(int32_t *)(p + 4),
+                          EE32(SETUP + 0x2A0), pickup_node(p) + 0x10);
+            if (host_service_net_send_frame(NET_FRAME_EVENT, GADDR(e), sizeof e))
+                fprintf(stderr, "online: pickup %d taken by slot %d (sent)\n", id, hle_puppet_global(slot));
+        }
+        return;
+    }
+}
+
+static void receive_pickup(int sender, const uint8_t *e, int n)
+{
+    if (!on.started || EE32(MENU) != LOAD_MENU || !race_running() ||
+        n != PICKUP_EVENT_SIZE || e[2] >= PICKUP_COUNT || e[2] >= 150 ||
+        e[3] >= hle_online_race_riders() || hle_puppet_owner(e[3]) != sender) return;
+    uint8_t *p = pickup_entry(e[2]), *node = pickup_node(p);
+    if (!node || !pickup_matches(e, n, PICKUP_COUNT, *(int32_t *)(p + 4),
+                                 EE32(SETUP + 0x2A0), node + 0x10) ||
+        !*(int32_t *)node || !node[4]) return;
+    /* Same taken state as 00196590, without any rider reward. 00196888 waits
+       for this collector to leave a 10-unit radius, then runs the retail timer. */
+    *(void **)(p + 12) = RIDER(hle_puppet_local(e[3]));
+    *(int32_t *)(p + 16) = EE32(PICKUP_POOL + 0xBE8 + 4 * e[4]);
+    node[4] = 0;
+    fprintf(stderr, "online: pickup %d taken by slot %d (event from player %d)\n", e[2], e[3], sender);
+}
+
 /* DHD_NET_RECORD=file: tests, this PC's rider's snapshots as sent (a 2-byte length, then the
    payload), for nettool --replay's bots. Keep it under build/ or a temp folder. */
 static void record(const uint8_t *payload, int n)
@@ -609,15 +664,16 @@ static void receive_frames(void)
     while ((n = host_service_net_receive_frame(GADDR(frame), sizeof frame)) > 0) {
         int sender = frame[1];
         const uint8_t *e = frame + 2;
-        if (frame[0] == NET_FRAME_STATE) {  /* the sender's riders: [size][snapshot]... */
-            for (const uint8_t *end = frame + n; e < end && e + 1 + e[0] <= end; e += 1 + e[0]) {
-                hle_puppet_receive(sender, e + 1, e[0]);
-                on.received++;
-            }
+        if (frame[0] == NET_FRAME_STATE) {
+            hle_puppet_receive(sender, e, n - 2);
+            on.received++;
             continue;
         }
         if (frame[0] != NET_FRAME_EVENT || n < 4 || e[0] != EVENT_VERSION || sender >= NET_MAX_SLOTS) continue;
         switch (e[1]) {
+        case EVENT_PICKUP:
+            receive_pickup(sender, e, n - 2);
+            break;
         case EVENT_LOADED:
             if (!on.loaded[sender]++) fprintf(stderr, "online: player %d has loaded (at %.1f s)\n", sender, host_wall_seconds());
             break;
@@ -861,7 +917,9 @@ void func_0020F9F0(int font, int view, int x, int y, const char *text);
    (func_001B4900: the race loop ends with 2 and the race screen opens its pause menu), whose
    builder then leaves the race screen at once as QUIT's Yes does (port_online_pause_rows). While
    the race loop runs, after a finish too, no menu opens: func_0015E0C0 alone or a pushed menu
-   does nothing there. Paused already, the menu opens again when the player resumes. */
+   does nothing there. Paused already, the loop's stop was taken by that pause (func_001B45F8 takes
+   one until the loop runs again), so the request is made again on the loop's first frame after
+   RESUME (hle_online_loop_frame): the menu opens again and leaves at once (finding 165). */
 static int quit_on_pause;
 static void leave_race(void)
 {
@@ -1098,13 +1156,36 @@ static void finish_step(void)
 extern void func_00148560(void *, int);
 extern void func_00148860(void *);
 
-void hle_online_watch_resume(void) { on.watch_paused = on.watch_direction = 0; }
+/* Every frame of the race loop (func_0016C0C8): the pause menu, which runs outside it, is closed.
+   watch_direction keeps the pad's last Left / Right (pads_read_now reads it in the menu too), so a
+   direction held through RESUME is no new press. A leave_race that came while the menu was up asks
+   the loop to stop again (ignored while a stop is pending). */
+void hle_online_loop_frame(void)
+{
+    on.watch_paused = 0;
+    if (quit_on_pause) func_001B45F8(EE_PTR(0x4B1F40), 2, 0);
+}
+
+/* View 0's camera setting (distance, D_004225A0 +0x12220, and its blend +0x12230, for the next
+   race too): func_0014CC38 changes it from the view's rider's own camera buttons, so watching a
+   player who changes theirs changed this PC's (func_0014DAA8 stores it). Saved when the camera
+   first leaves this PC's rider, put back when the race ends for this PC. */
+#define VIEW0_ZOOM (0x4225A0 + 0x12220)
+#define VIEW0_ZOOM_RATE (0x4225A0 + 0x12230)
+
+static void watch_zoom_restore(void)
+{
+    if (!on.watched) return;
+    EE32(VIEW0_ZOOM) = on.saved_zoom;
+    EE32(VIEW0_ZOOM_RATE) = on.saved_zoom_rate;
+}
 
 static void watch_cut(int slot)
 {
     if (slot == on.watch_slot) return;
     on.watch_slot = slot;
     on.watch_finished_at = 0;
+    if (slot && !on.watched) on.saved_zoom = EE32(VIEW0_ZOOM), on.saved_zoom_rate = EE32(VIEW0_ZOOM_RATE);
     if (slot) on.watched = 1;
     char name[48];
     fprintf(stderr, "online: watching %s (slot %d)\n",
@@ -1124,7 +1205,20 @@ void hle_online_watch_camera(void *camera)
     if (camera != EE_PTR(0x37EA60) || slot < 0 || slot >= hle_online_race_riders()) return;
     if (!slot && !(from_menu && on.end_held)) return;
     if (on.watch_paused || EE32(0x398C40 + 0x5BE4)) return; /* the race loop's pause state */
-    int cut = *(uint8_t **)((char *)camera + 0x2B4) != RIDER(slot);
+    uint8_t *old = *(uint8_t **)((char *)camera + 0x2B4);
+    int cut = old != RIDER(slot);
+    /* The game's own rider switch (func_001487D8) never leaves a rider while it crashes (crash
+       flag +0x4098 bit 2, or the crash states +0x6320 / +0x62E0): the crash's camera and screen
+       effects end only with it. Leaving one then (a crash with Quick Mount held) left the
+       screen orange. The cut waits for the crash to end, at most CUT_WAIT seconds. */
+    enum { CUT_WAIT = 5 };
+    if (cut && old && ((old[0x4098] >> 2 & 1) || *(uint8_t **)(old + 0x4ECC) == old + 0x6320
+                       || *(uint8_t **)(old + 0x4ECC) == old + 0x62E0)) {
+        double now = host_wall_seconds();
+        if (!on.cut_wait_at) on.cut_wait_at = now;
+        if (now - on.cut_wait_at < CUT_WAIT) return;
+    }
+    on.cut_wait_at = 0;
     *(uint8_t **)((char *)camera + 0x2B4) = RIDER(slot);
     if (cut) fprintf(stderr, "online: camera cut slot %d, mode %d -> 1\n", slot, EE32(0x37EA60 + 0x2B8));
     if (cut || EE32(0x37EA60 + 0x2B8) != 1) {
@@ -1266,21 +1360,15 @@ static void state_sync(void)
     }
     if (!race_running() || clock < on.last_sent + SNAPSHOT_TICKS && clock >= on.last_sent) return;
     on.last_sent = clock - clock % SNAPSHOT_TICKS;
-    /* All our riders in one frame (the host's AI riders too): one message to the server a
-       snapshot, not one a rider. Each is [size][snapshot]; a snapshot stays within 255 bytes. */
-    int at = 0, riders = 0, ai = 0;
+    /* Each message is an independent rider snapshot, below the SFU message/MTU budget. */
     for (int slot = 0; slot < hle_online_race_riders(); slot++) {
-        int room = (int)sizeof payload - at - 1;
-        if ((n = hle_puppet_pack(slot, payload + at + 1, room < 255 ? room : 255)) > 0) {
-            payload[at] = (uint8_t)n;
-            if (slot == 0) record(payload + at + 1, n);
-            at += 1 + n, riders++;
-            if (slot && hle_puppet_owned(slot)) ai++;
+        if ((n = hle_puppet_pack(slot, payload, sizeof payload)) > 0) {
+            if (slot == 0) record(payload, n);
+            if (host_service_net_send_frame(NET_FRAME_STATE, GADDR(payload), n)) {
+                on.sent++;
+                if (slot && hle_puppet_owned(slot)) on.ai_sent++;
+            }
         }
-    }
-    if (at && host_service_net_send_frame(NET_FRAME_STATE, GADDR(payload), at)) {
-        on.sent += riders;
-        on.ai_sent += ai;
     }
     while ((n = hle_puppet_take_event(payload, sizeof payload)) > 0) send_event(payload, n);
     static double last_title;
@@ -1336,6 +1424,10 @@ extern float port_fov_x;  /* widescreen.c: glyph width scale, 1 when off */
 void hle_online_names(void *rider, int view)
 {
     if (!online_mode() || !on.started || rider != RIDER(0) || !race_running()) return;
+    static HleEnv names_env;
+    const char *names = hle_env(&names_env, "DHD_NAMES");
+    if (names && !dhd_stricmp(names, "off")) return;
+    int name_width = names && !dhd_stricmp(names, "large") ? 400 : names && !dhd_stricmp(names, "medium") ? 320 : 240;
     uint8_t *pen = EE_PTR(0x4F3570), kept[0x20];
     int cx, cy, w, h, drawn = 0;
     func_0023D618(view, &cx, &cy);
@@ -1363,7 +1455,7 @@ void hle_online_names(void *rider, int view)
         /* Text normally stays inside the middle 4:3 area. Undo that mapping for
            this world anchor, while keeping the glyphs themselves in proportion. */
         int x = (int)(w / 2 + (local_x - w / 2) / port_fov_x), y = (int)local_y - 16;
-        func_0020FB80(0, 320, 240, -102, -24);
+        func_0020FB80(0, name_width, name_width * 3 / 4, -name_width * 102 / 320, -name_width * 24 / 320);
         int half_width = (func_0020F860(0, on.name[global]) + 31) / 32;
         if (local_x - half_width * port_fov_x < 1 || local_x + half_width * port_fov_x >= w - 1 || y < 1) continue;
         func_0020F518(0, 0, 0, 0, 128);
@@ -1480,6 +1572,7 @@ static void race_over(void)
     kernel_pace_shared(0);
     set_env("DHD_NAV", saved_nav);  /* "" unsets it */
     set_env("DHD_RACE_SEED", saved_seed);
+    watch_zoom_restore();
     memset(&on, 0, sizeof on);
     online = 0, from_menu = 0, connected = 0;
     selected_ride = 0;
@@ -1502,6 +1595,7 @@ static void back_to_room(void)
     kernel_pace_shared(0);
     set_env("DHD_NAV", saved_nav);
     set_env("DHD_RACE_SEED", saved_seed);
+    watch_zoom_restore();
     memset(&on, 0, sizeof on);
     online = 0, from_menu = 0, connected = 0;
     selected_ride = 0;
@@ -1658,9 +1752,27 @@ void pads_begin_field(void)
     if (on.started && EE32(MENU) != LOAD_MENU) race_left();
 }
 
+int port_controls_capturing(void);  /* controls_settings.c: a binding waits for a key or button */
+
+/* While PC SETTINGS > Controls waits for a key or button (and until it is let go), the game sees
+   no input: the press is the page's (finding 157). The pads stay connected. */
+static void held_back(HostPad *out)
+{
+    uint8_t connected = out->connected;
+    neutral(out);
+    out->connected = connected;
+}
+
 /* Online: the menu script, then in the race this PC's controller (DHD_NET_SCRIPTED=1, tests:
    still the script, DHD_RACE_PAD). */
+static void pads_read_now(int player, HostPad *out);
 void pads_read(int player, HostPad *out)
+{
+    pads_read_now(player, out);
+    if (port_controls_capturing()) held_back(out);
+}
+
+static void pads_read_now(int player, HostPad *out)
 {
     static HleEnv scripted_env;
     if (online_mode()) {

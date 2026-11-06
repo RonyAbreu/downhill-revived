@@ -76,6 +76,7 @@ saves/
 # --- Local notes and editor/agent settings ---------------------------------------------
 docs/private/
 .claude/
+.agents/
 .vscode/
 .idea/
 
