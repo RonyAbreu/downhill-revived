@@ -839,6 +839,20 @@ static uint32_t native_blend(Native *n, uint64_t alpha)
     if (negative[0] && negative[1]) n->stats.blend_approximate++;
     else if (negative[0]) op = 3;   /* REV_SUBTRACT: Cd * f - Cs * f */
     else if (negative[1]) op = 2;   /* SUBTRACT */
+    {   /* Which GS modes the blend_approx count is made of: each one named once a run, so the
+           next fix is chosen from what the game uses (a 256-bit set over A, B, C and D). */
+        static uint32_t named[8];
+        unsigned mode = (unsigned)alpha & 255;
+        int approximated = (factor[0] == BLEND_ONE && a == 0 && d == 0 && a != b) ||
+                           (factor[1] == BLEND_ONE && a == 1 && d == 1 && a != b) || (negative[0] && negative[1]);
+        if (approximated && !(named[mode >> 5] & 1u << (mode & 31))) {
+            named[mode >> 5] |= 1u << (mode & 31);
+            fprintf(stderr, "gs native: blend approximated: (%s - %s) * %s + %s, FIX %u\n",
+                    (const char *[]){"Cs", "Cd", "0", "0"}[a], (const char *[]){"Cs", "Cd", "0", "0"}[b],
+                    (const char *[]){"As", "Ad", "FIX", "FIX"}[c], (const char *[]){"Cs", "Cd", "0", "0"}[d],
+                    (unsigned)(alpha >> 32) & 255);
+        }
+    }
     return 1 | factor[0] << 1 | factor[1] << 6 | op << 11;
 }
 
