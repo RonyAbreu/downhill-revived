@@ -160,7 +160,9 @@ void dhdr_tex_upload_split(uint64_t *alloc_ns, uint64_t *reused)
    texture's life is short (the GS worker's cache turns over), and the sizes repeat (powers of
    two), so a released texture's GL object goes here instead of to glDeleteTextures, and the next
    upload of the same kind and size takes it: no new texture storage, only the pixels. The pool
-   holds at most POOL_BYTES; past that the oldest go. */
+   holds at most POOL_BYTES; past that the oldest go. Measured afterwards (finding 145): at a
+   race's start every texture is new, so the pool reuses nothing there; the spikes it was meant
+   for are still uploads, and only an upload thread with a shared context would move them. */
 enum { POOL_MAX = 512 };
 static const size_t POOL_BYTES = (size_t)64 << 20;
 typedef struct Pooled { GLuint gl; uint32_t w, h, levels; int replacement; size_t bytes; } Pooled;
