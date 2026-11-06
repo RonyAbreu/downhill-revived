@@ -182,10 +182,17 @@ void switch_thread_core(const char *name)
     int core;
     /* "native" is the native renderer's thread (native_core.inc). The perf lines call it
        "render", which is no thread's own name, and naming it that here was why it was the one
-       thread the first attempt never moved. */
-    if (!strcmp(name, "native")) core = cores[0];
+       thread the first attempt never moved.
+
+       The layout follows what a race at scale 1 measures once the renderer stopped being the
+       cost (finding 144, NX3): game 21-23 ms a field, vu 21-22, gs 13-16, native 3-4. The two
+       heavy ones get a core each and the two light ones share the third, which is 17-20 ms
+       against the 23 ms field. The first layout paired game with gs on one core, 37 ms of work,
+       and was written when the renderer was the heaviest thread; that is why pinning measured
+       as a wash. */
+    if (!strcmp(name, "game")) core = cores[0];
     else if (!strcmp(name, "vu")) core = cores[1];
-    else if (!strcmp(name, "gs") || !strcmp(name, "game")) core = cores[2];
+    else if (!strcmp(name, "gs") || !strcmp(name, "native")) core = cores[2];
     else return;   /* the main thread, SDL's audio, movie, texpack: left alone */
     if (R_FAILED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core))) {
         fprintf(stderr, "switch: the %s thread would not move to core %d\n", name, core);
