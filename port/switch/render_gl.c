@@ -256,7 +256,12 @@ void dhdr_surface_counter(DhdrSurface *s, int enabled, int ping, double seconds)
 void dhdr_surface_touch(DhdrSurface *s, const float *items, uint32_t count, float width_mm, float height_mm)
 { (void)s; (void)items; (void)count; (void)width_mm; (void)height_mm; }
 
+uint64_t dhdr_gl_swap_began_ns, dhdr_gl_swap_ended_ns;
+
 void dhdr_surface_present(DhdrSurface *s)
 {
-    if (s && s->gl && !s->failed) SDL_GL_SwapWindow(s->window);
+    if (!s || !s->gl || s->failed) return;
+    dhdr_gl_swap_began_ns = SDL_GetTicksNS();
+    SDL_GL_SwapWindow(s->window);
+    dhdr_gl_swap_ended_ns = SDL_GetTicksNS();
 }

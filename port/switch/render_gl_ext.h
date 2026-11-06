@@ -7,6 +7,7 @@
    (dhdr_gl_make_current), exactly as render_gl.c's own present calls do. */
 #ifndef RENDER_GL_EXT_H
 #define RENDER_GL_EXT_H
+#include <stdint.h>
 #include "dhd_render.h"
 
 /* Makes s's GL context current on this thread (creating it on the first call), loading glad and
@@ -16,5 +17,9 @@ int dhdr_gl_make_current(DhdrSurface *s);
 /* The last surface dhdr_surface_create made, or NULL (none yet, or destroyed since). The game
    makes one surface on one window, so this is the native renderer's too. */
 DhdrSurface *dhdr_gl_active_surface(void);
+
+/* When the last SDL_GL_SwapWindow began and ended (SDL_GetTicksNS), for render_native.c's slow
+   field line: the swap is the one part of a field's cycle that file does not run itself. */
+extern uint64_t dhdr_gl_swap_began_ns, dhdr_gl_swap_ended_ns;
 
 #endif
