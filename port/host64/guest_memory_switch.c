@@ -42,6 +42,7 @@ uintptr_t guest_base;
 static wasm_rt_memory_t *owner;
 static uintptr_t span_base;       /* SPAN of address space, found before main */
 static int in_heap;               /* span_base is the heap's start (else the stack region's) */
+static VirtmemReservation *span_reservation;   /* the stack region's run, while it is the guest's */
 static char span_why[160];        /* for dhd.log: main has no log yet when the choice is made */
 static uint8_t *committed;        /* one flag per GRANULE */
 static Mutex commit_lock;         /* commits come from the game thread and the host's */
@@ -113,6 +114,12 @@ void __libnx_initheap(void)
     fake_heap_end = (char *)addr + size;
 }
 
+/* The stack region's mappings, for host64_switch_memory_release: each one locks its heap source
+   until it is unmapped, and the heap outlives this program (the loader hands it to the next). */
+typedef struct { uintptr_t at; void *source; size_t size; } Mapping;
+static Mapping *mappings;         /* under commit_lock */
+static int mapping_count, mapping_room;
+
 /* [lo, hi), granule-aligned and none of it committed: in the heap, zeroed; in the stack region,
    one mapping of zeroed heap memory, which the process then never touches at its own address
    (svcMapMemory makes it inaccessible there). */
@@ -126,11 +133,55 @@ static int back_run(uint64_t lo, uint64_t hi)
     void *source = aligned_alloc(0x1000, size);
     if (!source) return 0;
     memset(source, 0, size);
+    if (mapping_count == mapping_room) {   /* each one is kept: an untracked one could not be given back */
+        int room = mapping_room ? mapping_room * 2 : 64;
+        Mapping *grown = realloc(mappings, (size_t)room * sizeof *grown);
+        if (!grown) {
+            free(source);
+            return 0;
+        }
+        mappings = grown;
+        mapping_room = room;
+    }
     if (R_FAILED(svcMapMemory((void *)(guest_base + lo), source, size))) {
         free(source);
         return 0;
     }
+    mappings[mapping_count].at = guest_base + lo;
+    mappings[mapping_count].source = source;
+    mappings[mapping_count].size = size;
+    mapping_count++;
     return 1;
+}
+
+/* The Switch's exit (port/host/switch_main.c), once no thread of ours is left to touch guest
+   memory: the stack region's mappings undone. Without this, every heap page that backed the guest
+   stays locked (no access) after this program has returned, and the next program the loader runs
+   in this process -- the Homebrew Menu, or dhd.nro again -- faults on its first write there: a
+   second start crashed inside nvInitialize's tmemCreate, zeroing a fresh transfer memory
+   (finding 146). The heap's own guest span needs nothing: it is plain heap. */
+void host64_switch_memory_release(void)
+{
+    int failed = 0;
+    for (int i = mapping_count - 1; i >= 0; i--) {
+        if (R_FAILED(svcUnmapMemory((void *)mappings[i].at, mappings[i].source, mappings[i].size))) {
+            failed++;
+            continue;
+        }
+        free(mappings[i].source);
+    }
+    if (mapping_count)
+        fprintf(stderr, "host64 memory: %d stack region mapping%s given back%s\n", mapping_count - failed,
+                mapping_count - failed == 1 ? "" : "s", failed ? " (some failed)" : "");
+    mapping_count = 0;
+    if (!in_heap && span_base) {
+        virtmemLock();
+        virtmemRemoveReservation(span_reservation);
+        virtmemUnlock();
+        span_reservation = NULL;
+    }
+    guest_base = 0;
+    owner = NULL;
 }
 
 static int commit_range(uint64_t lo, uint64_t hi)
@@ -186,9 +237,9 @@ void wasm_rt_allocate_memory(wasm_rt_memory_t *m, uint64_t initial, uint64_t max
     if (initial * 65536 > SPAN) fail("the module's memory outgrew SPAN (guest_memory_switch.c)");
     if (!in_heap) {  /* the stack region's run, kept from thread stacks from here on */
         virtmemLock();
-        void *taken = virtmemAddReservation((void *)span_base, SPAN);
+        span_reservation = virtmemAddReservation((void *)span_base, SPAN);
         virtmemUnlock();
-        if (!taken) fail("stack region reservation");
+        if (!span_reservation) fail("stack region reservation");
     }
     guest_base = span_base;
     if (!(committed = calloc((size_t)(SPAN / GRANULE), 1))) fail("commit map");

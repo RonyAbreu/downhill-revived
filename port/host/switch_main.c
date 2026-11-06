@@ -113,8 +113,24 @@ static void switch_exit_now(void)
     if (host_jobs_join(1000)) fprintf(stderr, "switch: a job thread is still running at the exit\n");
     int halted = gs_native_halt(1000);
     host_freeze_watch_stop(1500);
-    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    if (halted) {
+        /* SDL's video too: its EGL display terminated, which ends Mesa's nouveau device and with it
+           nvdrv. Left open, nvdrv keeps the 8 MiB transfer memory nvInitialize gave it, and those
+           heap pages stay inaccessible after the return: the next program the loader starts here
+           with the same heap -- dhd.nro again -- faulted zeroing its own transfer memory at the
+           same address (finding 146). */
+        SDL_Quit();
+        int closed = 0;
+        while (serviceIsActive(nvGetServiceSession()) && closed < 16) nvExit(), closed++;
+        if (closed) fprintf(stderr, "switch: nvdrv was still open after SDL_Quit (closed %d time%s)\n",
+                            closed, closed == 1 ? "" : "s");
+    } else {
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);   /* the render thread may still be drawing: video stays */
+    }
     switch_shutdown();
+    /* every thread that could touch guest memory is gone: its stack region mappings go back */
+    void host64_switch_memory_release(void);   /* port/host64/guest_memory_switch.c */
+    if (halted) host64_switch_memory_release();
     int switch_thread_census(unsigned ms);   /* port/switch/clocks.c */
     switch_thread_census(1000);
     const char *how = getenv("DHD_SWITCH_EXIT");

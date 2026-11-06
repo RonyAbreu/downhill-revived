@@ -2489,6 +2489,9 @@ static int SDLCALL native_thread(void *argument)
 #endif
     if (n->interp) native_interp_thread(n);
     else while (native_render_next(n)) {}
+#ifdef __SWITCH__
+    native_thread_release_gl();   /* so the exit's SDL_Quit can end EGL and nvdrv */
+#endif
     __atomic_store_n(&n->ended, 1, __ATOMIC_RELEASE);
     return 0;
 }

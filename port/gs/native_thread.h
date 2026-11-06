@@ -90,6 +90,16 @@ static inline int native_thread_start(SDL_ThreadFunction proc, void *argument)
     return 1;
 }
 #ifdef __SWITCH__
+#include <SDL3/SDL_video.h>
+/* The render thread's last act on the Switch: its OpenGL context made current nowhere. A context
+   left current on a thread that has ended stays bound for good, and EGL keeps a bound context
+   (and the GPU device under it) through eglTerminate: the exit's SDL_Quit could then not close
+   nvdrv (finding 146). */
+static inline void native_thread_release_gl(void)
+{
+    SDL_Window *window = SDL_GL_GetCurrentWindow();
+    if (window || SDL_GL_GetCurrentContext()) SDL_GL_MakeCurrent(window, NULL);
+}
 /* The render thread's end, once it has returned: its handle closed. */
 static inline void native_thread_join(void)
 {
