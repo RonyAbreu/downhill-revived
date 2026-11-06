@@ -1,3 +1,25 @@
+# Downhill Switch
+
+<img src="port/switch/icon.jpg" alt="Downhill Switch" width="160" align="right">
+
+**Downhill Domination on the Nintendo Switch, as homebrew.** Downhill Switch is the Switch port of
+[Downhill Revived](https://github.com/skuza-oss/downhill-revived) by skuza-oss: it runs that
+project's game core natively on Horizon, with its own OpenGL renderer for the Switch's GPU. It
+needs a Switch running Atmosphère and your own Downhill Domination (USA) disc image; nothing of
+the game is in this repository or its downloads.
+
+**[Download the beta](https://github.com/RonyAbreu/downhill-switch/releases)** ·
+**[Issues](https://github.com/RonyAbreu/downhill-switch/issues)** ·
+**[Installing and settings](port/release/SWITCH-NOTES.txt)** ·
+**[Where the port stands](docs/STATE.md)** (its "Nintendo Switch" section)
+
+Install: unzip the release onto the SD card (`sdmc:/switch/downhill-switch/`), put your disc
+image beside `dhd.nro` as `game.iso`, then open the Homebrew Menu holding R while launching a game
+and pick Downhill Switch. The Switch work lives on the `switch/port` branch; everything below is
+Downhill Revived's own README, which this port builds on.
+
+---
+
 # Downhill Revived
 
 A PC port of Downhill Domination.
