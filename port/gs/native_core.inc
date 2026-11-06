@@ -925,6 +925,15 @@ static void native_state(Native *n, Gs *g, unsigned prim, unsigned ctxt)
         c->blend_key = (c->blend_key & ~(31u << 1)) | BLEND_ONE << 1;
         k->flags |= 512;
     }
+    /* (Cd - 0) * As + Cd: the destination times 1 + As / 128, which native_blend approximates as
+       Cd alone (Zero, One). Flag 4096 tells a renderer that can do better: the Switch's draws the
+       colour as As / 128 and blends it with DstColor, One (render_native.c). The Rust renderer
+       does not read the flag and keeps the approximation. */
+    if (prim & 64) {
+        uint64_t alpha = g->reg[GS_ALPHA_1 + ctxt];
+        if ((alpha & 3) == 1 && (alpha >> 2 & 3) >= 2 && (alpha >> 4 & 3) == 0 && (alpha >> 6 & 3) == 1)
+            k->flags |= 4096;
+    }
     c->color_mask = (uint8_t)mask;
     /* Alpha test. AFAIL decides what a failing pixel still writes: a second pass draws exactly
        the failing pixels with the remaining writes. */
