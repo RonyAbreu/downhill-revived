@@ -12,6 +12,9 @@ sdmc:/switch/downhill-revived/ :
     switch/downhill-revived/README.txt              the players' text (port/release/SWITCH-NOTES.txt)
     switch/downhill-revived/LICENSE.txt
     switch/downhill-revived/THIRD-PARTY-NOTICES.txt
+    switch/downhill-revived/SWITCH-THIRD-PARTY-NOTICES.txt   what only the .nro links statically:
+                                                    libnx, newlib, the GCC runtime, Mesa,
+                                                    libdrm_nouveau, glad, libpng, zlib
 
 The player's own disc image goes beside them and is never in the archive.
 
@@ -56,11 +59,10 @@ def nro_problems(nro, name, settings):
         problems.append('no NRO0 header: this is not a Switch homebrew file')
     if b'dhd-port %s ' % name.encode() not in data:
         problems.append('not built from version %s (its own version string is not in it)' % name)
-    # The strings, each with what is around it: FORBIDDEN holds this checkout's own folder with
-    # the drive letter cut off, and a checkout named downhill-revived makes that "/downhill-
-    # revived", which the project's own repository URL in the binary contains. Printing the match
-    # is what tells that apart from a builder's path really having leaked.
-    lowered = data.lower()
+    # The strings, each with what is around it, so a match can be judged without running the scan
+    # again by hand. The game's own paths that hold the project's name (its SD card folder, its
+    # repository's address) are blanked first: rel.OWN_PATHS says why that cannot hide a leak.
+    lowered = rel.without_own_paths(data)
     for s in rel.FORBIDDEN + sorted(rel.server_strings(settings)):
         at = lowered.find(s.lower())
         if at >= 0:
@@ -106,7 +108,8 @@ def main():
              (FOLDER + 'dhd.ini', rel.lf(RELEASE / 'switch-dhd.ini')),
              (FOLDER + 'README.txt', rel.lf(RELEASE / 'SWITCH-NOTES.txt')),
              (FOLDER + 'LICENSE.txt', rel.lf(ROOT / 'LICENSE')),
-             (FOLDER + 'THIRD-PARTY-NOTICES.txt', rel.lf(RELEASE / 'THIRD-PARTY-NOTICES.txt'))]
+             (FOLDER + 'THIRD-PARTY-NOTICES.txt', rel.lf(RELEASE / 'THIRD-PARTY-NOTICES.txt')),
+             (FOLDER + 'SWITCH-THIRD-PARTY-NOTICES.txt', rel.lf(RELEASE / 'SWITCH-THIRD-PARTY-NOTICES.txt'))]
     for path, _ in files:
         if rel.GAME_DATA.search(path.rsplit('/', 1)[-1]):
             sys.exit('%s looks like game data' % path)

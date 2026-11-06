@@ -705,28 +705,22 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   of findings 107/112/127, plus NEON paths and thread placement over the four A57 cores. An
   overclocked Switch is about 0.6x the Unisoc T612 of findings 126/127 single-thread, 0.35x at
   the stock 1020 MHz, so well under 60 fields/s is expected at first.
-- **NX4, packaging (the tool is written; two findings are open).**
+- **NX4, packaging (done).**
   `python port/switch/package.py` checks the `.nro` and zips it with the SD card's own layout
   (`switch/downhill-revived/`: the `.nro`, `port/release/switch-dhd.ini` as `dhd.ini`,
-  `port/release/SWITCH-NOTES.txt` as `README.txt`, and the two licence texts), beside an
+  `port/release/SWITCH-NOTES.txt` as `README.txt`, `LICENSE.txt`, `THIRD-PARTY-NOTICES.txt` and
+  `SWITCH-THIRD-PARTY-NOTICES.txt`: the licences and copyright notices of what only the `.nro`
+  links statically -- libnx, newlib, the GCC runtime, Mesa (every copyright line of the sources
+  whose objects `dhd.map` shows linked), libdrm_nouveau, glad, libpng, zlib), beside an
   unzipped copy and a `SHA256SUMS`. It is separate from `package_release.py` because that one
   publishes -- `latest.json`, which the launchers and Android's update notice read -- and the
   Switch build has no launcher and no update check; its checks are imported rather than copied.
-  It refuses today, on two things that want a person:
-  - It reports `/downhill-revived` as a forbidden string. That is `scan_retail`'s rule that the
-    builder's own folder must not appear in the binary, and `FORBIDDEN` holds this checkout's
-    path with the drive letter cut off. The match is `sdmc:/switch/downhill-revived/`, which is
-    where the game lives on the SD card and has to be in it. It is a collision with a checkout
-    named `downhill-revived`, not a leak, and it would hit any platform built from such a
-    checkout.
-  - Three runs of the retail executable's `.rodata` are in the `.nro` and not in
-    `scan_retail.SOURCE`: 67 bytes from PS2 0x002994B5, 131 from 0x0029AC7D and 792 from
-    0x0029A968. `SOURCE` is a curated list of the ranges the decompiled source legitimately
-    holds, each with a note naming its file. Whether these three are the same thing has to be
-    checked by hand against `src/`, so nothing was added to that list.
- `package_release.py --platform switch`: the `.nro`, a `dhd.ini`
-  template and the players' text, the disc image beside them in
-  `sdmc:/switch/downhill-revived/`.
+  It passes. The two things it first refused were neither a leak nor game data (finding 144,
+  "Packaging"): `/downhill-revived`, the checkout's folder without its drive, matched the game's
+  own SD path and repository address, which `package_release.OWN_PATHS` now blanks (those two
+  strings only); and three runs of the retail `.rodata` were zlib's DEFLATE length table and
+  fdlibm's float pi/2 reduction tables, which devkitPro's static `libz.a` and newlib `libm.a`
+  carry too, now in `scan_retail.PUBLIC`.
 
 Off on Horizon, as on Android: online play (`host_service_net_offered` is 0), the disc check for
 online, and presence. `dhd.ini` is read by the C reader, not the Rust `dhd_settings` crate.

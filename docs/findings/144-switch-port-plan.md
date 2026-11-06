@@ -74,6 +74,35 @@ under 60 fields/s at first; the work list is the one of findings 107/112/127, me
 4. **NX4, packaging.** `package_release.py --platform switch`: the `.nro`, a `dhd.ini` template, the
    players' text; the disc image goes beside it (`sdmc:/switch/downhill-revived/`).
 
+## Packaging: what the release checks first refused (2026-11-06)
+
+`port/switch/package.py` (NX4) refused the first `.nro` on two things, neither of them a leak:
+
+- **`/downhill-revived` as a builder's folder.** `package_release.FORBIDDEN` holds the checkout's
+  own path with the drive letter cut off; from a checkout named `downhill-revived` that is
+  `/downhill-revived`, which the game holds on purpose: its SD card folder
+  (`sdmc:/switch/downhill-revived/`, `switch_main.c` `DEFAULT_DIR`) and its repository's address
+  (`other_releases.inc`, `update_check.c`), the second in every platform's build. A checkout
+  under any other path (a worktree, say) does not collide. `package_release.OWN_PATHS` now blanks
+  those two exact strings, and nothing else, before `FORBIDDEN` is searched for; neither can be
+  part of a filesystem path (no folder is named `sdmc:` or `https:`), so `E:/downhill-revived/...`,
+  `/e/downhill-revived/...` and `/mnt/e/downhill-revived/...` are still found.
+- **Three runs of the retail `.rodata`.** None is the decompiled source's and none is game data:
+  each is a public library table that the game's PS2 libraries and the Switch toolchain's both
+  carry, found by searching the toolchain's own static libraries (in the `dhd-switch-dev` image)
+  for the bytes. They went in `scan_retail.PUBLIC`, not `SOURCE`.
+  - 67 bytes at PS2 0x002994B5: DEFLATE's length base table (zlib `inftrees.c` `lbase`: 3 ... 258
+    as 16-bit words), beside the distance table `PUBLIC` already listed. In the Switch build it
+    comes from devkitPro's portlibs `libz.a`, under libpng (NX2). The other platforms decode PNG
+    with the png crate, whose inflater lays its tables out differently; only the distance table
+    matched there.
+  - 792 bytes at 0x0029A968 and 131 at 0x0029AC7D: fdlibm's `e_rem_pio2f.c` (float argument
+    reduction under `sinf`/`cosf`/`tanf`): `two_over_pi`, 2/pi eight bits per word, and
+    `npio2_hw`, the high words of n*pi/2. devkitA64's newlib `libm.a`, linked statically, has
+    both. The other platforms take libm from the system's shared C library (UCRT, glibc,
+    libSystem, bionic), so it is never in the file shipped; the wasm core (`dhd_core.wasm`)
+    holds neither table.
+
 ## Other Switch ports read (2026-11-05)
 
 Two the player pointed at, and what each gave:
