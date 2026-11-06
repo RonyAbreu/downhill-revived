@@ -113,6 +113,9 @@ static void switch_exit_now(void)
     if (host_jobs_join(1000)) fprintf(stderr, "switch: a job thread is still running at the exit\n");
     int halted = gs_native_halt(1000);
     host_freeze_watch_stop(1500);
+    /* the clock keeper is an SDL thread: joined before SDL_Quit, which leaves every SDL_Thread
+       invalid and SDL_WaitThread a no-op (the census then still listed "clocks") */
+    switch_shutdown();
     if (halted) {
         /* SDL's video too: its EGL display terminated, which ends Mesa's nouveau device and with it
            nvdrv. Left open, nvdrv keeps the 8 MiB transfer memory nvInitialize gave it, and those
@@ -127,10 +130,11 @@ static void switch_exit_now(void)
     } else {
         SDL_QuitSubSystem(SDL_INIT_AUDIO);   /* the render thread may still be drawing: video stays */
     }
-    switch_shutdown();
     /* every thread that could touch guest memory is gone: its stack region mappings go back */
     void host64_switch_memory_release(void);   /* port/host64/guest_memory_switch.c */
     if (halted) host64_switch_memory_release();
+    void host64_switch_heap_report(void);   /* what is left held in the heap the next program gets */
+    host64_switch_heap_report();
     int switch_thread_census(unsigned ms);   /* port/switch/clocks.c */
     switch_thread_census(1000);
     const char *how = getenv("DHD_SWITCH_EXIT");

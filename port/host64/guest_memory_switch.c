@@ -80,6 +80,62 @@ static uintptr_t stack_region_run(uint64_t need, uint64_t *largest)
     return 0;
 }
 
+/* Pages of the heap something else still holds (finding 146). The homebrew loader hands every
+   program it runs in this process the same heap, so a program that left part of it with a system
+   service -- transfer memory a service never gave back, GPU memory, a mapping's locked source --
+   leaves it inaccessible to the next one, which faults on its first write there. A block counts
+   as held when it is not plain read-write heap with no attribute. heap_scan lists them (the first
+   HELD_MAX) and returns how many there are, and the largest run of [lo, hi) clear of them. */
+enum { HELD_MAX = 8 };
+typedef struct { uintptr_t addr; uint64_t size; u32 type, perm, attr; } HeldBlock;
+
+static int heap_scan(uintptr_t lo, uintptr_t hi, HeldBlock *held, uintptr_t *clear_lo, uintptr_t *clear_hi)
+{
+    int count = 0;
+    uintptr_t run = lo, best_lo = lo, best_hi = lo;
+    for (uintptr_t at = lo; at < hi;) {
+        MemoryInfo m;
+        u32 page;
+        if (R_FAILED(svcQueryMemory(&m, &page, at)) || m.addr + m.size <= at) break;
+        uintptr_t end = m.addr + m.size < hi ? m.addr + m.size : hi;
+        int plain = (m.type & MemState_Type) == MemType_Heap && (m.perm & Perm_Rw) == Perm_Rw && !m.attr;
+        if (!plain) {
+            if (count < HELD_MAX)
+                held[count] = (HeldBlock){at, end - at, m.type & MemState_Type, m.perm, m.attr};
+            count++;
+            if (at - run > best_hi - best_lo) best_lo = run, best_hi = at;
+            run = end;
+        }
+        at = end;
+    }
+    if (hi - run > best_hi - best_lo) best_lo = run, best_hi = hi;
+    if (clear_lo) *clear_lo = best_lo, *clear_hi = best_hi;
+    return count;
+}
+
+static void held_log(const char *when, const HeldBlock *held, int count)
+{
+    fprintf(stderr, "host64 memory: %s: %d held heap block%s%s\n", when, count, count == 1 ? "" : "s",
+            count ? " (type, permission, attribute)" : "");
+    for (int i = 0; i < count && i < HELD_MAX; i++)
+        fprintf(stderr, "  %p +%llu KiB: type 0x%X perm %u attr 0x%X\n", (void *)held[i].addr,
+                (unsigned long long)(held[i].size >> 10), held[i].type, held[i].perm, held[i].attr);
+}
+
+static HeldBlock start_held[HELD_MAX];  /* what __libnx_initheap found, logged once the log is open */
+static int start_held_count;
+static uint64_t start_skipped;          /* bytes of heap left out to stay clear of them */
+static uintptr_t heap_lo, heap_hi;      /* the heap as the loader gave it */
+
+/* The exit's view (port/host/switch_main.c), after every teardown: what this program leaves held
+   in the heap the next program gets. */
+void host64_switch_heap_report(void)
+{
+    HeldBlock held[HELD_MAX];
+    if (!heap_hi) return;
+    held_log("at the exit", held, heap_scan(heap_lo, heap_hi, held, NULL, NULL));
+}
+
 /* libnx's own heap setup (weak there), with the guest's address space chosen first. */
 extern char *fake_heap_start, *fake_heap_end;
 
@@ -95,6 +151,17 @@ void __libnx_initheap(void)
         if (total > used + 0x200000) size = (total - used - 0x200000) & ~(uint64_t)0x1FFFFF;
         if (!size) size = 0x2000000 * 16;
         if (R_FAILED(svcSetHeapSize(&addr, size))) diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_HeapAllocFailed));
+    }
+    /* A heap that a program before this one left partly held: only its largest clear run is used,
+       guest and malloc alike (the first is the bsd transfer memory socketInitialize zeroes, which
+       is where a second start from the Homebrew Menu crashed). */
+    heap_lo = (uintptr_t)addr, heap_hi = (uintptr_t)addr + size;
+    uintptr_t clear_lo, clear_hi;
+    start_held_count = heap_scan(heap_lo, heap_hi, start_held, &clear_lo, &clear_hi);
+    if (start_held_count) {
+        start_skipped = size - (clear_hi - clear_lo);
+        addr = (void *)clear_lo;
+        size = clear_hi - clear_lo;
     }
     uint64_t largest;
     if ((span_base = stack_region_run(SPAN, &largest))) {
@@ -233,6 +300,11 @@ void wasm_rt_allocate_memory(wasm_rt_memory_t *m, uint64_t initial, uint64_t max
     fprintf(stderr, "host64 memory: process %llu of %llu MiB used; guest address space: %s\n",
             (unsigned long long)(info(InfoType_UsedMemorySize) >> 20),
             (unsigned long long)(info(InfoType_TotalMemorySize) >> 20), span_why);
+    if (start_held_count) {
+        held_log("at the start (a program before this one left them)", start_held, start_held_count);
+        fprintf(stderr, "host64 memory: %llu MiB of the heap left out to stay clear of them\n",
+                (unsigned long long)(start_skipped >> 20));
+    }
     if (!span_base) fail("no room for the guest's address space (start in title takeover: hold R on a game)");
     if (initial * 65536 > SPAN) fail("the module's memory outgrew SPAN (guest_memory_switch.c)");
     if (!in_heap) {  /* the stack region's run, kept from thread stacks from here on */
