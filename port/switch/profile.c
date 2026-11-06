@@ -14,7 +14,13 @@
    against dhd.elf (addr2line, inlined frames kept). A thread waiting rather than running shows
    up in the kernel call it waits in (svcWaitSynchronization, svcWaitProcessWideKeyAtomic, ...),
    so the report says how much of a thread's time is work and how much waiting, without a
-   second mechanism. */
+   second mechanism.
+
+   Windows (finding 145): the last two seconds of samples are also kept in a ring, each with its
+   time and, for a sample in a kernel wait, two more return addresses. When the renderer logs a
+   slow field it asks for a window over that field (switch_profile_window), and what each thread
+   did in it is counted apart and written to profile.txt as `window` and `ws` lines, numbered as
+   the log line says, so a 200 ms field can be read on its own instead of drowned in the run. */
 #include <switch.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +52,19 @@ static int in_wait(uintptr_t pc)
         if (pc - wait_stubs[i] < 32) return 1;
     return 0;
 }
+/* The ring of recent samples (the windows): about 1,000 a second for each of up to 8 threads. */
+typedef struct { uint64_t tick; uint32_t pc, lr, up1, up2; uint32_t thread; } Recent;
+#define RECENT 16384   /* about two seconds of seven threads */
+static Recent *recent;
+static volatile uint64_t recent_count;   /* samples written so far; the ring holds the last RECENT */
+/* A window: its length and, per (thread, PC, LR, up1, up2), a count. */
+#define WINDOWS 64
+#define WINDOW_SLOTS 2048
+typedef struct { Recent key; uint32_t count; } WindowSlot;
+static struct { double ms; WindowSlot *slots; uint32_t used, samples; } windows[WINDOWS];
+static unsigned window_count;
+static void recent_add(const ThreadContext *ctx, int thread, int waiting);
+
 static volatile int thread_count;
 static Slot *slots;
 static uint64_t dropped;
@@ -150,6 +169,57 @@ static void wait_add(const ThreadContext *ctx, int thread)
     dropped++;
 }
 
+/* The sampler, the thread still paused: the sample into the ring. A waiting sample keeps two
+   frames above its LR (as wait_add walks them), since the LR alone names only libnx's wrapper. */
+static void recent_add(const ThreadContext *ctx, int thread, int waiting)
+{
+    if (!recent) return;
+    Recent r = { armGetSystemTick(), (uint32_t)module_offset(ctx->pc.x), (uint32_t)module_offset(ctx->lr), 0, 0,
+                 (uint32_t)thread };
+    if (waiting) {
+        uint64_t sp = ctx->sp, fp = ctx->fp;
+        uint32_t *up[2] = { &r.up1, &r.up2 };
+        for (int d = 0; d < 2; d++) {
+            if (fp < sp || fp + 16 > threads[thread].stack_top || fp & 15) break;
+            const uint64_t *frame = (const uint64_t *)fp;
+            *up[d] = (uint32_t)module_offset(frame[1]);
+            if (frame[0] <= fp) break;
+            fp = frame[0];
+        }
+    }
+    recent[recent_count % RECENT] = r;
+    __atomic_store_n(&recent_count, recent_count + 1, __ATOMIC_RELEASE);
+}
+
+unsigned switch_profile_window(double ms)
+{
+    if (!sampler_on || !recent || window_count >= WINDOWS || ms <= 0) return 0;
+    WindowSlot *slots_here = calloc(WINDOW_SLOTS, sizeof *slots_here);
+    if (!slots_here) return 0;
+    uint64_t now = armGetSystemTick(), span = (uint64_t)(ms * 1e-3 * armGetSystemTickFreq());
+    uint64_t count = __atomic_load_n(&recent_count, __ATOMIC_ACQUIRE);
+    uint64_t oldest = count > RECENT - 256 ? count - (RECENT - 256) : 0;   /* leave room for the writer */
+    uint32_t used = 0, samples = 0;
+    for (uint64_t i = count; i-- > oldest;) {
+        Recent r = recent[i % RECENT];
+        if (now - r.tick > span) break;   /* older than the window (ticks only grow) */
+        samples++;
+        uint64_t h = r.thread;
+        h = (h ^ r.pc) * 0x9E3779B97F4A7C15ull; h = (h ^ r.lr) * 0x9E3779B97F4A7C15ull;
+        h = (h ^ r.up1) * 0x9E3779B97F4A7C15ull; h = (h ^ r.up2) * 0x9E3779B97F4A7C15ull;
+        for (uint32_t j = (uint32_t)(h >> 53) & (WINDOW_SLOTS - 1), probe = 0; probe < 64; probe++, j = (j + 1) & (WINDOW_SLOTS - 1)) {
+            WindowSlot *w = &slots_here[j];
+            if (w->count && w->key.thread == r.thread && w->key.pc == r.pc && w->key.lr == r.lr && w->key.up1 == r.up1 &&
+                w->key.up2 == r.up2) { w->count++; break; }
+            if (!w->count) { w->key = r; w->count = 1; used++; break; }
+        }
+    }
+    unsigned id = window_count;
+    windows[id].ms = ms; windows[id].slots = slots_here; windows[id].used = used; windows[id].samples = samples;
+    __atomic_store_n(&window_count, id + 1, __ATOMIC_RELEASE);   /* the exit's writer reads only whole ones */
+    return id + 1;
+}
+
 static void sampler_main(void *unused)
 {
     (void)unused;
@@ -170,6 +240,7 @@ static void sampler_main(void *unused)
             Result rc = svcGetThreadContext3(&ctx, h);
             int waiting = R_SUCCEEDED(rc) && in_wait(ctx.pc.x);
             if (waiting) wait_add(&ctx, t);   /* while it is still held: its frames can't change */
+            if (R_SUCCEEDED(rc)) recent_add(&ctx, t, waiting);
             svcSetThreadActivity(h, ThreadActivity_Runnable);
             if (R_FAILED(rc)) { threads[t].failed++; continue; }
             threads[t].samples++;
@@ -193,6 +264,7 @@ void switch_profile_thread(const char *name)
     if (!sampler_on && !slots) {
         slots = calloc(PROFILE_SLOTS, sizeof *slots);
         wait_stacks = calloc(WAIT_SLOTS, sizeof *wait_stacks);
+        recent = calloc(RECENT, sizeof *recent);
         MemoryInfo info; u32 page;
         if (slots && R_SUCCEEDED(svcQueryMemory(&info, &page, (uintptr_t)switch_profile_thread)))
             module_base = info.addr;   /* the .nro's code region starts at the module's base */
@@ -245,6 +317,15 @@ void switch_profile_stop(const char *dir)
         fprintf(f, "thread %s %llu %llu\n", threads[t].name, (unsigned long long)threads[t].samples,
                 (unsigned long long)threads[t].failed);
     write_slots(f);
+    for (unsigned w = 0; w < window_count; w++) {
+        fprintf(f, "window %u %.1f %u\n", w + 1, windows[w].ms, windows[w].samples);
+        for (uint32_t i = 0; i < WINDOW_SLOTS; i++) {
+            const WindowSlot *e = &windows[w].slots[i];
+            if (e->count)
+                fprintf(f, "ws %u %s 0x%x 0x%x 0x%x 0x%x %u\n", w + 1, threads[e->key.thread].name, e->key.pc, e->key.lr,
+                        e->key.up1, e->key.up2, e->count);
+        }
+    }
     for (uint32_t i = 0; wait_stacks && i < WAIT_SLOTS; i++) {
         const WaitStack *w = &wait_stacks[i];
         if (!w->count) continue;

@@ -109,3 +109,84 @@ could do the same thing.
 The main build of that comparison already had other CPU-side changes (`graphics_queue.c`), so
 the frame rate difference is not the renderer's alone; the longest fields in both are the CPU
 threads'.
+
+## The race-load spikes removed (second round)
+
+The same track again, now with the profiler's windows: `DHD_SWITCH_PROFILE = 1` keeps the last
+two seconds of samples, and each slow-field line names a window (`[profile window N]`) in which
+`profile_report.py --windows` shows what every thread did during that field alone. The line
+also gives its time since start and the uploads made while waiting.
+
+### Why not an upload thread
+
+The plan was a second EGL context sharing objects, on an upload thread, with fences. devkitPro's
+Mesa (branch `switch-20.1.0-rc3`, `nvc0_context.c`) gives every context of a screen the screen's
+one pushbuf, `nvc0->base.pushbuf = screen->base.pushbuf`, with no lock (upstream nouveau got
+its multithreading fixes only years later). Two contexts used at once on two threads would write into one command
+stream. So the uploads stay on the render thread, but are moved to where it has nothing to do.
+
+### What an upload cost
+
+The first round's build queued each new texture and uploaded it while the render thread waited
+for the next field (`native_idle_uploads`, native_core.inc). That took the load screens' uploads
+out of the pictures (54 textures, 10 MiB, inside a wait), but not the race start's: there the
+fields come back to back and the thread never waits. The window of such a field (63 ms, 43
+uploads) said where the time went: 65% of the render thread's samples were in nvservices IPC,
+`nvAddressSpaceMap` (39%), `nvMapCreate` (11%), `UnmapBuffer` (8%), `nvMapClose`, against 10% in
+`memcpy`. Each `glTexStorage2D` makes a buffer object, and each `glTexSubImage2D` makes a staging
+one and frees it again (`nvc0_miptree_transfer_map`: `nouveau_bo_new` of a GART buffer, then an
+M2MF copy). The pixel unpack ring did not avoid it: `st_TexSubImage` takes the blit path only when
+the screen prefers it, which on this GPU without VRAM it does not, so it falls back to
+`_mesa_store_texsubimage` and the same transfer.
+
+### The atlas
+
+`textures.c` now gives a decoded texture a slot of an atlas page: one R32UI texture holding up to
+64 textures of one size (8 x 8 slots, a page at most 1024 texels a side), made the first time a
+size needs one and kept while used (one empty page per size is kept too). Its texels are written
+by a draw: the upload ring is a texture buffer (`glTexBuffer`, R32UI), and a fragment shader
+fetches `base + y * width + x` from it into the slot's rectangle of the page, so no staging
+object is made. The draws fetch at `texels_origin + xy`, conversions at `base_rect.xy + xy`; the
+bounds are still the texture's own size, so nothing reads into a neighbour. The renderer's GL
+state the copy touches (framebuffer, program, vertex array, viewport, blend, depth, scissor,
+stencil, cull, colour mask) is saved and put back, since the copy also runs inside a picture.
+Replacements (texture packs, the sharp font) keep a texture each. `DHD_SWITCH_UPLOAD` picks the
+form: `atlas` (the default), `idle` (a texture each, uploaded while waiting), `render` (the ring
+only) and `direct` (the first form).
+
+### The CPU threads' long fields
+
+The windows of the 187-243 ms fields at the boot, the menus and the race's load all said the same:
+the GS worker ran `font_sharp_view` (55-67%) and `button_icons_paint` (20-23%) -- the sharp copy
+of the game's font (finding 058) with the button icons painted in, about 1024 x 1024 texels of
+B-spline magnification, 150-190 ms on an A57 -- while the game thread waited for it. The disc was
+not the cause (the game thread's `fsFileRead` was a quarter of one such window, overlapped). On
+the Switch (`FONT_SHARP_ASYNC`, font_sharp.h) the copy is now made on a thread of its own; the
+font is drawn as the game has it until a later decode finds the copy made (a fraction of a
+second, at a font's first appearance). Other targets keep making it in place.
+
+### Numbers, same track
+
+| | first round (idle uploads only) | atlas and font thread |
+| --- | --- | --- |
+| renderer fields over 50 ms | 4 (63-113 ms, race start) | none |
+| 55 new textures, 10 MiB, at load | 59 ms (while waiting) | 11.7 ms |
+| CPU threads' fields over 150 ms | 3 (195-243 ms) | none |
+| longest field of the session | 243 ms | 91 ms |
+| race | 40.8 fields/s, max 190 ms | 41.2 fields/s, max 75 ms |
+
+The frame rate moves 39.6-47.7 fields/s between 30 s windows of the same race, so the sessions
+do not separate on it; the limit stays `cpu:game` / `cpu:vu`.
+
+### What is left
+
+- At a race's load, one field of 90 ms where the GS worker decodes 10 MiB of new textures texel
+  by texel (`native_decode` -> `gs_image_pixel` and `gs_pixel_address`, 73% of its samples). A
+  decode by rows or by blocks, per format, instead of a full address computation per texel would
+  shorten it; it is shared code (native_core.inc, memory.c).
+- In a race, about one field in 30 s of 57-77 ms in which every sampled thread is mostly waiting
+  (game 55-72%, VU 70-76%, GS 74-82%, render 93%). The windows do not show who holds them up; it
+  is not the renderer, the disc or the font. The audio thread and the system's own threads are
+  not sampled.
+- The render thread writes the log itself (`fsFileWrite` was 11% of one window: the slow-field
+  line), a small cost only while fields are slow.

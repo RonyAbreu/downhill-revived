@@ -21,6 +21,13 @@ GLuint dhdr_tex_gl(DhdrTexture *t);
    it is a decoded texture (R32UI, one level, fetched texel by texel). */
 int dhdr_tex_is_replacement(const DhdrTexture *t);
 
+/* Where t's texels start in its GL texture: a slot's origin in an atlas page (DHD_SWITCH_UPLOAD
+   = atlas, decoded textures), else 0, 0. */
+void dhdr_tex_origin(const DhdrTexture *t, int32_t *x, int32_t *y);
+
+/* The atlas pages made so far and their bytes, for the log. */
+void dhdr_tex_atlas_stats(uint64_t *pages, uint64_t *bytes);
+
 /* t's size in texels; levels_out may be NULL. */
 void dhdr_tex_size(const DhdrTexture *t, uint32_t *w, uint32_t *h, uint32_t *levels_out);
 
@@ -43,6 +50,17 @@ void dhdr_tex_upload_stats(uint64_t *count, uint64_t *ns, uint64_t *bytes);
 /* Of that: the nanoseconds spent making new GL textures, and the uploads that reused a pooled
    one (a released texture's GL object of the same kind and size) instead. */
 void dhdr_tex_upload_split(uint64_t *alloc_ns, uint64_t *reused);
+
+/* Idle uploads (finding 145): new textures queued for the render thread to upload while it waits
+   for the next field. dhdr_tex_idle_waker names what wakes that wait when the queue goes from
+   empty to one (NULL: no queue; until it is set, textures are not queued at all).
+   dhdr_tex_idle_pending: 1 while the queue holds any. dhdr_tex_idle_upload uploads the oldest
+   (RENDER THREAD ONLY, context current) and returns 0 when there was none.
+   dhdr_tex_idle_stats: what those uploads have cost, apart from dhdr_tex_upload_stats'. */
+void dhdr_tex_idle_waker(void (*wake)(void *), void *arg);
+int dhdr_tex_idle_pending(void);
+int dhdr_tex_idle_upload(void);
+void dhdr_tex_idle_stats(uint64_t *count, uint64_t *ns, uint64_t *bytes);
 
 /* Every GL object textures.c owns (the dead list drained first), for surface teardown. */
 void dhdr_tex_shutdown(void);
