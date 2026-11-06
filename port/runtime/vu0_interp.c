@@ -101,9 +101,6 @@ typedef struct {
     /* A run is bounded to MAX_STEPS and the longest stall is 54 cycles.
        32-bit timestamps cover the entire run, including the final drain. */
     uint32_t cycle;
-    uint32_t vf_ready[32];
-    uint32_t component_ready[32][4];
-    struct { uint32_t at, mac, status, clip, mask, kind; } flags[16];
     int n_flags, flag_head;
     uint32_t flag_cycle;  /* the cycle the flags are read at: the current pair's issue */
     uint32_t clip_next;
@@ -128,6 +125,14 @@ typedef struct {
     __m128 lazy_last;
     int lazy_dest, lazy_valid, lazy_used;
 #endif
+    /* Not cleared between runs (run_state): every entry is a cycle timestamp, compared only
+       against the cycle (ready > cycle, a stall) or a newer one, or a flag queue entry read only
+       while queued. A run starts its cycle past every time stored in them, so they are all
+       expired, as zeroed ones were when each run started at cycle 0. */
+    uint32_t vf_ready[32];
+    uint32_t component_ready[32][4];
+    struct { uint32_t at, mac, status, clip, mask, kind; } flags[16];
+    uint32_t cycle_base;  /* this run's cycle 0 (the trace prints cycles from it) */
     ps2_q128 vu1_file[64]; /* VU0 only: VU1 VF/VI as VU0 addresses them at 0x4000, filled on first use */
 } Vu;
 
@@ -1323,7 +1328,7 @@ static inline void trace_pair(Vu *u, unsigned pc)
 {
 #ifdef PS2_VU_TRACE
     if (getenv("DHD_VU_TRACE")) {
-        fprintf(stderr, "N %04X %llu", pc * 8, (unsigned long long)u->cycle);
+        fprintf(stderr, "N %04X %llu", pc * 8, (unsigned long long)(u->cycle - u->cycle_base));
         for (unsigned v = 1; v < 32; v++) for (unsigned c = 0; c < 4; c++) fprintf(stderr, " %08X", u->c->vf[v].w[c]);
         fprintf(stderr, "\n");
     }
@@ -1563,10 +1568,21 @@ void ps2_vu_aot_load(const void *vutext)
 #endif
 }
 
+/* The state of the run in progress on this thread, one per unit (VU0 runs on the game thread's
+   vcallms and on the VIF's, VU1 on the VIF's). It outlives the run so that its timestamp arrays
+   need not be cleared: run starts the cycle at the old one + 64, past all of them. Comparisons
+   see only differences of times and the cycle, so a run gives what it gave from cycle 0; q_ready
+   and p_ready keep 0 for "none", which no time reaches (they never come near 2^32). */
+static Vu *run_state(unsigned unit)
+{
+    static _Thread_local Vu state[2];
+    return &state[unit & 1];
+}
+
 static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr, unsigned unit, unsigned top, unsigned itop,
                ps2_vu_kick_fn kick, void *opaque)
 {
-    Vu u;
+    Vu *const u = run_state(unit);
     unsigned mask = unit ? 0x7FF : 0x1FF;
     unsigned pc = (addr / 8) & mask;
     int branch = -1, ending = 0;
@@ -1630,18 +1646,25 @@ static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr
     if (native_geometry) native_key_targets[native_index]++;
 #endif
 #endif
-    memset(&u, 0, offsetof(Vu, vu1_file));  /* about 60k VU0 and 30k VU1 runs a second in a race */
-    u.c = cpu;
-    u.unit = unit; u.code_mask = mask; u.data_mask = unit ? 0x3FF : 0xFF;
-    u.top = top; u.itop = itop; u.kick = kick; u.opaque = opaque;
-    u.status = cpu->vu0_ctrl[0] & 0xFFF;
-    u.mac = cpu->vu0_ctrl[1] & 0xFFFF;
-    u.clip = u.clip_next = cpu->vu0_ctrl[2] & 0xFFFFFF;
+    /* About 60k VU0 and 30k VU1 runs a second in a race: clear the scalars only (run_state). */
+    uint32_t base = u->cycle + 64;  /* past every ready time the last run stored (at most cycle + 4) */
+    if (base >= 0xC0000000u) {  /* a run moves the cycle well under 2^30: start again from 0 */
+        memset(u, 0, offsetof(Vu, vu1_file));
+        base = 0;
+    }
+    memset(u, 0, offsetof(Vu, vf_ready));
+    u->cycle = u->flag_cycle = u->vi_written_at = u->cycle_base = base;  /* the old run's 0 */
+    u->c = cpu;
+    u->unit = unit; u->code_mask = mask; u->data_mask = unit ? 0x3FF : 0xFF;
+    u->top = top; u->itop = itop; u->kick = kick; u->opaque = opaque;
+    u->status = cpu->vu0_ctrl[0] & 0xFFF;
+    u->mac = cpu->vu0_ctrl[1] & 0xFFFF;
+    u->clip = u->clip_next = cpu->vu0_ctrl[2] & 0xFFFFFF;
     for (steps = 0; steps < MAX_STEPS; steps++) {
 #ifdef PS2_VU_GEOMETRY_BENCH
         /* Test-only capture of a pipeline boundary, absent from game builds. */
         extern int vu_geometry_capture(void *, unsigned);
-        if (vu_geometry_capture(&u, pc)) return 0;
+        if (vu_geometry_capture(u, pc)) return 0;
 #endif
 #if defined(PS2_VU_AOT) && !defined(PS2_VU_GEOMETRY_BENCH) && !defined(PS2_VU_REFERENCE)
         unsigned long long before_vertices = native_vertices, before_clipped = native_clipped_vertices;
@@ -1649,10 +1672,10 @@ static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr
         if (native_geometry && pc == native_start / 8 && branch < 0 && !ending &&
             steps < MAX_STEPS - (native_kind >= 256 ? 262144 : 16384) &&
             native_code_matches(cpu->vu0_code, native_kind, native_start, native_end) &&
-            ((native_count = native_kind == 8192 ? native_geometry_3140(&u) : native_kind == 4096 ? native_geometry_0798(&u) :
-                             native_kind == 2048 ? native_particles_2e48(&u) : native_kind == 1024 ? native_particles_0e10(&u) : native_kind == 512 ? native_geometry_2dc8(&u) : native_kind == 256 ? native_geometry_1430(&u) : native_kind == 128 ? native_skin_468(&u) : native_kind == 64 ? native_geometry_800(&u) : native_kind == 16 ? native_geometry_20c(&u) :
-                             native_kind == 32 ? native_geometry_260(&u) : native_kind == 4 ? native_geometry_1638(&u) :
-                             native_kind == 8 ? native_geometry_17e0(&u) : native_geometry_loop(&u)) ||
+            ((native_count = native_kind == 8192 ? native_geometry_3140(u) : native_kind == 4096 ? native_geometry_0798(u) :
+                             native_kind == 2048 ? native_particles_2e48(u) : native_kind == 1024 ? native_particles_0e10(u) : native_kind == 512 ? native_geometry_2dc8(u) : native_kind == 256 ? native_geometry_1430(u) : native_kind == 128 ? native_skin_468(u) : native_kind == 64 ? native_geometry_800(u) : native_kind == 16 ? native_geometry_20c(u) :
+                             native_kind == 32 ? native_geometry_260(u) : native_kind == 4 ? native_geometry_1638(u) :
+                             native_kind == 8 ? native_geometry_17e0(u) : native_geometry_loop(u)) ||
              native_kind < 64)) {  /* 08B0 and 0468 decline before writing anything: then they run pair by pair */
             unsigned count = native_count;
             if (!count || count > (unsigned)(MAX_STEPS - steps)) {
@@ -1688,7 +1711,7 @@ static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr
         const AotBlock *translated = !use_aot ? NULL : unit ? aot_find(pc, pair, MAX_STEPS - steps, branch >= 0 || ending)
                                                             : aot0_find(pc, pair, MAX_STEPS - steps, branch >= 0 || ending);
         if (translated) {
-            next = translated->run(&u, pc, &bad);
+            next = translated->run(u, pc, &bad);
             if (bad) return -1;
 #ifdef PS2_VU_COVERAGE
             if (unit) ps2_vu1_translated += translated->count;
@@ -1703,27 +1726,27 @@ static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr
 #ifdef PS2_VU_COVERAGE
         if (unit) ps2_vu1_interpreted[pc]++;
 #endif
-        if (unit) pair_stalls(&u, hi, lo);
-        apply_flags(&u);
-        update_q(&u);
-        if (upper(&u, hi, &up) < 0) {
+        if (unit) pair_stalls(u, hi, lo);
+        apply_flags(u);
+        update_q(u);
+        if (upper(u, hi, &up) < 0) {
             fprintf(stderr, "vu%u: unknown upper instruction %08X at 0x%04X\n", unit, hi, pc * 8);
             return -1;
         }
         if (BIT(hi, 31))  /* I bit: the lower word is a float for I */
             memcpy(&cpu->i, &lo, 4);
         else if (!(up.flags == 2 && (lo >> 25) == 0x11))
-            next = lower(&u, lo, pc, &bad);
+            next = lower(u, lo, pc, &bad);
         if (bad) {
             fprintf(stderr, "vu%u: failed lower instruction %08X at 0x%04X\n", unit, lo, pc * 8);
             return -1;
         }
-        commit_upper(&u, &up, FT(lo));
+        commit_upper(u, &up, FT(lo));
 #ifdef PS2_VU_AOT
         }
 #endif
-        trace_pair(&u, pc);
-        u.cycle++;
+        trace_pair(u, pc);
+        u->cycle++;
 #ifdef PS2_VU_AOT
         if (translated && translated->fused) {
             pc = next >= 0 ? (unsigned)next & mask : (pc + 1) & mask;
@@ -1754,16 +1777,16 @@ static inline __attribute__((always_inline)) int run(ps2_cpu *cpu, unsigned addr
         fprintf(stderr, "\n");
         return -1;
     }
-    if (u.q_ready) {  /* a division still running finishes */
-        cpu->q = u.q_next;
-        if (unit) u.status = (u.status & ~0x30u) | u.q_flags;
+    if (u->q_ready) {  /* a division still running finishes */
+        cpu->q = u->q_next;
+        if (unit) u->status = (u->status & ~0x30u) | u->q_flags;
     }
-    if (u.p_ready) cpu->p = u.p_next;
+    if (u->p_ready) cpu->p = u->p_next;
     cpu->vu0_ctrl[10] = pc * 8;
-    drain_flags(&u);
-    cpu->vu0_ctrl[0] = u.status;
-    cpu->vu0_ctrl[1] = u.mac;
-    cpu->vu0_ctrl[2] = u.clip;
+    drain_flags(u);
+    cpu->vu0_ctrl[0] = u->status;
+    cpu->vu0_ctrl[1] = u->mac;
+    cpu->vu0_ctrl[2] = u->clip;
     return 0;
 }
 
