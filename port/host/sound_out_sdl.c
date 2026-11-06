@@ -275,7 +275,7 @@ static void SDLCALL host_callback(void *unused, SDL_AudioStream *stream, int add
        leaves to queue behind four threads that between them want more than the three cores the
        process has. A field that takes 227 ms (measured on hardware) starves it, and the sound
        did not come back afterwards. Raising it here is the only place that thread is reachable
-       (switch-hero does the same from its own audio thread, finding 144). */
+       (switch-hero does the same from its own audio thread, finding 167). */
     {
         static int raised;
         if (!raised) {

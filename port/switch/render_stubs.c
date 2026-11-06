@@ -1,4 +1,4 @@
-/* The Switch's renderer entries nothing draws yet (finding 144): the test hooks. The device, the
+/* The Switch's renderer entries nothing draws yet (finding 167): the test hooks. The device, the
    exact renderer and presentation are render_gl.c's, the native renderer render_native.c's,
    DhdrTexture textures.c's and PNG png_switch.c's. */
 #include <stddef.h>

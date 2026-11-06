@@ -1,4 +1,4 @@
-/* The Switch's PNG decoding (finding 144): dhd_render.h's dhdr_png_size and dhdr_png_decode,
+/* The Switch's PNG decoding (finding 167): dhd_render.h's dhdr_png_size and dhdr_png_decode,
    which the texture packs (port/gs/texpack.c) and the button icons (port/gs/button_icons.c) ask
    for. The other targets get these from the Rust `png` crate through port/render; there is no
    Rust on Horizon, so this is libpng, which devkitPro packages as switch-libpng.

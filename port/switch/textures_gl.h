@@ -1,4 +1,4 @@
-/* DhdrTexture on the Switch (NX2 step 2, finding 144), shared between textures.c (the objects
+/* DhdrTexture on the Switch (NX2 step 2, finding 167), shared between textures.c (the objects
    themselves) and render_native.c (the draws that sample them).
 
    dhd_render.h lets dhdr_texture_create, _retain and _release run on any thread (the GS worker,
@@ -51,7 +51,7 @@ void dhdr_tex_upload_stats(uint64_t *count, uint64_t *ns, uint64_t *bytes);
    one (a released texture's GL object of the same kind and size) instead. */
 void dhdr_tex_upload_split(uint64_t *alloc_ns, uint64_t *reused);
 
-/* Idle uploads (finding 145): new textures queued for the render thread to upload while it waits
+/* Idle uploads (finding 168): new textures queued for the render thread to upload while it waits
    for the next field. dhdr_tex_idle_waker names what wakes that wait when the queue goes from
    empty to one (NULL: no queue; until it is set, textures are not queued at all).
    dhdr_tex_idle_pending: 1 while the queue holds any. dhdr_tex_idle_upload uploads the oldest

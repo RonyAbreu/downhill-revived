@@ -1,4 +1,4 @@
-"""The Switch homebrew release (finding 144, NX4): the .nro and the files that go beside it on
+"""The Switch homebrew release (finding 167, NX4): the .nro and the files that go beside it on
 the SD card, checked and zipped into build/release-switch/.
 
     python port/switch/package.py                       # build/host64-switch/dhd.nro
@@ -20,7 +20,7 @@ The player's own disc image goes beside them and is never in the archive.
 
 Why not package_release.py: that one publishes -- it writes latest.json, which the launchers and
 the Android update notice read, and signs and checks an APK. The Switch build has no launcher and
-no update check (finding 144), so there is nothing for it to publish into; what is worth sharing
+no update check (finding 167), so there is nothing for it to publish into; what is worth sharing
 is its checks, and those are imported from it rather than written again here.
 
 The checks: the file really is an NRO, it was built from this version, it names no server but the

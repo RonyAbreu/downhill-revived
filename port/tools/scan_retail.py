@@ -45,7 +45,7 @@ SOURCE = [
 PUBLIC = [
     (0x2994B5, 67, "DEFLATE's length base table (RFC 1951; 3, 4, 5 ... 258, 0, 0 as 16-bit words, 62 bytes "
                    "at 0x2994B8: zlib's inftrees.c lbase) of the game's zlib, with the zero fill before it; "
-                   "the Switch build's zlib (devkitPro's portlibs libz.a, under libpng, finding 144) has the "
+                   "the Switch build's zlib (devkitPro's portlibs libz.a, under libpng, finding 167) has the "
                    "same"),
     (0x29A968, 920, "fdlibm's float argument reduction tables (e_rem_pio2f.c, under sinf/cosf/tanf) of the "
                     "game's libm: two_over_pi, 2/pi eight bits per 32-bit word (198 words, 792 bytes), then "

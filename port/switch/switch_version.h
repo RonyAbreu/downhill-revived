@@ -1,4 +1,4 @@
-/* The Switch homebrew's own identity (finding 144, NX4): the name, author and version the
+/* The Switch homebrew's own identity (finding 167, NX4): the name, author and version the
    Homebrew Menu shows (the NACP, made by build_host64.py from these lines), the folder it lives in
    on the SD card, and the release it ships as (port/switch/package.py). The game inside is still
    Downhill Revived, whose own version (DHD_VERSION, port/include/version.h) the log and the

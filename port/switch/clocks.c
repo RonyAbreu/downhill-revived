@@ -1,4 +1,4 @@
-/* The Switch's CPU, GPU and memory clocks (finding 144, NX3).
+/* The Switch's CPU, GPU and memory clocks (finding 167, NX3).
 
    Horizon starts a homebrew at the handheld defaults: CPU 1020 MHz, GPU 307.2 MHz, EMC
    1331.2 MHz. The first measurement of the native renderer on hardware (DHD_GL_TIMES) put the
@@ -136,7 +136,7 @@ void switch_clocks_stop(void)
     fprintf(stderr, "switch: the clocks are back as they were\n");
 }
 
-/* ---- which core each of the port's threads runs on (finding 144, NX3) ----
+/* ---- which core each of the port's threads runs on (finding 167, NX3) ----
 
    Horizon starts every thread on the process's default core, so the game, VU, GS and render
    threads queue behind one another on one of the three an application may use. The measurement
@@ -182,7 +182,7 @@ static void switch_thread_named(const char *name)
 
 /* At the return to the loader (switch_main.c): which threads of this process are still there
    besides the caller. The Homebrew Menu is loaded into this same process next, so anything listed
-   here is a thread that may wake inside it (finding 144). Waits up to ms for them to go, then
+   here is a thread that may wake inside it (finding 167). Waits up to ms for them to go, then
    names what is left: a named thread by its name, any other by its kernel id. Returns how many. */
 int switch_thread_census(unsigned ms)
 {
@@ -244,7 +244,7 @@ void switch_thread_core(const char *name)
        thread the first attempt never moved.
 
        The layout follows what a race at scale 1 measures once the renderer stopped being the
-       cost (finding 144, NX3): game 21-23 ms a field, vu 21-22, gs 13-16, native 3-4. The two
+       cost (finding 167, NX3): game 21-23 ms a field, vu 21-22, gs 13-16, native 3-4. The two
        heavy ones get a core each and the two light ones share the third, which is 17-20 ms
        against the 23 ms field. The first layout paired game with gs on one core, 37 ms of work,
        and was written when the renderer was the heaviest thread; that is why pinning measured

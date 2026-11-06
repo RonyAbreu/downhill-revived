@@ -1,4 +1,4 @@
-/* The Nintendo Switch's start (finding 144), in place of the launcher's own process start:
+/* The Nintendo Switch's start (finding 167), in place of the launcher's own process start:
    android_main.c's counterpart. The homebrew loader starts dhd.nro with argv[0] its path on the SD
    card; dhd.ini, dhd.log and the memory cards go in that folder (host_exe_path, switch_exe_path).
    The disc image is dhd.ini's `iso`, else game.iso beside the .nro. Then the shared start,
@@ -65,7 +65,7 @@ static int applet_mode_refused(void)
     return 1;
 }
 
-/* The exit, EXIT GAME's (finding 144).
+/* The exit, EXIT GAME's (finding 167).
 
    EXIT GAME used to end the process with exit() from the game thread (gs_pump_messages) while
    the other threads still ran, and libnx's teardown after the exit handlers closed the services
@@ -91,7 +91,7 @@ int switch_quit_asked(void) { return __atomic_load_n(&quit_asked, __ATOMIC_ACQUI
 /* The game thread's EXIT GAME: the main thread is told to exit, and this thread ends itself
    rather than waiting -- every thread of ours must be gone before libnx returns to the loader,
    because the Homebrew Menu then runs in this same process and a thread left behind wakes into
-   code that is no longer there (finding 144). */
+   code that is no longer there (finding 167). */
 void switch_quit(void)
 {
     __atomic_store_n(&quit_asked, 1, __ATOMIC_RELEASE);
@@ -169,7 +169,7 @@ int main(int argc, char **argv)
            "DHD_STICK_DEAD_ZONE,DHD_PROMPTS,DHD_TEXTURES,DHD_FONT,DHD_FPS,DHD_VSYNC,DHD_PERF_COUNTER,DHD_UNLOCK_ALL", 0);
     fprintf(stderr, "switch: %s %s by %s in %s\n", DHD_SWITCH_NAME, DHD_SWITCH_VERSION, DHD_SWITCH_AUTHOR, dir);
     /* The clocks before the game starts: Horizon hands a homebrew the handheld defaults, and at
-       GPU 307.2 MHz the native renderer is fill-rate bound (finding 144, NX3). */
+       GPU 307.2 MHz the native renderer is fill-rate bound (finding 167, NX3). */
     char clocks[16];
     if (!dhd_settings_read(ini, "DHD_SWITCH_CLOCKS", clocks, sizeof clocks)) clocks[0] = 0;
     switch_clocks_start(getenv("DHD_SWITCH_CLOCKS") ? getenv("DHD_SWITCH_CLOCKS") : clocks);

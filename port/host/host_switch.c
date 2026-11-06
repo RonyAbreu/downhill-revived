@@ -1,4 +1,4 @@
-/* The Nintendo Switch host of host_api.h (finding 144): host_posix.c's counterpart on Horizon with
+/* The Nintendo Switch host of host_api.h (finding 167): host_posix.c's counterpart on Horizon with
    libnx. What differs: the program's path is the .nro's folder on the SD card (the homebrew
    loader passes it as argv[0]; switch_main.c keeps it), there is no page protection of guest RAM
    and no access-fault guard (graphics.c then reads GS store-image data synchronously, as with
@@ -114,7 +114,7 @@ int switch_readable(const void *p, size_t n)
     return 1;
 }
 
-/* A CPU exception in the program: libnx calls this on its own stack (finding 144). host.c prints
+/* A CPU exception in the program: libnx calls this on its own stack (finding 167). host.c prints
    the crash report (dhd.log); returning leaves the exception unhandled, so Horizon ends the
    program (and Atmosphere writes its own report). */
 u8 __nx_exception_stack[0x8000] __attribute__((aligned(16)));

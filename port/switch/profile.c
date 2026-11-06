@@ -1,4 +1,4 @@
-/* A sampling profiler for the Switch (finding 144, NX3): where the game and VU threads spend a
+/* A sampling profiler for the Switch (finding 167, NX3): where the game and VU threads spend a
    field, measured on the console itself, which no PC tool reaches.
 
    `DHD_SWITCH_PROFILE = 1` in dhd.ini (or the environment) starts it. Every named thread
@@ -16,7 +16,7 @@
    so the report says how much of a thread's time is work and how much waiting, without a
    second mechanism.
 
-   Windows (finding 145): the last two seconds of samples are also kept in a ring, each with its
+   Windows (finding 168): the last two seconds of samples are also kept in a ring, each with its
    time and, for a sample in a kernel wait, two more return addresses. When the renderer logs a
    slow field it asks for a window over that field (switch_profile_window), and what each thread
    did in it is counted apart and written to profile.txt as `window` and `ws` lines, numbered as

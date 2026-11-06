@@ -1,6 +1,9 @@
-# 145 — The Switch renderer: where the long fields come from, and the pieces it lacked
+# 168 — The Switch renderer: where the long fields come from, and the pieces it lacked
 
-Phase 4, NX2/NX3 (finding 144). The Switch's GL renderer (`port/switch/render_native.c`,
+Status: current
+Checked: 2026-11-06
+
+Phase 4, NX2/NX3 (finding 167). The Switch's GL renderer (`port/switch/render_native.c`,
 `textures.c`) averaged 4 ms a field on hardware, yet single fields reached 232 ms in races and
 346 ms in menus, the audio underran around them, and STATE.md listed four renderer features as
 missing. This is what the measurements said and what was done. All numbers are from a real

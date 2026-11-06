@@ -1,4 +1,4 @@
-/* The Switch's native renderer, NX2 steps 1 and 2 (finding 144): textured GS geometry on
+/* The Switch's native renderer, NX2 steps 1 and 2 (finding 167): textured GS geometry on
    OpenGL 4.3 core (DHD_RENDER=native; dhd.ini "renderer = native"). It stands in
    for the Rust renderer's native half (port/render/src/native, native.wgsl) the same way
    render_gl.c stands in for its device and presentation: the command loop, the draw pipeline, the
@@ -58,7 +58,7 @@ typedef struct NativeSurface {
 
 /* The draw pipelines. The Rust renderer specialises its fragment stage with WebGPU's
    specialisation constants (native.wgsl's native_spec), so the paths a draw does not take cost
-   it nothing; OpenGL has no such thing, and the first measurement on hardware (finding 144, step
+   it nothing; OpenGL has no such thing, and the first measurement on hardware (finding 167, step
    3) showed why that matters: with everything decided at run time, 57 draws of a 640 x 448
    picture took 107 ms, and the cost tracked the pixel count almost exactly (four times the
    pixels, about a quarter of the rate). So the variants are separate compilations of one source
@@ -521,7 +521,7 @@ static const char *scanout_source =
    display texture comes out exactly as the compute form writes it).
 
    On the Switch (Mesa's nouveau, Tegra X1) the compute form measured 24 ms of GPU a picture at
-   1024x896 and 30 ms at 1280x896 (DHD_GL_TIMES = 2, finding 144): a cost in proportion to the
+   1024x896 and 30 ms at 1280x896 (DHD_GL_TIMES = 2, finding 167): a cost in proportion to the
    pixels. The same shader as a draw measured the same 24 and 30 ms, so the stage was not it.
    What is left per pixel is `at / ds` and `at % ds`: four integer divisions, and this GPU has no
    integer divide -- the same cost texel_xy had in the draws (107 ms to 1.2 ms once
@@ -2089,7 +2089,7 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
 }
 
 /* native_core.inc's render thread, while it waits for the next field with the context lock held:
-   one queued new texture uploaded (textures_gl.h, finding 145). 0 when there was none or no
+   one queued new texture uploaded (textures_gl.h, finding 168). 0 when there was none or no
    context yet. */
 int dhdr_switch_idle(DhdrNative *n)
 {

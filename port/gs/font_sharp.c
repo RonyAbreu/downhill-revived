@@ -15,7 +15,7 @@
 
    On the Switch (FONT_SHARP_ASYNC, font_sharp.h) a copy is made on a thread of its own: it takes
    150-190 ms of an A57 (the magnification and the button icons), which on the GS worker held a
-   whole field that long at the boot, the menus and each race's load (finding 145). There the
+   whole field that long at the boot, the menus and each race's load (finding 168). There the
    first decode of a font starts the copy and draws the font as the game has it; the decodes
    after it pick the copy up once it is made (font_sharp_waiting). */
 #include <SDL3/SDL_atomic.h>  /* SDL_SpinLock, SDL_strcasecmp; the web build swaps in its one-thread stub */

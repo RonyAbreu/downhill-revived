@@ -1,6 +1,9 @@
-# 147 — The sound mixer, voice by voice: a cheaper game thread on the Switch
+# 169 — The sound mixer, voice by voice: a cheaper game thread on the Switch
 
-Phase 4, NX3 (finding 144). The console profile (`DHD_SWITCH_PROFILE`, STATE.md "NX3, the CPU
+Status: current
+Checked: 2026-11-06
+
+Phase 4, NX3 (finding 167). The console profile (`DHD_SWITCH_PROFILE`, STATE.md "NX3, the CPU
 threads measured on the console") put about 9% of the Switch's game thread, the thread that
 limits a race at scale 2, in the native 989snd mixer (`port/hle/sound.c`, finding 022): `render`,
 `reverb_sample` and `snd_adsr_tick`. This is how that cost was cut without changing a sample.

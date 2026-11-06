@@ -1,5 +1,5 @@
 #!/bin/bash
-# The Switch's dhd.nro (finding 144) from build/wasm/dhd_core.wasm, inside the build image:
+# The Switch's dhd.nro (finding 167) from build/wasm/dhd_core.wasm, inside the build image:
 #   docker build -t dhd-switch-dev port/switch
 #   docker run --rm -v "$PWD:/src" -v dhd-objcache:/objcache dhd-switch-dev bash port/switch/build.sh [options]
 # The dhd-objcache volume is the shared object cache (tools/objcache.py, DHD_OBJCACHE_DIR in the

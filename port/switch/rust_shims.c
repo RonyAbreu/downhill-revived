@@ -1,4 +1,4 @@
-/* The Switch's stand-ins for the Rust crates other than the renderer (finding 144): there is no
+/* The Switch's stand-ins for the Rust crates other than the renderer (finding 167): there is no
    Rust std on Horizon. dhd_settings is reimplemented in C over the generated table
    (port/hle/settings_table.h: each dhd.ini key, its DHD_* variable and its built-in value);
    online play (dhd_net), its disc check (dhd_disc) and Discord (dhd_presence) are off, as on

@@ -1,4 +1,7 @@
-# 144: Nintendo Switch homebrew port plan (task NX0)
+# 167: Nintendo Switch homebrew port plan (task NX0)
+
+Status: in progress
+Checked: 2026-11-06
 
 Goal: a Switch homebrew build (`.nro`, devkitPro devkitA64 + libnx, Atmosphère, started in title
 takeover) made from the same portable core as every other target: the wasm2c output of
@@ -26,7 +29,7 @@ Android (finding 091), the player brings their own USA disc image; nothing of th
 | Online, disc check for online, Discord | Rust (`dhd_net`, `dhd_disc`, `dhd_presence`) | Off, as on Android (`NET_OFFERED 0`) |
 | Guest RAM | one 32 MiB memfd mapped six times (three full views, three low aliases), 8 GiB `PROT_NONE` reservation, commits by mprotect, guard pages instead of bounds checks, SIGSEGV reporter, deferred GS reads by page faults | No shared-memory aliasing for a homebrew. Plan: one RAM view; the module side already folds non-crossing alias accesses (`memory_access.h`); make the host side's `GUEST()` fold too; wasm2c bounds checks (`WASM_RT_MEMCHECK_BOUNDS_CHECK`) instead of guard pages; `DHD_DEFER_READS=0` (synchronous GS reads); faults reported through `__libnx_exception_handler` |
 | Process glue | `/proc/self/exe`, dladdr, pipes for the log, signals, `pthread_getcpuclockid` | Stubs: exe path = the `.nro`'s folder on `sdmc:`, no code-range lookup, log written by the host to `dhd.log` directly |
-| Clocks | the OS's | Raise CPU/GPU/EMC through `clkrst` (pcv before 8.0.0) and restore on exit, reapplied after dock/HOME/sleep; defer to sys-clk when it runs (as nfsu1-sw / defjam-sw) |
+| Clocks | the OS's | Raise CPU/GPU/EMC through `clkrst` (pcv before 8.0.0) and restore on exit, reapplied after docking, the HOME menu or sleep; defer to sys-clk when it runs (as nfsu1-sw / defjam-sw) |
 
 ## Performance (the real risk)
 

@@ -43,7 +43,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#ifndef __SWITCH__  /* Horizon has no signals, pipes or ucontext (host_switch.c, finding 144) */
+#ifndef __SWITCH__  /* Horizon has no signals, pipes or ucontext (host_switch.c, finding 167) */
 #include <poll.h>
 #include <setjmp.h>
 #include <sys/ioctl.h>

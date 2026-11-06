@@ -32,6 +32,7 @@ out of date). New findings: copy `TEMPLATE.md` to the next free number on the la
 | Speed (PC) | 089, 090, 129 perf log, 130/131 iGPU | 031, 032, 046, 048, 051, 066, 069 |
 | Android and phones | 091, 107, 108, 126/127 low-end profile, 143, 145, 146-149 | |
 | Browser | 083, 087, 102 | |
+| Nintendo Switch (Downhill Switch, branch `switch/port`) | 167 plan and round log, 168 renderer's long fields, 169 sound mixer, 090 VS1 | |
 
 ## Numbers not in this folder
 
@@ -195,6 +196,9 @@ out of date). New findings: copy `TEMPLATE.md` to the next free number on the la
 | 163 | [REVIVED SETTINGS: tabs, a clearer Controls page, online name size](163-revived-settings.md) | current |  |
 | 165 | [no port patch in code the port does not compile](165-dead-patch-guard.md) | current |  |
 | 166 | [Online races on the tracks without a split-screen level (Salt City MX and TD)](166-online-more-tracks.md) | current |  |
+| 167 | [Nintendo Switch homebrew port plan (task NX0)](167-switch-port-plan.md) | in progress |  |
+| 168 | [The Switch renderer: where the long fields come from, and the pieces it lacked](168-switch-renderer-spikes.md) | current |  |
+| 169 | [The sound mixer, voice by voice: a cheaper game thread on the Switch](169-sound-mixer-segments.md) | current |  |
 | 075 | no file: the portable-core plan was numbered 075 on its branch and merged as 081 | renumbered | see 081 |
 | 113 | no file: the delta-time clock work was numbered 113 on its branch; the mixer's VBLANK time is in 139 | renumbered | see 139 |
 <!-- index:end -->

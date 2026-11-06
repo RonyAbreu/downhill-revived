@@ -11,7 +11,7 @@ For each thread: its samples, the share in kernel waits (the svc stubs a waiting
 in), then the top functions by self samples (the innermost frame, inlined ones included) and by
 the function the sample is in once inlining is undone (the outermost frame at that address).
 
-Then each window (finding 145): a slow field the renderer logged with `[profile window N]`, what
+Then each window (finding 168): a slow field the renderer logged with `[profile window N]`, what
 every thread did over that field alone -- its top functions, and for a waiting sample the calls
 it waits under. `--windows` prints only those.
 """

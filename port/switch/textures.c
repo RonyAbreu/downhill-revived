@@ -1,4 +1,4 @@
-/* The Switch's DhdrTexture (NX2 step 2, finding 144): decoded textures and replacements, the C
+/* The Switch's DhdrTexture (NX2 step 2, finding 167): decoded textures and replacements, the C
    stand-in for port/render/src/native/textures.rs.
 
    A decoded texture is w x h R32UI, each texel its RGBA8 bytes read as one integer (finding 131,
@@ -12,14 +12,14 @@
    samples it (dhdr_tex_gl), and the CPU copy is freed then. Releasing the last reference puts the
    texture on a dead list that dhdr_tex_collect drains on the render thread.
 
-   Idle uploads (finding 145): a new texture also goes on a queue, holding a reference of its own,
+   Idle uploads (finding 168): a new texture also goes on a queue, holding a reference of its own,
    and the render thread uploads from it while it waits for the next field (dhdr_tex_idle_upload,
    called from native_core.inc's render loop), so the picture that samples it finds it done. Not a
    second thread: devkitPro's Mesa 20.1 nouveau gives every context of a screen the screen's one
    pushbuf (nvc0_create: nvc0->base.pushbuf = screen->base.pushbuf) with no lock, so a shared
    context on an upload thread would corrupt the command stream.
 
-   The atlas (finding 145): what an upload cost on hardware was not the pixels but the driver's
+   The atlas (finding 168): what an upload cost on hardware was not the pixels but the driver's
    buffer objects -- each glTexStorage2D a new one, and each glTexSubImage2D a staging one made
    and freed again (nvc0_miptree_transfer_map), every one of them several IPC round trips to
    nvservices (nvMapCreate, nvAddressSpaceMap, UnmapBuffer, nvMapClose). So a decoded texture
@@ -246,12 +246,12 @@ void dhdr_tex_upload_split(uint64_t *alloc_ns, uint64_t *reused)
 
 /* ---- the pool: GL textures of released DhdrTextures, kept for the next of the same shape ----
 
-   Measured on hardware (finding 144): the first fields of a race uploaded 20-90 textures each,
+   Measured on hardware (finding 167): the first fields of a race uploaded 20-90 textures each,
    0.6-0.8 ms apiece for 20-40 KiB, which put those fields at 50-80 ms. Most of a decoded
    texture's life is short (the GS worker's cache turns over), and the sizes repeat (powers of
    two), so a released texture's GL object goes here instead of to glDeleteTextures, and the next
    upload of the same kind and size takes it: no new texture storage, only the pixels. The pool
-   holds at most POOL_BYTES; past that the oldest go. Measured afterwards (finding 145): at a
+   holds at most POOL_BYTES; past that the oldest go. Measured afterwards (finding 168): at a
    race's start every texture is new, so the pool reuses nothing there; the spikes it was meant
    for are still uploads, and only an upload thread with a shared context would move them. */
 enum { POOL_MAX = 512 };
@@ -331,7 +331,7 @@ static size_t ring_reserve(size_t bytes)
     /* The half is kept, not worked out from g_ring_at: rounded up to 256, g_ring_at can land
        exactly on the end of the buffer, and a half computed from it would be 2 -- past both the
        buffer and g_ring_fence, which is how the first version of this wrote over the pool's
-       count and crashed (finding 144). */
+       count and crashed (finding 167). */
     int half = g_ring_half;
     size_t end = (size_t)(half + 1) * RING_HALF;
     if (g_ring_at + bytes > end) {   /* this half is full: fence it, move to the other */

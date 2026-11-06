@@ -1,4 +1,4 @@
-/* Guest linear memory on the Nintendo Switch (finding 144): guest_memory.c's reserve-and-commit
+/* Guest linear memory on the Nintendo Switch (finding 167): guest_memory.c's reserve-and-commit
    without its aliased RAM views. The guest needs SPAN of contiguous address space (its memory runs
    up to the module's, above 0x70100000), of which it uses a few tens of MiB. Horizon has no way to
    reserve address space by itself, so it is found in one of two places:

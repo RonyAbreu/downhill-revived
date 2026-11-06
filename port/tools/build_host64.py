@@ -73,7 +73,7 @@ class Target:
         self.fiber = fiber  # the fiber switch's adapter, port/host64/fiber_<fiber>.c (the CPU and its ABI)
         self.flags, self.wabt, self.simde = list(flags), Path(os.environ.get('WABT_DIR') or wabt), simde
         self.windows, self.android, self.mac = key == 'win-x64', key == 'android-arm64', key == 'macos-arm64'
-        self.switch = key == 'switch-arm64'  # Nintendo Switch homebrew (finding 144): devkitA64's GCC, libnx
+        self.switch = key == 'switch-arm64'  # Nintendo Switch homebrew (finding 167): devkitA64's GCC, libnx
         self.posix = not self.windows
 
 
@@ -96,7 +96,7 @@ TARGETS = {t.key: t for t in (
            jobs=max(2, (os.cpu_count() or 4) // 2), outputs=8,
            flags=['--target=aarch64-linux-android%d' % ANDROID_API, '-march=armv8-a', '-moutline-atomics', '-mtune=cortex-a78',
                   '-fPIC', '-fomit-frame-pointer']),
-    # Nintendo Switch (finding 144): the Tegra X1's Cortex-A57s; devkitPro's flags for libnx
+    # Nintendo Switch (finding 167): the Tegra X1's Cortex-A57s; devkitPro's flags for libnx
     # (switch_rules: -mtp=soft, -fPIE). No Rust: render_gl.c, render_native.c, textures.c, render_stubs.c and
     # rust_shims.c stand in.
     Target('switch-arm64', None, 'build/host64-switch', 'dhd.nro', 'arm64', jobs=8, outputs=8,

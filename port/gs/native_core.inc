@@ -2612,7 +2612,7 @@ static void native_zread_after(Native *n)
 }
 
 #if defined(__SWITCH__) && !defined(NATIVE_INLINE)
-/* The Switch's idle uploads (port/switch/textures.c, finding 145): new textures the GS worker
+/* The Switch's idle uploads (port/switch/textures.c, finding 168): new textures the GS worker
    made are uploaded while the render thread waits for the field that samples them, one at a
    time so a field handed over waits for one upload at most. The GS worker's first texture into
    an empty queue wakes the wait (native_idle_wake, under queue_lock, so it cannot fall between
@@ -3015,7 +3015,7 @@ static void native_exit_report(void) { if (native_reported) native_profile(nativ
    up to `ms` milliseconds, so it has ended -- not merely stopped -- before libnx returns to the
    Homebrew Menu. A thread of ours still alive then is still alive in the menu that the loader
    puts into the same process: one woke into code no longer there (an instruction abort in
-   sphaira's process, finding 144). 1 when it ended. */
+   sphaira's process, finding 167). 1 when it ended. */
 int gs_native_halt(unsigned ms)
 {
     Native *n = native_reported;

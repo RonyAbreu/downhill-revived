@@ -1,4 +1,4 @@
-/* The Switch's performance knobs (clocks.c, finding 144 NX3): the CPU, GPU and memory clocks
+/* The Switch's performance knobs (clocks.c, finding 167 NX3): the CPU, GPU and memory clocks
    for switch_main.c, and the core each of the port's threads runs on. */
 #ifndef SWITCH_CLOCKS_H
 #define SWITCH_CLOCKS_H

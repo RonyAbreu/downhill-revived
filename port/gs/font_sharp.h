@@ -17,7 +17,7 @@ int font_sharp_match(uint64_t tex0);
    nothing. One device per process. */
 void *font_sharp_view(const ReplaceDevice *device, const uint32_t *pixels, unsigned w, unsigned h, uint64_t key);
 
-/* FONT_SHARP_ASYNC (the Switch, finding 145): font_sharp_view does not make a missing copy
+/* FONT_SHARP_ASYNC (the Switch, finding 168): font_sharp_view does not make a missing copy
    itself but starts it on a thread of its own and returns NULL, so the caller draws the game's
    font until a later font_sharp_view (pixels may then be NULL) finds it made.
    font_sharp_waiting: 1 while the copy for key is still being made. */

@@ -1,5 +1,5 @@
 #!/bin/bash
-# SDL3 for the Switch (finding 144): devkitPro's fork, branch switch-sdl-3.4 (video, audio, joystick,
+# SDL3 for the Switch (finding 167): devkitPro's fork, branch switch-sdl-3.4 (video, audio, joystick,
 # timer and filesystem backends for Horizon), static, into build/port/sdl3-switch/.
 # Inside the build image:  docker run --rm -v "$PWD:/src" dhd-switch-dev bash port/switch/build_sdl3.sh
 set -euo pipefail

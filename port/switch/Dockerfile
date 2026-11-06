@@ -1,4 +1,4 @@
-# Build environment for the Nintendo Switch target (finding 144).
+# Build environment for the Nintendo Switch target (finding 167).
 #   docker build -t dhd-switch-dev port/switch
 # devkitPro's image brings devkitA64, libnx and the Switch portlibs; this adds what the shared
 # pipeline needs (build_wasm.py, build_host64.py): LLVM, the wasi-sdk sysroot, WABT, SIMDe and

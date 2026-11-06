@@ -106,7 +106,7 @@ static void idle_wait(_Atomic uint32_t *p, uint32_t at, _Atomic uint32_t *flag, 
     int64_t spin_start = tl_begin();
 #endif
     /* DHD_QUEUE_SPINS: the producer's spin before it sleeps (default 512, the Switch's 0). On the
-       Switch the game thread spent 7% of its samples here (finding 144, NX3), on three cores that
+       Switch the game thread spent 7% of its samples here (finding 167, NX3), on three cores that
        the VU and GS threads also want; sleeping at once measured 40.9 -> 45.0 fields/s in a race
        and 41.6 -> 49.7 in the menus at scale 2. */
     static int producer_spins = -1;
