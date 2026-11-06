@@ -56,11 +56,10 @@ def nro_problems(nro, name, settings):
         problems.append('no NRO0 header: this is not a Switch homebrew file')
     if b'dhd-port %s ' % name.encode() not in data:
         problems.append('not built from version %s (its own version string is not in it)' % name)
-    # The strings, each with what is around it: FORBIDDEN holds this checkout's own folder with
-    # the drive letter cut off, and a checkout named downhill-revived makes that "/downhill-
-    # revived", which the project's own repository URL in the binary contains. Printing the match
-    # is what tells that apart from a builder's path really having leaked.
-    lowered = data.lower()
+    # The strings, each with what is around it, so a match can be judged without running the scan
+    # again by hand. The game's own paths that hold the project's name (its SD card folder, its
+    # repository's address) are blanked first: rel.OWN_PATHS says why that cannot hide a leak.
+    lowered = rel.without_own_paths(data)
     for s in rel.FORBIDDEN + sorted(rel.server_strings(settings)):
         at = lowered.find(s.lower())
         if at >= 0:

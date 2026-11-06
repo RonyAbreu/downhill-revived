@@ -158,6 +158,24 @@ FORBIDDEN = [b'\\Users\\', b'/Users/'] + [
     for s in {os.environ.get('USERNAME', ''), os.environ.get('USER', '')} if len(s) > 2] + [
     p.encode() for folder in (ROOT, ROOT.parent) if len(folder.parts) > 1
     for p in (str(folder), str(folder).replace('\\', '/'), str(folder)[2:], str(folder)[2:].replace('\\', '/'))]
+# The game's own strings that hold the project's name: its folder on a Switch's SD card
+# (switch_main.c DEFAULT_DIR) and its repository's address (other_releases.inc, update_check.c).
+# Built from a checkout named downhill-revived, FORBIDDEN's drive-less form is "/downhill-revived",
+# which both contain. These exact strings are blanked before FORBIDDEN is searched for, and nothing
+# else: neither can be part of a builder's path (no folder is named "sdmc:" or "https:"), so the
+# same folder anywhere else, as in E:/downhill-revived/port/... or /e/downhill-revived/..., is
+# still found.
+OWN_PATHS = (b'sdmc:/switch/downhill-revived/', b'https://github.com/skuza-oss/downhill-revived/')
+
+
+def without_own_paths(text):
+    """text lowered, with each of OWN_PATHS blanked out (same length, so offsets still hold)."""
+    lowered = text.lower()
+    for s in OWN_PATHS:
+        lowered = lowered.replace(s, b'\0' * len(s))
+    return lowered
+
+
 # SDL_windows.c's list of USB vibration device paths: SDL's own text, not a builder's folder.
 SDL_OWN_PATHS = ('C:/Windows/USB_Vibration', 'C:/Windows/USB Vibration')
 # Windows' own DLLs: dhd.exe may import nothing else (no DLL is shipped beside it to be imported;
@@ -374,7 +392,7 @@ def exe_problems(exe, servers):
             problems.append('%s absolute path %r' % (kind, m.group(0)[:120].decode('ascii', 'replace')))
         for host in other_hosts(text):
             problems.append('%s server host %r' % (kind, host.decode('ascii', 'replace')))
-        lowered = text.lower()
+        lowered = without_own_paths(text)
         for s in FORBIDDEN + sorted(servers):
             if s.lower() in lowered:
                 problems.append('%s string %r' % (kind, s.decode('ascii', 'replace')))
@@ -715,7 +733,7 @@ def names_server_or_path(content, settings):
              else h for h in hosts} - {b'races.example.org', OFFICIAL_HOST}
     hosts = {h for h in hosts if b'.' in h or b':' in h or h.startswith(b'localhost')}
     return bool(hosts or other_hosts(content) or any(
-        s.lower() in content.lower() for s in FORBIDDEN + sorted(server_strings(settings))))
+        s.lower() in without_own_paths(content) for s in FORBIDDEN + sorted(server_strings(settings))))
 
 
 def write_sums(folder, version):
