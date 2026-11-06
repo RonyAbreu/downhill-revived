@@ -68,17 +68,23 @@ allocation then landed on. Now:
 
 Measured: EXIT GAME back to the menu with no crash.
 
-## The heap: still held at the next start
+## The heap: still held at the next start (a thread after all)
 
 A second start from the menu then crashed one step earlier, at the top of `main`:
 `socketInitialize` -> `bsdInitialize` -> `tmemCreate`, again zeroing a transfer memory. So pages
 of the heap are still held after the exit. The crash report does not carry the fault address and
-dhd.log is not open yet at that point, so what holds them is not yet known. libnx's `bsdExit`
+dhd.log is not open yet at that point, so the crash itself does not say what holds them. libnx's `bsdExit`
 frees its transfer memory without waiting for the service to give it back (`tmemClose`; nvdrv's
 cleanup waits, `tmemWaitForPermission`), and services torn down by libnx after our last exit
 handler are outside what the exit can see.
 
-So the start now protects itself and the log says what is held:
+The likely holder is our own: that build's census read `threads left at the return: clocks`.
+The clock keeper is an SDL thread, joined by `switch_clocks_stop`, which that build ran after
+`SDL_Quit`; `SDL_Quit` leaves every `SDL_Thread` invalid, so `SDL_WaitThread` returned without
+joining and the keeper lived on into the next program, its libnx stack still mapped from heap
+pages that stayed locked as the mapping's source. The keeper is now joined before `SDL_Quit`.
+
+And the start now protects itself and the log says what is held:
 
 - `__libnx_initheap` (guest_memory_switch.c), before anything allocates, scans the heap with
   `svcQueryMemory` and lists every block that is not plain read-write heap with no attribute
@@ -87,6 +93,12 @@ So the start now protects itself and the log says what is held:
   was left out;
 - the exit logs the same scan after every teardown (`host64_switch_heap_report`), which shows
   what this program itself leaves held.
+
+Measured with both (the keeper joined first, the scan): three to four rounds of a race, EXIT GAME
+and a start again from the Homebrew Menu, with no crash and no new crash report. The last start's
+dhd.log lists no held heap block at all, so the scan had nothing to avoid there: the keeper's
+join is what fixed it, and the scan stays as a guard and a diagnosis. (That run was ended
+without EXIT GAME, so its exit scan is not in the log.)
 
 ## Other ways to start
 

@@ -649,6 +649,22 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   (`switch_thread_census`, clocks.c: `svcGetThreadList` on the loader's process handle -- 0
   lists every thread on the console), named when they are ours, so another such crash can be
   told apart from a sphaira fault.
+- **Starting again from the Homebrew Menu (fixed, finding 170).** hbloader runs the menu
+  and every program started from it in one process with one heap, so the exit must give back
+  its threads and its heap. Threads: libnx has no `pthread_detach`, so every detached thread
+  (render, freeze watch, texture pack loaders, jobs) kept its kernel thread and stack mapping;
+  each is now joined, the game thread by the main loop, the clock keeper before `SDL_Quit`.
+  Measured: census `none`. Heap: the exit never closed SDL's video, and nvdrv kept its 8 MiB
+  transfer memory in the heap, so a second start crashed in `nvInitialize`; the render thread
+  now releases its GL context and the exit calls `SDL_Quit` (the guest's stack region mappings
+  are undone too). Measured: the exit clean. A second start then crashed earlier, in
+  `socketInitialize` -> `bsdInitialize`'s `tmemCreate`, on heap pages still held: most likely the
+  clock keeper's stack, since that build's census listed `clocks` (joined after `SDL_Quit`,
+  which voids every SDL_Thread). The keeper is now joined first, and the start keeps the guest
+  and malloc to the heap's largest clear run, logging every held block at the start and the
+  exit. Measured: 3-4 rounds of race, EXIT GAME and a start again from the menu, no crash, no
+  new crash report, and the last start found no held block. A forwarder ends its own process
+  at exit and cannot show any of this.
 - **NX3, the CPU threads measured on the console (2026-11-06).** `DHD_SWITCH_PROFILE = 1`
   (port/switch/profile.c) samples the named threads about 1,000 times a second from a thread of
   its own: it pauses each one (`svcSetThreadActivity`), reads its PC and LR
