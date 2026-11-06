@@ -80,7 +80,7 @@ static uintptr_t stack_region_run(uint64_t need, uint64_t *largest)
     return 0;
 }
 
-/* Pages of the heap something else still holds (finding 146). The homebrew loader hands every
+/* Pages of the heap something else still holds (finding 170). The homebrew loader hands every
    program it runs in this process the same heap, so a program that left part of it with a system
    service -- transfer memory a service never gave back, GPU memory, a mapping's locked source --
    leaves it inaccessible to the next one, which faults on its first write there. A block counts
@@ -226,7 +226,7 @@ static int back_run(uint64_t lo, uint64_t hi)
    stays locked (no access) after this program has returned, and the next program the loader runs
    in this process -- the Homebrew Menu, or dhd.nro again -- faults on its first write there: a
    second start crashed inside nvInitialize's tmemCreate, zeroing a fresh transfer memory
-   (finding 146). The heap's own guest span needs nothing: it is plain heap. */
+   (finding 170). The heap's own guest span needs nothing: it is plain heap. */
 void host64_switch_memory_release(void)
 {
     int failed = 0;

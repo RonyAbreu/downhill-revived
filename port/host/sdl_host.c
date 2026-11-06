@@ -240,7 +240,7 @@ int sdl_host_main(int (*game)(void *), void *arg)
 #ifdef __SWITCH__
         /* EXIT GAME (port/host/switch_main.c): the exit runs here, on the thread that pumps the
            events, after the game thread has ended itself -- joined first, so its kernel thread is
-           closed and gone before the loader's turn (finding 146). */
+           closed and gone before the loader's turn (finding 170). */
         {
             int switch_quit_asked(void);
             if (switch_quit_asked()) {

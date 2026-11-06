@@ -26,7 +26,7 @@ TexPackEntry *texpack_find(const Gs *g, unsigned ctxt);
 void *texpack_view(TexPackEntry *e, uint64_t field);
 
 /* The loaders told to end, and joined once they have, waiting up to ms (the Switch's exit, where
-   no thread may outlive the return to the Homebrew Menu: finding 146). Safe without a pack. */
+   no thread may outlive the return to the Homebrew Menu: finding 170). Safe without a pack. */
 void texpack_halt(unsigned ms);
 
 /* Once a field (GS worker): replacements over the memory budget that no recent field drew are
