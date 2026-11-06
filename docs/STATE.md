@@ -157,12 +157,12 @@ in `online/server/wrangler.jsonc`, player defaults are `port/render/settings/src
 - `DHD_SWITCH_PROFILE = 1` samples the named threads on the console (`port/switch/profile.c`,
   `profile.txt` beside dhd.log, `port/switch/profile_report.py`); every exit lists the threads
   left (`switch_thread_census`).
-- Exit (finding 170): hbloader loads the Homebrew Menu into the same process, and the menu
-  hands the same heap to the next program, so every thread is joined, the GL context released,
-  SDL quit, nvdrv closed and the guest's mappings undone before the return (EXIT GAME measured
-  clean). At start the heap is scanned for blocks a previous run left held, the guest and malloc
-  stay in the largest clear run, and dhd.log names those blocks (untested on hardware). Open: a
-  relaunch from the Homebrew Menu right after EXIT GAME crashed while pages were still held.
+- Exit and relaunch (finding 170): hbloader loads the Homebrew Menu into the same process, and the
+  menu hands the same heap to the next program, so every thread is joined (the clock keeper
+  before SDL_Quit), the GL context released, SDL quit, nvdrv closed and the guest's mappings
+  undone before the return. At start the heap is scanned for blocks a previous run left held,
+  and the guest and malloc stay in the largest clear run. Measured: EXIT GAME and reopening from
+  the Homebrew Menu, several rounds, no crash.
 - Open: the rider's shadow can draw flat for part of a race; the sound mixer is about 9% of the
   game thread and can't leave it while the core is single-threaded.
 

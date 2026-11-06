@@ -199,7 +199,7 @@ out of date). New findings: copy `TEMPLATE.md` to the next free number on the la
 | 167 | [Nintendo Switch homebrew port plan (task NX0)](167-switch-port-plan.md) | in progress |  |
 | 168 | [The Switch renderer: where the long fields come from, and the pieces it lacked](168-switch-renderer-spikes.md) | current |  |
 | 169 | [The sound mixer, voice by voice: a cheaper game thread on the Switch](169-sound-mixer-segments.md) | current |  |
-| 170 | [The Switch's exit: what a program must give back before the Homebrew Menu's turn](170-switch-exit-threads.md) | in progress |  |
+| 170 | [The Switch's exit: what a program must give back before the Homebrew Menu's turn](170-switch-exit-threads.md) | current |  |
 | 075 | no file: the portable-core plan was numbered 075 on its branch and merged as 081 | renumbered | see 081 |
 | 113 | no file: the delta-time clock work was numbered 113 on its branch; the mixer's VBLANK time is in 139 | renumbered | see 139 |
 <!-- index:end -->
