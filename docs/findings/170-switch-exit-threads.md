@@ -3,7 +3,7 @@
 Status: in progress
 Checked: 2026-11-06
 
-Phase 4, NX4 (finding 144, "EXIT GAME's crash"). On the Switch, EXIT GAME returns to the Homebrew
+Phase 4, NX4 (finding 167, "EXIT GAME's crash"). On the Switch, EXIT GAME returns to the Homebrew
 Menu (sphaira), which hbloader loads into the **same process**, and from there the player may
 start dhd.nro again, in that process too. Nothing of ours is cleaned up by a process end, so
 two things have to be given back by the program itself:
