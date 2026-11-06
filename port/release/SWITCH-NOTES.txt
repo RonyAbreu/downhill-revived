@@ -81,4 +81,6 @@ Licences
 --------
 
 LICENSE.txt is this project's. THIRD-PARTY-NOTICES.txt names the other work it is
-built with and their licences.
+built with and their licences, and SWITCH-THIRD-PARTY-NOTICES.txt the libraries only
+the Switch build holds (libnx, newlib, the GCC runtime, Mesa, libdrm_nouveau, glad,
+libpng and zlib).

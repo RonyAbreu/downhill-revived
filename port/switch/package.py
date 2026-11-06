@@ -12,6 +12,9 @@ sdmc:/switch/downhill-revived/ :
     switch/downhill-revived/README.txt              the players' text (port/release/SWITCH-NOTES.txt)
     switch/downhill-revived/LICENSE.txt
     switch/downhill-revived/THIRD-PARTY-NOTICES.txt
+    switch/downhill-revived/SWITCH-THIRD-PARTY-NOTICES.txt   what only the .nro links statically:
+                                                    libnx, newlib, the GCC runtime, Mesa,
+                                                    libdrm_nouveau, glad, libpng, zlib
 
 The player's own disc image goes beside them and is never in the archive.
 
@@ -105,7 +108,8 @@ def main():
              (FOLDER + 'dhd.ini', rel.lf(RELEASE / 'switch-dhd.ini')),
              (FOLDER + 'README.txt', rel.lf(RELEASE / 'SWITCH-NOTES.txt')),
              (FOLDER + 'LICENSE.txt', rel.lf(ROOT / 'LICENSE')),
-             (FOLDER + 'THIRD-PARTY-NOTICES.txt', rel.lf(RELEASE / 'THIRD-PARTY-NOTICES.txt'))]
+             (FOLDER + 'THIRD-PARTY-NOTICES.txt', rel.lf(RELEASE / 'THIRD-PARTY-NOTICES.txt')),
+             (FOLDER + 'SWITCH-THIRD-PARTY-NOTICES.txt', rel.lf(RELEASE / 'SWITCH-THIRD-PARTY-NOTICES.txt'))]
     for path, _ in files:
         if rel.GAME_DATA.search(path.rsplit('/', 1)[-1]):
             sys.exit('%s looks like game data' % path)

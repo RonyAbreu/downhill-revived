@@ -662,7 +662,10 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
 - **NX4, packaging (done).**
   `python port/switch/package.py` checks the `.nro` and zips it with the SD card's own layout
   (`switch/downhill-revived/`: the `.nro`, `port/release/switch-dhd.ini` as `dhd.ini`,
-  `port/release/SWITCH-NOTES.txt` as `README.txt`, and the two licence texts), beside an
+  `port/release/SWITCH-NOTES.txt` as `README.txt`, `LICENSE.txt`, `THIRD-PARTY-NOTICES.txt` and
+  `SWITCH-THIRD-PARTY-NOTICES.txt`: the licences and copyright notices of what only the `.nro`
+  links statically -- libnx, newlib, the GCC runtime, Mesa (every copyright line of the sources
+  whose objects `dhd.map` shows linked), libdrm_nouveau, glad, libpng, zlib), beside an
   unzipped copy and a `SHA256SUMS`. It is separate from `package_release.py` because that one
   publishes -- `latest.json`, which the launchers and Android's update notice read -- and the
   Switch build has no launcher and no update check; its checks are imported rather than copied.
