@@ -82,7 +82,7 @@ static int applet_mode_refused(void)
    clock keeper; the last one here ends and joins the texture pack's loaders, any job thread, the
    render thread (gs_native_halt), the freeze watch and SDL's audio thread. Joined, not merely
    ended: libnx has no pthread_detach, and a thread nobody joins keeps its kernel thread and its
-   stack's mapping into the menu's turn (finding 146).
+   stack's mapping into the menu's turn (finding 170).
    DHD_SWITCH_EXIT = kernel keeps the svcExitProcess ending, for comparing. */
 static volatile int quit_asked;
 
@@ -121,7 +121,7 @@ static void switch_exit_now(void)
            nvdrv. Left open, nvdrv keeps the 8 MiB transfer memory nvInitialize gave it, and those
            heap pages stay inaccessible after the return: the next program the loader starts here
            with the same heap -- dhd.nro again -- faulted zeroing its own transfer memory at the
-           same address (finding 146). */
+           same address (finding 170). */
         SDL_Quit();
         int closed = 0;
         while (serviceIsActive(nvGetServiceSession()) && closed < 16) nvExit(), closed++;

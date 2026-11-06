@@ -132,7 +132,7 @@ void host_wait_wall(double seconds)
 /* ---- threads: a fire-and-forget job (online_menu.c, the async services) ---- */
 /* On the Switch a job is not detached but kept, and joined once it has finished (at the next job,
    or at the exit: host_jobs_join): libnx has no pthread_detach, so a detached thread's kernel
-   thread outlives it, into the Homebrew Menu that runs in this same process next (finding 146). */
+   thread outlives it, into the Homebrew Menu that runs in this same process next (finding 170). */
 #ifdef __SWITCH__
 enum { JOBS_MAX = 8 };
 static struct {

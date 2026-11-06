@@ -74,7 +74,7 @@ static inline void native_cond_wait(NativeCond *c, NativeMutex *m) { SDL_WaitCon
 
    On the Switch it is kept instead, and joined at the exit (native_thread_join): libnx has no
    pthread_detach, so a detached thread's kernel object and stack mapping outlive it, and the
-   Homebrew Menu then runs in this same process with them still there (finding 146). */
+   Homebrew Menu then runs in this same process with them still there (finding 170). */
 #ifdef __SWITCH__
 static SDL_Thread *native_thread_handle;
 #endif
@@ -94,7 +94,7 @@ static inline int native_thread_start(SDL_ThreadFunction proc, void *argument)
 /* The render thread's last act on the Switch: its OpenGL context made current nowhere. A context
    left current on a thread that has ended stays bound for good, and EGL keeps a bound context
    (and the GPU device under it) through eglTerminate: the exit's SDL_Quit could then not close
-   nvdrv (finding 146). */
+   nvdrv (finding 170). */
 static inline void native_thread_release_gl(void)
 {
     SDL_Window *window = SDL_GL_GetCurrentWindow();

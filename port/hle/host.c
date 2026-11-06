@@ -568,7 +568,7 @@ static SDL_Thread *freeze_thread;   /* kept, not detached: joined by host_freeze
 static int freeze_ended;
 
 /* Joined once it has ended: on the Switch a thread nobody joins keeps its kernel thread (libnx
-   has no pthread_detach), which the exit's census lists (finding 146). */
+   has no pthread_detach), which the exit's census lists (finding 170). */
 void host_freeze_watch_stop(unsigned ms)
 {
     if (!freeze_stop) return;
