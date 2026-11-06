@@ -138,42 +138,177 @@ void dhdr_texture_release(DhdrTexture *t)
 
 /* ---- the render thread ---- */
 
-/* What the uploads cost, for DHD_GL_TIMES (render_native.c prints them). */
-static uint64_t g_upload_count, g_upload_ns, g_upload_bytes;
+/* What the uploads cost, for DHD_GL_TIMES and the slow field line (render_native.c prints them):
+   how many, their time, their bytes; of that time, what making GL textures took, and how many
+   uploads found a texture of their size in the pool instead. */
+static uint64_t g_upload_count, g_upload_ns, g_upload_bytes, g_alloc_ns, g_reused;
 
 void dhdr_tex_upload_stats(uint64_t *count, uint64_t *ns, uint64_t *bytes)
 {
     *count = g_upload_count; *ns = g_upload_ns; *bytes = g_upload_bytes;
 }
 
+void dhdr_tex_upload_split(uint64_t *alloc_ns, uint64_t *reused)
+{
+    *alloc_ns = g_alloc_ns; *reused = g_reused;
+}
+
+/* ---- the pool: GL textures of released DhdrTextures, kept for the next of the same shape ----
+
+   Measured on hardware (finding 144): the first fields of a race uploaded 20-90 textures each,
+   0.6-0.8 ms apiece for 20-40 KiB, which put those fields at 50-80 ms. Most of a decoded
+   texture's life is short (the GS worker's cache turns over), and the sizes repeat (powers of
+   two), so a released texture's GL object goes here instead of to glDeleteTextures, and the next
+   upload of the same kind and size takes it: no new texture storage, only the pixels. The pool
+   holds at most POOL_BYTES; past that the oldest go. Measured afterwards (finding 145): at a
+   race's start every texture is new, so the pool reuses nothing there; the spikes it was meant
+   for are still uploads, and only an upload thread with a shared context would move them. */
+enum { POOL_MAX = 512 };
+static const size_t POOL_BYTES = (size_t)64 << 20;
+typedef struct Pooled { GLuint gl; uint32_t w, h, levels; int replacement; size_t bytes; } Pooled;
+static Pooled g_pool[POOL_MAX];
+static unsigned g_pool_count;
+static size_t g_pool_bytes;
+
+static size_t gl_bytes(const DhdrTexture *t)
+{
+    return t->replacement ? mip_bytes(t->w, t->h, t->levels) : (size_t)t->w * t->h * 4;
+}
+
+static GLuint pool_take(const DhdrTexture *t)
+{
+    for (unsigned i = g_pool_count; i-- > 0;) {   /* newest first */
+        Pooled *e = &g_pool[i];
+        if (e->w == t->w && e->h == t->h && e->levels == t->levels && e->replacement == t->replacement) {
+            GLuint gl = e->gl;
+            g_pool_bytes -= e->bytes;
+            memmove(e, e + 1, (g_pool_count - i - 1) * sizeof *e);
+            g_pool_count--;
+            return gl;
+        }
+    }
+    return 0;
+}
+
+static void pool_put(const DhdrTexture *t)
+{
+    size_t bytes = gl_bytes(t);
+    if (bytes > POOL_BYTES / 4) { glDeleteTextures(1, &t->gl); return; }
+    while (g_pool_count && (g_pool_count == POOL_MAX || g_pool_bytes + bytes > POOL_BYTES)) {
+        glDeleteTextures(1, &g_pool[0].gl);   /* the oldest */
+        g_pool_bytes -= g_pool[0].bytes;
+        memmove(&g_pool[0], &g_pool[1], (g_pool_count - 1) * sizeof g_pool[0]);
+        g_pool_count--;
+    }
+    g_pool[g_pool_count++] = (Pooled){ t->gl, t->w, t->h, t->levels, t->replacement, bytes };
+    g_pool_bytes += bytes;
+}
+
+/* ---- the upload ring: the pixels go through one pixel unpack buffer ----
+
+   glTexSubImage2D from client memory makes the driver copy the pixels into a staging buffer of
+   its own each time. Here they are copied into one 8 MiB buffer instead, mapped unsynchronised,
+   and the texture is filled from it on the GPU. The buffer is used as two halves: a half is
+   written only after the fence set when it was last left has passed (a field or more ago, so
+   that wait is normally free). An upload larger than a half goes the old way.
+   DHD_SWITCH_UPLOAD = direct turns the ring off. */
+enum { RING_BYTES = 8 << 20, RING_HALF = RING_BYTES / 2 };
+static GLuint g_ring;
+static GLsync g_ring_fence[2];
+static size_t g_ring_at;      /* the next free byte, inside half g_ring_half */
+static int g_ring_half;       /* the half being written (0 or 1) */
+static int g_ring_off = -1;   /* -1 not decided yet */
+
+/* Room for `bytes` in the ring: its offset, or (size_t)-1 to upload directly. */
+static size_t ring_reserve(size_t bytes)
+{
+    if (g_ring_off < 0) {
+        const char *s = getenv("DHD_SWITCH_UPLOAD");
+        g_ring_off = s && !strcmp(s, "direct");
+    }
+    if (g_ring_off || bytes > RING_HALF) return (size_t)-1;
+    if (!g_ring) {
+        glGenBuffers(1, &g_ring);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, g_ring);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, RING_BYTES, NULL, GL_STREAM_DRAW);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        if (!g_ring) { g_ring_off = 1; return (size_t)-1; }
+    }
+    /* The half is kept, not worked out from g_ring_at: rounded up to 256, g_ring_at can land
+       exactly on the end of the buffer, and a half computed from it would be 2 -- past both the
+       buffer and g_ring_fence, which is how the first version of this wrote over the pool's
+       count and crashed (finding 144). */
+    int half = g_ring_half;
+    size_t end = (size_t)(half + 1) * RING_HALF;
+    if (g_ring_at + bytes > end) {   /* this half is full: fence it, move to the other */
+        if (g_ring_fence[half]) glDeleteSync(g_ring_fence[half]);
+        g_ring_fence[half] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        half ^= 1;
+        g_ring_half = half;
+        g_ring_at = (size_t)half * RING_HALF;
+        if (g_ring_fence[half]) {
+            glClientWaitSync(g_ring_fence[half], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+            glDeleteSync(g_ring_fence[half]);
+            g_ring_fence[half] = 0;
+        }
+    }
+    size_t at = g_ring_at;
+    g_ring_at = (at + bytes + 255) & ~(size_t)255;
+    return at;
+}
+
 static void upload(DhdrTexture *t)
 {
     uint64_t began = SDL_GetTicksNS();
     size_t bytes = t->bytes;
-    glGenTextures(1, &t->gl);
-    if (!t->gl) { t->failed = 1; return; }
+    GLuint gl = pool_take(t);
+    int fresh = !gl;
+    if (fresh) glGenTextures(1, &gl);
+    if (!gl) { t->failed = 1; return; }
+    t->gl = gl;
     glBindTexture(GL_TEXTURE_2D, t->gl);
+    if (fresh) {
+        if (t->replacement) {
+            glTexStorage2D(GL_TEXTURE_2D, (GLsizei)t->levels, GL_RGBA8, (GLsizei)t->w, (GLsizei)t->h);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, (GLint)t->levels - 1);
+        } else {
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, (GLsizei)t->w, (GLsizei)t->h);
+            /* An integer texture is never filtered; the shader fetches texels itself (texel_u). */
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        }
+        g_alloc_ns += SDL_GetTicksNS() - began;
+    } else g_reused++;
+    const uint8_t *source = t->pixels;
+    size_t at = ring_reserve(bytes);
+    if (at != (size_t)-1) {
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, g_ring);
+        void *map = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, (GLintptr)at, (GLsizeiptr)bytes,
+                                     GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT | GL_MAP_INVALIDATE_RANGE_BIT);
+        if (map) {
+            memcpy(map, t->pixels, bytes);
+            glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+            source = (const uint8_t *)(uintptr_t)at;   /* an offset into the bound buffer */
+        } else {
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        }
+    }
     if (t->replacement) {
-        glTexStorage2D(GL_TEXTURE_2D, (GLsizei)t->levels, GL_RGBA8, (GLsizei)t->w, (GLsizei)t->h);
-        const uint8_t *at = t->pixels;
+        const uint8_t *level_at = source;
         uint32_t lw = t->w, lh = t->h;
         for (uint32_t level = 0; level < t->levels; level++) {
             glTexSubImage2D(GL_TEXTURE_2D, (GLint)level, 0, 0, (GLsizei)lw, (GLsizei)lh,
-                            GL_RGBA, GL_UNSIGNED_BYTE, at);
-            at += (size_t)lw * lh * 4;
+                            GL_RGBA, GL_UNSIGNED_BYTE, level_at);
+            level_at += (size_t)lw * lh * 4;
             lw = lw > 1 ? lw / 2 : 1;
             lh = lh > 1 ? lh / 2 : 1;
         }
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, (GLint)t->levels - 1);
     } else {
-        glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, (GLsizei)t->w, (GLsizei)t->h);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)t->w, (GLsizei)t->h,
-                        GL_RED_INTEGER, GL_UNSIGNED_INT, t->pixels);
-        /* An integer texture is never filtered; the shader fetches texels itself (texel_u). */
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                        GL_RED_INTEGER, GL_UNSIGNED_INT, source);
     }
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     /* The pixels are in GL now; on a 4 GiB console the CPU copy is worth giving back. */
     free(t->pixels);
     t->pixels = NULL;
@@ -269,7 +404,7 @@ void dhdr_tex_collect(void)
     dead_unlock();
     while (dead) {
         DhdrTexture *next = dead->next_dead;
-        if (dead->gl) glDeleteTextures(1, &dead->gl);
+        if (dead->gl) pool_put(dead);
         free(dead->pixels);
         free(dead);
         dead = next;
@@ -279,6 +414,12 @@ void dhdr_tex_collect(void)
 void dhdr_tex_shutdown(void)
 {
     dhdr_tex_collect();
+    for (unsigned i = 0; i < g_pool_count; i++) glDeleteTextures(1, &g_pool[i].gl);
+    g_pool_count = 0; g_pool_bytes = 0;
+    for (int i = 0; i < 2; i++)
+        if (g_ring_fence[i]) { glDeleteSync(g_ring_fence[i]); g_ring_fence[i] = 0; }
+    if (g_ring) glDeleteBuffers(1, &g_ring);
+    g_ring = 0; g_ring_at = 0; g_ring_half = 0;
     for (unsigned i = 0; i < 8; i++) {
         if (g_samplers[i]) glDeleteSamplers(1, &g_samplers[i]);
         g_samplers[i] = 0;

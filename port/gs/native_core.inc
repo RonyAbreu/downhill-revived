@@ -839,6 +839,20 @@ static uint32_t native_blend(Native *n, uint64_t alpha)
     if (negative[0] && negative[1]) n->stats.blend_approximate++;
     else if (negative[0]) op = 3;   /* REV_SUBTRACT: Cd * f - Cs * f */
     else if (negative[1]) op = 2;   /* SUBTRACT */
+    {   /* Which GS modes the blend_approx count is made of: each one named once a run, so the
+           next fix is chosen from what the game uses (a 256-bit set over A, B, C and D). */
+        static uint32_t named[8];
+        unsigned mode = (unsigned)alpha & 255;
+        int approximated = (factor[0] == BLEND_ONE && a == 0 && d == 0 && a != b) ||
+                           (factor[1] == BLEND_ONE && a == 1 && d == 1 && a != b) || (negative[0] && negative[1]);
+        if (approximated && !(named[mode >> 5] & 1u << (mode & 31))) {
+            named[mode >> 5] |= 1u << (mode & 31);
+            fprintf(stderr, "gs native: blend approximated: (%s - %s) * %s + %s, FIX %u\n",
+                    (const char *[]){"Cs", "Cd", "0", "0"}[a], (const char *[]){"Cs", "Cd", "0", "0"}[b],
+                    (const char *[]){"As", "Ad", "FIX", "FIX"}[c], (const char *[]){"Cs", "Cd", "0", "0"}[d],
+                    (unsigned)(alpha >> 32) & 255);
+        }
+    }
     return 1 | factor[0] << 1 | factor[1] << 6 | op << 11;
 }
 
@@ -910,6 +924,15 @@ static void native_state(Native *n, Gs *g, unsigned prim, unsigned ctxt)
     if (c->blend_key && source == BLEND_SA && (destination == BLEND_ZERO || destination == BLEND_ONE)) {
         c->blend_key = (c->blend_key & ~(31u << 1)) | BLEND_ONE << 1;
         k->flags |= 512;
+    }
+    /* (Cd - 0) * As + Cd: the destination times 1 + As / 128, which native_blend approximates as
+       Cd alone (Zero, One). Flag 4096 tells a renderer that can do better: the Switch's draws the
+       colour as As / 128 and blends it with DstColor, One (render_native.c). The Rust renderer
+       does not read the flag and keeps the approximation. */
+    if (prim & 64) {
+        uint64_t alpha = g->reg[GS_ALPHA_1 + ctxt];
+        if ((alpha & 3) == 1 && (alpha >> 2 & 3) >= 2 && (alpha >> 4 & 3) == 0 && (alpha >> 6 & 3) == 1)
+            k->flags |= 4096;
     }
     c->color_mask = (uint8_t)mask;
     /* Alpha test. AFAIL decides what a failing pixel still writes: a second pass draws exactly

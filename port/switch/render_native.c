@@ -16,10 +16,10 @@
    as its source alpha, then the alpha channel alone, unblended), because this device offers no
    dual-source blending.
 
-   Still missing: sampling a surface or a conversion (texture_surface, convert) — such a draw
-   loses its texture bit and comes out flat, as every textured draw did in step 1 — the texture
-   copies (DHDR_CMD_COPY, IMPORT and ALPHA_UPLOAD are no-ops), the Z probe of finding 097, and
-   the reversed triangle order the alpha pass of a GREATER-with-writes draw wants.
+   Also here: a draw sampling a surface (another one, or its own target through a copy), the
+   texture copies (DHDR_CMD_COPY, IMPORT, ALPHA_UPLOAD), the Z probe of finding 097, and the
+   reversed triangle order the alpha pass of a GREATER-with-writes draw wants. Still missing: a
+   draw sampling a conversion (convert), which loses its texture bit and comes out flat.
 
    Scanout and present are exact (native.wgsl's native_scanout, in a compute shader, and the same
    windowed quad render_gl.c's exact present uses), so the picture is in the right place and the
@@ -44,6 +44,8 @@
 #include "textures_gl.h"
 
 enum { DHDR_NATIVE_SURFACE_COUNT = 48 };
+enum { ZREAD_MAX = 64, ZREAD_SLOTS = 3 };   /* zread.rs: GS pixels a side, buffers in flight */
+enum { CONVERTS = 64 };                    /* convert.rs: conversions a picture holds at most */
 
 typedef struct NativeSurface {
     GLuint texture, fbo;
@@ -115,8 +117,98 @@ struct DhdrNative {
     uint32_t scratch_width, scratch_height;
     GLuint import_texture, import_fbo;
     uint32_t import_width, import_height;
+    GLuint upload_program, upload_texture;   /* ALPHA_UPLOAD (alpha_upload) */
+    GLint upload_map;
+    /* Conversions (run_convert): the program, the inverse table, the constants block, and one
+       converted texture per conversion index (convert.rs's converted[64]). */
+    GLuint convert_program, convert_inverse, convert_constants;
+    struct { GLuint texture; uint32_t w, h; } converted[CONVERTS];
     int point_filter;
+    /* The Z probe (finding 097, zread.rs): a compute pass copies the probed patch of a Z surface
+       into one of these buffers after a picture, and a later picture takes the newest one whose
+       fence has passed, never waiting for one. */
+    struct { GLuint buffer; GLsync fence; uint32_t rect[4]; uint64_t tag; } zslots[ZREAD_SLOTS];
+    GLuint zread_program;
+    GLint zread_rect, zread_scale;
 };
+
+/* ---- slow fields: what the render thread did in a field that took too long ----
+
+   A field's cycle on the render thread, from one picture's start to the next one's: the picture
+   (dhdr_native_picture_indexed: the draws, with any program it had to link, any texture it had to
+   upload and any surface it had to make; the dead textures; the scanout), the present draw, the
+   pacing wait until the picture's due time, the swap, and then the wait for the GS worker to hand
+   over the next field. When a cycle is longer than DHD_SLOW_FIELD_MS (50 by default; 0 turns it
+   off), one line names each part's time, so a spike says whether this thread caused it (links,
+   uploads, surfaces, draws, the swap) or waited for the CPU threads that make the fields. */
+typedef struct FieldCost {
+    uint64_t start, end;          /* the picture's own start and end (SDL_GetTicksNS) */
+    uint64_t draws_ns, collect_ns, scan_ns;
+    uint32_t links;   uint64_t link_ns;
+    uint32_t surfaces; uint64_t surface_ns;
+    uint64_t uploads, upload_ns, upload_bytes, alloc_ns, reused;
+    uint64_t present_began, present_ended;   /* dhdr_native_present, 0 when it did not run */
+    uint32_t draws, copies, imports, converts;
+} FieldCost;
+
+/* g_cost sums what happens from one picture's end to the next one's (surfaces are made before
+   the picture that draws into them, links and uploads inside it); at a picture's end it becomes
+   g_last, the cycle the next picture's start checks. Render thread only. */
+static FieldCost g_cost, g_last;
+static uint64_t g_cost_fields;  /* pictures so far */
+
+static int slow_field_ms(void)
+{
+    static int ms = -1;
+    if (ms < 0) {   /* getenv, not SDL_getenv: dhd.ini reaches the environment after SDL's copy */
+        const char *s = getenv("DHD_SLOW_FIELD_MS");
+        ms = s ? atoi(s) : 50;
+        if (ms < 0) ms = 0;
+    }
+    return ms;
+}
+
+/* At a picture's start: the last cycle, logged when it was slow. */
+static void slow_field_check(uint64_t now)
+{
+    static unsigned printed;
+    const FieldCost *c = &g_last, *next = &g_cost;   /* next: what ran since, before this picture */
+    int limit = slow_field_ms();
+    if (!limit || !c->start || g_cost_fields < 2) return;
+    double ms = (now - c->start) / 1e6;
+    if (ms < limit || printed >= 400) return;
+    printed++;
+    double picture = (c->end - c->start) / 1e6, present = 0, pace = 0, swap = 0, wait;
+    uint64_t last = c->end;
+    if (c->present_began >= c->end) {
+        present = (c->present_ended - c->present_began) / 1e6;
+        last = c->present_ended;
+        if (dhdr_gl_swap_began_ns >= c->present_ended) {
+            pace = (dhdr_gl_swap_began_ns - c->present_ended) / 1e6;
+            swap = (dhdr_gl_swap_ended_ns - dhdr_gl_swap_began_ns) / 1e6;
+            last = dhdr_gl_swap_ended_ns;
+        }
+    }
+    /* Surfaces made for this picture ran after the last swap, outside both pictures. */
+    double before = next->surface_ns / 1e6;
+    wait = now > last ? (now - last) / 1e6 - before : 0;
+    if (wait < 0) wait = 0;
+    /* What the cycle went into most: this thread's own work, the pacing, or the wait for a field. */
+    double own = picture + present + swap + before;
+    const char *verdict = wait >= own && wait >= pace ? "the CPU threads (waiting for the next field)"
+                        : pace >= own ? "pacing" : swap >= picture + present ? "the swap (GPU or display)"
+                        : "the render thread";
+    fprintf(stderr, "gs native: slow field %.1f ms: picture %.1f (draws %.1f over %u draws, %u links %.1f ms, "
+                    "%llu uploads %.1f ms %.0f KiB (new textures %.1f ms, %llu reused), %u surfaces %.1f ms, %u copies, %u imports, %u conversions, "
+                    "dead textures %.1f, "
+                    "scanout %.1f), present %.1f, pacing %.1f, swap %.1f, %u surfaces made for the next %.1f, "
+                    "waiting for the next field %.1f -> %s\n",
+            ms, picture, c->draws_ns / 1e6, c->draws, c->links, c->link_ns / 1e6,
+            (unsigned long long)c->uploads, c->upload_ns / 1e6, c->upload_bytes / 1024.0, c->alloc_ns / 1e6,
+            (unsigned long long)c->reused, c->surfaces,
+            c->surface_ns / 1e6, c->copies, c->imports, c->converts, c->collect_ns / 1e6, c->scan_ns / 1e6, present, pace, swap,
+            next->surfaces, before, wait, verdict);
+}
 
 /* ---- shaders (native.wgsl, translated line for line for the untextured step 1 subset) ---- */
 
@@ -291,7 +383,11 @@ static const char *native_fragment_source =
        round() keeps it so where a compiler would fuse the product into a later add. */
     "vec4 load_texel_f(ivec2 xy) {\n"
     "    ivec2 size = texels_size;\n"
-    "    vec4 v = texelFetch(native_texture, clamp(xy, ivec2(0), size - 1), 0);\n"
+    "    ivec2 c = clamp(xy, ivec2(0), size - 1);\n"
+    /* A surface holds its GS rows bottom up (native_vertex's flip): GS row y is texture row
+       size.y - 1 - y. texels_size is the surface's own size, also when the texture is the
+       scratch copy of it (a draw sampling its own target), which keeps the same rows. */
+    "    vec4 v = texelFetch(native_texture, ivec2(c.x, size.y - 1 - c.y), 0);\n"
     "    return (all(greaterThanEqual(xy, ivec2(0))) && all(lessThan(xy, size))) ? v : vec4(0.0);\n"
     "}\n"
     "vec4 texel(ivec2 c) {\n"
@@ -368,6 +464,10 @@ static const char *native_fragment_source =
     "    }\n"
     "    vec4 color = combine(t);\n"
     "    frag_color = vec4(color.rgb / 255.0, clamp(color.a / alpha_div, 0.0, 1.0));\n"
+    /* Flag 4096 (native_core.inc): the GS blend is Cd * (1 + As / 128), which no blend factor
+       gives. The colour leaves the shader as As / 128 and the blend is DstColor, One:
+       Cd * As / 128 + Cd. Exact up to As = 128; above, the output stops at 1 (Cd * 2). */
+    "    if ((flags & 4096u) != 0u) frag_color.rgb = vec3(clamp(color.a / 128.0, 0.0, 1.0));\n"
     "}\n";
 
 /* native_scanout (native.wgsl), the exact (non-"fast") form: da = display[0..3] (psm, bw, scale
@@ -565,10 +665,82 @@ static DrawProgram *draw_program(DhdrNative *n, unsigned key)
              (key & PROGRAM_ALPHA_TEST) ? "#define ALPHA_TEST 1\n" : "",
              (key & PROGRAM_SCALE_ONE) ? "#define SCALE_ONE 1\n" : "",
              (key & PROGRAM_WRAP_REPEAT) ? "#define WRAP_REPEAT 1\n" : "");
+    uint64_t began = SDL_GetTicksNS();
     d->id = link_program(native_vertex_source, defines, native_fragment_source, NULL);
+    g_cost.links++;
+    g_cost.link_ns += SDL_GetTicksNS() - began;
     if (!d->id) return NULL;
     find_draw_uniforms(d, (key & PROGRAM_TEXELS) ? "native_texels" : "native_texture", 0);
     return d;
+}
+
+static int ensure_aux(GLuint *texture, GLuint *fbo, uint32_t *have_w, uint32_t *have_h,
+                      uint32_t w, uint32_t h);
+static void ensure_buffer(GLenum target, GLuint buffer, size_t *capacity, size_t bytes);
+static int ensure_zread(DhdrNative *n);
+static int ensure_upload(DhdrNative *n);
+static int ensure_convert(DhdrNative *n);
+
+/* Every draw program, linked and drawn with once, before the first picture.
+
+   Linking one on first use (as this file first did) put each link inside the field that first
+   needed it, and on Mesa's nouveau a link is a full compile of both stages -- tens of
+   milliseconds on this CPU. A race or a menu reaching a new kind of draw then stalled a field.
+   Mesa may also leave part of the work for the first draw (its state tracker picks a variant
+   when a draw validates the program), so each program draws one pixel into the scratch
+   framebuffer and the queue is finished, all at start-up. DHD_SWITCH_PRELINK = 0 goes back to
+   linking on first use (to measure the difference). */
+static void prelink_programs(DhdrNative *n)
+{
+    const char *env = getenv("DHD_SWITCH_PRELINK");
+    if (env && !strcmp(env, "0")) return;
+    uint64_t began = SDL_GetTicksNS();
+    if (!ensure_aux(&n->scratch_texture, &n->scratch_fbo, &n->scratch_width, &n->scratch_height, 4, 4)) return;
+    DhdrVertex corner[3];
+    memset(corner, 0, sizeof corner);
+    corner[0].x = 0; corner[0].y = 0;
+    corner[1].x = 4; corner[1].y = 0;
+    corner[2].x = 0; corner[2].y = 4;
+    for (int i = 0; i < 3; i++) { corner[i].q = 1; corner[i].rgba = 0x80808080u; }
+    glBindVertexArray(n->vao);
+    ensure_buffer(GL_ARRAY_BUFFER, n->vbo, &n->vbo_bytes, sizeof corner);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof corner, corner);
+    glBindFramebuffer(GL_FRAMEBUFFER, n->scratch_fbo);
+    glViewport(0, 0, 4, 4);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, 1, 1);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glActiveTexture(GL_TEXTURE0);
+    unsigned linked = 0;
+    for (unsigned key = 0; key < PROGRAM_COUNT; key++) {
+        if ((key & PROGRAM_BILINEAR) && !(key & PROGRAM_TEXELS)) continue;   /* never asked for */
+        DrawProgram *d = draw_program(n, key);
+        if (!d) continue;
+        linked++;
+        glUseProgram(d->id);
+        glBindTexture(GL_TEXTURE_2D, (key & PROGRAM_TEXELS) ? dhdr_tex_dummy_texels() : dhdr_tex_dummy_rgba());
+        /* Uniforms sent here bypass the held copies (d->held stays 0), so the first real draw
+           sends its own. */
+        glUniform2f(d->u_target_size, 4, 4);
+        glUniform1ui(d->u_flags, 1);
+        glUniform1ui(d->u_scale, 1 | 1 << 8 | 1 << 16);
+        glUniform2i(d->u_texels_size, 1, 1);
+        glUniform2ui(d->u_tex_size, 1, 1);
+        glUniform1f(d->u_alpha_div, 255.0f);
+        glUniform1f(d->u_alpha_scale, 255.0f);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    /* The other programs a picture may need: the Z probe, the alpha upload, the conversions.
+       (Each is used for a handful of pixels, so a first use costs only its link, done here.) */
+    linked += ensure_zread(n) + ensure_upload(n) + ensure_convert(n);
+    glFinish();
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    fprintf(stderr, "gs native: %u programs linked (draw programs drawn with) at start-up in %.1f ms\n", linked,
+            (SDL_GetTicksNS() - began) / 1e6);
+    /* Start-up links are not a field's: the first slow field line must not count them. */
+    g_cost.links = 0; g_cost.link_ns = 0;
 }
 
 static int ensure_gl_objects(DhdrNative *n)
@@ -609,6 +781,9 @@ static int ensure_gl_objects(DhdrNative *n)
     glEnableVertexAttribArray(2);
     glVertexAttribIPointer(2, 4, GL_UNSIGNED_BYTE, sizeof(DhdrVertex), (void *)offsetof(DhdrVertex, rgba));
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, n->ibo);
+    prelink_programs(n);
+    glBindVertexArray(n->vao);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, n->ibo);
     fprintf(stderr, "gs native: GL native renderer ready (scanout: %s)\n",
             n->scanout_cycle ? "cycle, the next form at each DHD_GL_TIMES line" : scanout_names[n->scanout_mode]);
     n->ready = 1;
@@ -634,6 +809,13 @@ void dhdr_native_destroy(DhdrNative *n)
         if (n->scratch_fbo) glDeleteFramebuffers(1, &n->scratch_fbo);
         if (n->scratch_texture) glDeleteTextures(1, &n->scratch_texture);
         if (n->import_fbo) glDeleteFramebuffers(1, &n->import_fbo);
+        if (n->upload_texture) glDeleteTextures(1, &n->upload_texture);
+        if (n->upload_program) glDeleteProgram(n->upload_program);
+        for (int i = 0; i < CONVERTS; i++)
+            if (n->converted[i].texture) glDeleteTextures(1, &n->converted[i].texture);
+        if (n->convert_program) glDeleteProgram(n->convert_program);
+        if (n->convert_inverse) glDeleteBuffers(1, &n->convert_inverse);
+        if (n->convert_constants) glDeleteBuffers(1, &n->convert_constants);
         if (n->import_texture) glDeleteTextures(1, &n->import_texture);
         glDeleteBuffers(1, &n->vbo);
         glDeleteBuffers(1, &n->ibo);
@@ -641,6 +823,11 @@ void dhdr_native_destroy(DhdrNative *n)
         for (int i = 0; i < PROGRAM_COUNT; i++)
             if (n->programs[i].id) glDeleteProgram(n->programs[i].id);
         for (int i = 0; i < 3; i++) glDeleteProgram(n->scanout[i].id);
+        for (int i = 0; i < ZREAD_SLOTS; i++) {
+            if (n->zslots[i].fence) glDeleteSync(n->zslots[i].fence);
+            if (n->zslots[i].buffer) glDeleteBuffers(1, &n->zslots[i].buffer);
+        }
+        if (n->zread_program) glDeleteProgram(n->zread_program);
         glDeleteProgram(n->present_program);
         dhdr_tex_shutdown();
     }
@@ -663,18 +850,20 @@ int dhdr_native_surface(DhdrNative *n, uint32_t index, uint32_t scale, uint32_t 
         size_out[0] = s->width; size_out[1] = s->height;
         return 1;
     }
+    uint64_t began = SDL_GetTicksNS();
+    g_cost.surfaces++;
     uint32_t nw = s->texture && s->width > w ? s->width : (w ? w : 1);
     uint32_t nh = s->texture && s->height > h ? s->height : (h ? h : 1);
     GLuint texture = 0, fbo = 0;
     glGenTextures(1, &texture);
     glBindTexture(GL_TEXTURE_2D, texture);
     glTexStorage2D(GL_TEXTURE_2D, 1, depth ? GL_DEPTH_COMPONENT32F : GL_RGBA8, (GLsizei)nw, (GLsizei)nh);
-    if (!depth) {
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    }
+    /* Nearest and one level for a Z surface too: the Z probe fetches from it, and the default
+       minifying filter wants mipmaps it does not have, which makes a fetch undefined. */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glGenFramebuffers(1, &fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, depth ? GL_DEPTH_ATTACHMENT : GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
@@ -702,6 +891,7 @@ int dhdr_native_surface(DhdrNative *n, uint32_t index, uint32_t scale, uint32_t 
     s->texture = texture; s->fbo = fbo; s->width = nw; s->height = nh; s->scale = scale ? scale : 1; s->depth = depth != 0;
     s->depth_attached = 0;   /* a new framebuffer carries none of the old one's attachments */
     size_out[0] = nw; size_out[1] = nh;
+    g_cost.surface_ns += SDL_GetTicksNS() - began;
     return 1;
 }
 
@@ -1100,24 +1290,468 @@ static int report_times(uint64_t draws_ns, uint64_t scan_ns, uint64_t collect_ns
     return 1;
 }
 
+/* A draw sampling its own target t (surfaces.rs's sample_target): the region its texture can
+   reach (tex_offset, tex_size, cut to the surface) copied to the scratch texture at the same
+   texture coordinates, which the draw then samples with the surface's own size and rows. The
+   scratch texture, or 0 to draw untextured (the caller's flat fallback). */
+static GLuint sample_target(DhdrNative *n, NativeSurface *t, const DhdrNativeConstants *c, DhdrPictureResult *out)
+{
+    uint32_t ss = t->scale ? t->scale : 1;
+    int32_t x = c->tex_offset[0], y = c->tex_offset[1];
+    int32_t w = (int32_t)c->tex_size[0], h = (int32_t)c->tex_size[1];
+    int32_t sw = (int32_t)(t->width / ss), sh = (int32_t)(t->height / ss);
+    if (x < 0 || y < 0) return 0;
+    if (x + w > sw) w = sw - x;
+    if (y + h > sh) h = sh - y;
+    if (w < 0) w = 0;
+    if (h < 0) h = 0;
+    if (!ensure_aux(&n->scratch_texture, &n->scratch_fbo, &n->scratch_width, &n->scratch_height, t->width, t->height))
+        return 0;
+    if (w && h) {
+        GLint bx = x * (int32_t)ss, bw = w * (int32_t)ss, bh = h * (int32_t)ss;
+        GLint by = flip_y(t->height, y * (int32_t)ss, bh);
+        glCopyImageSubData(t->texture, GL_TEXTURE_2D, 0, bx, by, 0,
+                           n->scratch_texture, GL_TEXTURE_2D, 0, bx, by, 0, bw, bh, 1);
+    }
+    out->self_copies++;
+    out->self_copy_px += (uint64_t)w * (uint64_t)h;
+    return n->scratch_texture;
+}
+
+/* native_upload_alpha (native.wgsl): a 64 x 32 page of alpha bits applied to a surface without
+   resampling its scaled RGB. The upload's red is the new bits and its green the mask: the alpha
+   becomes (old & ~mask) | bits, read from a copy of the region in the scratch texture. Drawn as
+   one triangle over the target, cut to the page by the scissor. */
+static const char *upload_alpha_source =
+    "uniform usampler2D upload;\n"     /* 64 x 32 RGBA8UI, row 0 the GS top */
+    "uniform sampler2D previous;\n"    /* the target's copy, the same texel layout */
+    "uniform ivec4 map;\n"             /* x, y (GS pixels), scale, the target's height */
+    "out vec4 color;\n"
+    "void main() {\n"
+    "    ivec2 texel = ivec2(gl_FragCoord.xy);\n"
+    "    ivec2 gs = ivec2(texel.x, map.w - 1 - texel.y) / map.z - map.xy;\n"
+    "    uvec2 bits = (all(greaterThanEqual(gs, ivec2(0))) && all(lessThan(gs, ivec2(64, 32))))\n"
+    "               ? texelFetch(upload, gs, 0).rg : uvec2(0u);\n"
+    "    vec4 old = texelFetch(previous, texel, 0);\n"
+    "    uint alpha = uint(round(old.a * 255.0));\n"
+    "    color = vec4(old.rgb, float((alpha & ~bits.y) | bits.x) / 255.0);\n"
+    "}\n";
+
+/* The alpha upload's program and its 64 x 32 texture, made once (at start-up, prelink_programs). */
+static int ensure_upload(DhdrNative *n)
+{
+    static int failed;
+    if (n->upload_program) return 1;
+    if (failed) return 0;
+    n->upload_program = link_program(scanout_vertex_source, "#version 430 core\n", upload_alpha_source, NULL);
+    if (!n->upload_program) { failed = 1; return 0; }
+    glUseProgram(n->upload_program);
+    glUniform1i(glGetUniformLocation(n->upload_program, "upload"), 1);
+    glUniform1i(glGetUniformLocation(n->upload_program, "previous"), 0);
+    n->upload_map = glGetUniformLocation(n->upload_program, "map");
+    glGenTextures(1, &n->upload_texture);
+    glBindTexture(GL_TEXTURE_2D, n->upload_texture);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8UI, 64, 32);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    return 1;
+}
+
+static void alpha_upload(DhdrNative *n, const DhdrCommand *k)
+{
+    if (k->target < 0 || (uint32_t)k->target >= DHDR_NATIVE_SURFACE_COUNT || !k->pixels) return;
+    NativeSurface *t = &n->surfaces[k->target];
+    if (!t->texture || t->depth) return;
+    int32_t ss = (int32_t)(t->scale ? t->scale : 1);
+    int32_t left = k->x * ss, top = k->y * ss, right = (k->x + 64) * ss, bottom = (k->y + 32) * ss;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > (int32_t)t->width) right = (int32_t)t->width;
+    if (bottom > (int32_t)t->height) bottom = (int32_t)t->height;
+    if (right <= left || bottom <= top) return;
+    if (!ensure_upload(n)) return;
+    if (!ensure_aux(&n->scratch_texture, &n->scratch_fbo, &n->scratch_width, &n->scratch_height, t->width, t->height))
+        return;
+    GLint low = (GLint)t->height - bottom;   /* the page's lowest texture row */
+    glCopyImageSubData(t->texture, GL_TEXTURE_2D, 0, left, low, 0,
+                       n->scratch_texture, GL_TEXTURE_2D, 0, left, low, 0, right - left, bottom - top, 1);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, n->upload_texture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 64, 32, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, k->pixels);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, n->scratch_texture);
+    glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
+    glViewport(0, 0, (GLsizei)t->width, (GLsizei)t->height);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(left, low, right - left, bottom - top);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_BLEND);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(n->upload_program);
+    glUniform4i(n->upload_map, k->x, k->y, ss, (GLint)t->height);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+/* ---- conversions (native.wgsl's native_convert, convert.rs) ----
+
+   A texture over GS memory some of which native surfaces drew: a compute pass rebuilds it texel
+   by texel, each GS word taken from the decoded base texture (page source 0) or from one of up to
+   four source surfaces (colour or Z), through the swizzle tables, then the texture's own format
+   and palette applied. Translated line for line from native.wgsl; what differs:
+   - the Y flip: a surface holds its GS rows bottom up (native_vertex), so a source is read at
+     texture row (height - 1 - y), and the converted texture is written the same way round, so a
+     draw samples it exactly as it samples a surface (fetch_surface, texels_size its size);
+   - the page arithmetic divides by powers of two with shifts (pw, ph are 64 or 128, 32 or 64):
+     this GPU has no integer divide (STATE.md NX3); the divisions by the buffer width stay.
+   - a Z source is a sampler2D over the depth texture (compare mode off), reading its .r. */
+static const char *convert_source =
+    "#version 430 core\n"
+    "layout(local_size_x = 8, local_size_y = 8) in;\n"
+    "layout(std140, binding = 0) uniform Convert {\n"
+    "    uvec4 tex; uvec4 size; uvec4 slot[4]; uvec4 pages[32]; uvec4 palette[64];\n"
+    "} convert;\n"
+    "layout(std430, binding = 0) readonly buffer Inverse { uint native_inverse[]; };\n"
+    "layout(binding = 0) uniform usampler2D convert_base;\n"
+    "layout(binding = 1) uniform sampler2D convert_colour0;\n"
+    "layout(binding = 2) uniform sampler2D convert_colour1;\n"
+    "layout(binding = 3) uniform sampler2D convert_colour2;\n"
+    "layout(binding = 4) uniform sampler2D convert_colour3;\n"
+    "layout(binding = 5) uniform sampler2D convert_depth0;\n"
+    "layout(binding = 6) uniform sampler2D convert_depth1;\n"
+    "layout(binding = 7) uniform sampler2D convert_depth2;\n"
+    "layout(binding = 8) uniform sampler2D convert_depth3;\n"
+    "layout(rgba8, binding = 0) writeonly uniform image2D native_converted;\n"
+    /* A surface's texel at GS-scaled (x, y), rows from the top; 0 outside. */
+    "vec4 load_surface(sampler2D t, ivec2 xy) {\n"
+    "    ivec2 size = textureSize(t, 0);\n"
+    "    if (any(lessThan(xy, ivec2(0))) || any(greaterThanEqual(xy, size))) return vec4(0.0);\n"
+    "    return texelFetch(t, ivec2(xy.x, size.y - 1 - xy.y), 0);\n"
+    "}\n"
+    "uint load_base(ivec2 xy) {\n"
+    "    ivec2 size = textureSize(convert_base, 0);\n"
+    "    if (any(lessThan(xy, ivec2(0))) || any(greaterThanEqual(xy, size))) return 0u;\n"
+    "    return texelFetch(convert_base, xy, 0).x;\n"
+    "}\n"
+    "uint bits_per_pixel(uint psm) {\n"
+    "    if (psm == 1u || psm == 49u) return 24u;\n"
+    "    if ((psm & 7u) == 2u) return 16u;\n"
+    "    if (psm == 19u || psm == 27u) return 8u;\n"
+    "    if (psm == 20u || psm == 36u || psm == 44u) return 4u;\n"
+    "    return 32u;\n"
+    "}\n"
+    "uint address(uint psm, uint bp, uint bw, uint x, uint y) {\n"
+    "    uint pws = 6u, phs = 5u, bits = 32u, high = 0u, block = 0u, column = 0u, bx = 0u, by = 0u;\n"
+    "    if (psm == 19u || psm == 20u) { pws = 7u; phs = (psm == 19u) ? 6u : 7u; }\n"
+    "    else if ((psm & 7u) == 2u) { phs = 6u; }\n"
+    "    uint px = x & ((1u << pws) - 1u);\n"
+    "    uint py = y & ((1u << phs) - 1u);\n"
+    "    if (psm == 19u) {\n"
+    "        bits = 8u; bx = px >> 4; by = py >> 4;\n"
+    "        block = (bx & 1u) | (by & 1u) << 1 | (bx & 2u) << 1 | (by & 2u) << 2 | (bx & 4u) << 2;\n"
+    "        column = (px & 1u) << 2 | (px & 2u) << 3 | (px & 4u) << 3 | (px & 8u) >> 2 |\n"
+    "                 (py & 1u) << 3 | (py & 2u) >> 1 | (py & 4u) << 4 | (py & 8u) << 4;\n"
+    "        column ^= ((py >> 1 ^ py >> 2) & 1u) << 5;\n"
+    "    } else if (psm == 20u) {\n"
+    "        bits = 4u; bx = px >> 5; by = py >> 4;\n"
+    "        block = (by & 1u) | (bx & 1u) << 1 | (by & 2u) << 1 | (bx & 2u) << 2 | (by & 4u) << 2;\n"
+    "        column = (px & 1u) << 3 | (px & 2u) << 4 | (px & 4u) << 4 | (px & 8u) >> 2 | (px & 16u) >> 2 |\n"
+    "                 (py & 1u) << 4 | (py & 2u) >> 1 | (py & 4u) << 5 | (py & 8u) << 5;\n"
+    "        column ^= ((py >> 1 ^ py >> 2) & 1u) << 6;\n"
+    "    } else if ((psm & 7u) == 2u) {\n"
+    "        bits = 16u; bx = px >> 4; by = py >> 3;\n"
+    "        if ((psm & 8u) != 0u) {\n"
+    "            block = (by & 1u) | (bx & 1u) << 1 | (by & 4u) | (by & 2u) << 2 | (bx & 2u) << 3;\n"
+    "        } else {\n"
+    "            block = (by & 1u) | (bx & 1u) << 1 | (by & 2u) << 1 | (bx & 2u) << 2 | (by & 4u) << 2;\n"
+    "        }\n"
+    "        column = (px & 1u) << 1 | (px & 2u) << 2 | (px & 4u) << 2 | (px & 8u) >> 3 |\n"
+    "                 (py & 1u) << 2 | (py & 6u) << 4;\n"
+    "    } else {\n"
+    "        bx = px >> 3; by = py >> 3;\n"
+    "        block = (bx & 1u) | (by & 1u) << 1 | (bx & 2u) << 1 | (by & 2u) << 2 | (bx & 4u) << 2;\n"
+    "        column = (px & 1u) | (px & 6u) << 1 | (py & 1u) << 1 | (py & 6u) << 3;\n"
+    "        if (psm == 27u || psm == 36u) high = 24u;\n"
+    "        if (psm == 44u) high = 28u;\n"
+    "    }\n"
+    "    block += bp + ((y >> phs) * ((bw << 6) >> pws) + (x >> pws)) * 32u;\n"
+    "    if ((psm & 48u) == 48u) block ^= 24u;\n"
+    "    return (block * 2048u + column * bits + high) & 0x1FFFFFFu;\n"
+    "}\n"
+    "uint convert_word(uint slot, ivec2 xy, bool depth, float unit) {\n"
+    "    if (depth) {\n"
+    "        float d;\n"
+    "        if (slot == 0u) d = load_surface(convert_depth0, xy).r; else if (slot == 1u) d = load_surface(convert_depth1, xy).r;\n"
+    "        else if (slot == 2u) d = load_surface(convert_depth2, xy).r; else d = load_surface(convert_depth3, xy).r;\n"
+    "        return (d >= 1.0) ? 0xFFFFFFFFu : uint(d * unit);\n"
+    "    }\n"
+    "    vec4 c;\n"
+    "    if (slot == 0u) c = load_surface(convert_colour0, xy); else if (slot == 1u) c = load_surface(convert_colour1, xy);\n"
+    "    else if (slot == 2u) c = load_surface(convert_colour2, xy); else c = load_surface(convert_colour3, xy);\n"
+    "    uvec4 u = uvec4(round(c * 255.0));\n"
+    "    return u.r | u.g << 8 | u.b << 16 | u.a << 24;\n"
+    "}\n"
+    "uint convert_half(uint slot, uvec2 origin, uint at, uint scale) {\n"
+    "    uvec2 p = (origin + uvec2(at & 255u, at >> 8)) * scale + scale / 2u;\n"
+    "    uint w = convert_word(slot, ivec2(p), false, 0.0);\n"
+    "    return (w >> 3 & 31u) | (w >> 11 & 31u) << 5 | (w >> 19 & 31u) << 10 | (w >> 31) << 15;\n"
+    "}\n"
+    "void store(uvec2 at, uint rgba) {\n"
+    "    imageStore(native_converted, ivec2(int(at.x), int(convert.size.y) - 1 - int(at.y)),\n"
+    "               vec4(float(rgba & 255u), float(rgba >> 8 & 255u), float(rgba >> 16 & 255u), float(rgba >> 24)) / 255.0);\n"
+    "}\n"
+    "void main() {\n"
+    "    uvec3 tid = gl_GlobalInvocationID;\n"
+    "    if (tid.x >= convert.size.x || tid.y >= convert.size.y) return;\n"
+    "    uint psm = convert.tex.x;\n"
+    "    uint a = address(psm, convert.tex.y, convert.tex.z, tid.x, tid.y);\n"
+    "    uint word = a >> 5;\n"
+    "    uint page = (word >> 11) & 511u;\n"
+    "    uint source = (convert.pages[page >> 4][(page >> 2) & 3u] >> ((page & 3u) * 8u)) & 255u;\n"
+    "    if (source == 0u) { store(tid.xy, load_base(ivec2(tid.xy))); return; }\n"
+    "    uvec4 s = convert.slot[source - 1u];\n"
+    "    uint rel = (page - s.x) & 511u;\n"
+    "    uint bw = s.y;\n"
+    "    uint scale = convert.tex.w >> ((source - 1u) * 8u) & 255u;\n"
+    "    uint value;\n"
+    "    if (s.z == 2u) {\n"
+    "        uvec2 origin = uvec2((rel % bw) * 64u, (rel / bw) * 64u);\n"
+    "        uint half_at = 4096u + (word & 2047u) * 2u;\n"
+    "        value = convert_half(source - 1u, origin, native_inverse[half_at], scale) |\n"
+    "                convert_half(source - 1u, origin, native_inverse[half_at + 1u], scale) << 16;\n"
+    "    } else {\n"
+    "        uint at = native_inverse[((s.z == 1u) ? 2048u : 0u) + (word & 2047u)];\n"
+    "        ivec2 xy = ivec2(int(((rel % bw) * 64u + (at & 255u)) * scale + scale / 2u),\n"
+    "                         int(((rel / bw) * 32u + (at >> 8)) * scale + scale / 2u));\n"
+    "        value = convert_word(source - 1u, xy, s.z == 1u, uintBitsToFloat(s.w));\n"
+    "    }\n"
+    "    uint bits = bits_per_pixel(psm);\n"
+    "    uint texa = convert.size.z;\n"
+    "    value = (value >> (a & 31u)) & ((bits == 32u) ? 0xFFFFFFFFu : ((1u << bits) - 1u));\n"
+    "    uint rgba = value;\n"
+    "    if (bits <= 8u) rgba = convert.palette[value >> 2][value & 3u];\n"
+    "    else if ((psm & 7u) == 2u) {\n"
+    "        uint alpha = ((value & 0x8000u) != 0u) ? (convert.size.w & 255u) : (texa & 255u);\n"
+    "        if ((texa & 0x8000u) != 0u && value == 0u) alpha = 0u;\n"
+    "        rgba = (value & 31u) << 3 | (value & 0x3E0u) << 6 | (value & 0x7C00u) << 9 | alpha << 24;\n"
+    "    } else if ((psm & 7u) == 1u) {\n"
+    "        rgba = (value & 0xFFFFFFu) | (((texa & 0x8000u) != 0u && (value & 0xFFFFFFu) == 0u) ? 0u : (texa & 255u) << 24);\n"
+    "    }\n"
+    "    store(tid.xy, rgba);\n"
+    "}\n";
+
+/* init.rs's inverse_table (native_core.inc's native_inverse_table): for the colour (PSMCT32)
+   and Z (PSMZ32) layouts, the word in a page to the pixel holding it (x | y << 8), colour then
+   Z; then for PSMCT16 (64 x 64 pages), the 16-bit half in a page to its pixel. */
+static void inverse_table(uint32_t inverse[8192])
+{
+    memset(inverse, 0, 8192 * sizeof *inverse);
+    for (uint32_t y = 0; y < 64; y++)
+        for (uint32_t x = 0; x < 64; x++) {
+            uint32_t bx = x / 16, by = y / 8;
+            uint32_t block = (by & 1) | (bx & 1) << 1 | (by & 2) << 1 | (bx & 2) << 2 | (by & 4) << 2;
+            uint32_t column = (x & 1) << 1 | (x & 2) << 2 | (x & 4) << 2 | (x & 8) >> 3 | (y & 1) << 2 | (y & 6) << 4;
+            inverse[4096 + block * 128 + column] = x | y << 8;
+        }
+    for (uint32_t layout = 0; layout < 2; layout++)
+        for (uint32_t y = 0; y < 32; y++)
+            for (uint32_t x = 0; x < 64; x++) {
+                uint32_t bx = x / 8, by = y / 8;
+                uint32_t block = (bx & 1) | (by & 1) << 1 | (bx & 2) << 1 | (by & 2) << 2 | (bx & 4) << 2;
+                uint32_t column = (x & 1) | (x & 6) << 1 | (y & 1) << 1 | (y & 6) << 3;
+                if (layout == 1) block ^= 0x18;   /* PSMZ32: Z's block XOR */
+                inverse[layout * 2048 + ((block * 2048 + column * 32) >> 5 & 2047)] = x | y << 8;
+            }
+}
+
+/* The conversion program and its two buffers, made once. 0 when they could not be. */
+static int ensure_convert(DhdrNative *n)
+{
+    static int failed;
+    if (n->convert_program) return 1;
+    if (failed) return 0;
+    n->convert_program = link_program(NULL, NULL, NULL, convert_source);
+    if (!n->convert_program) { failed = 1; return 0; }
+    static uint32_t inverse[8192];
+    inverse_table(inverse);
+    glGenBuffers(1, &n->convert_inverse);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, n->convert_inverse);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof inverse, inverse, GL_STATIC_DRAW);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    glGenBuffers(1, &n->convert_constants);
+    glBindBuffer(GL_UNIFORM_BUFFER, n->convert_constants);
+    glBufferData(GL_UNIFORM_BUFFER, sizeof(DhdrConvertConstants), NULL, GL_STREAM_DRAW);
+    glBindBuffer(GL_UNIFORM_BUFFER, 0);
+    return 1;
+}
+
+/* native_run_convert (convert.rs's run): conversion i of the picture into its converted texture.
+   The texture (its size in w, h), or 0 when it cannot run: no size, a source surface without a
+   texture, or no program. Leaves texture unit 0 active. */
+static GLuint run_convert(DhdrNative *n, const DhdrPicture *p, int32_t i, uint32_t *w_out, uint32_t *h_out)
+{
+    if (i < 0 || (uint32_t)i >= p->convert_count || i >= CONVERTS || !p->converts) return 0;
+    const DhdrConvert *v = &p->converts[i];
+    uint32_t w = v->constants.size[0], h = v->constants.size[1];
+    if (!w || !h || w > 4096 || h > 4096 || !ensure_convert(n)) return 0;
+    DhdrConvertConstants constants = v->constants;
+    constants.tex[3] = 0;   /* each source's scale, a byte a slot */
+    GLuint colour[4] = { 0 }, depth[4] = { 0 };
+    for (int s = 0; s < 4; s++) {
+        uint32_t scale = 1;
+        int16_t index = v->surface[s];
+        if (index >= 0) {
+            if ((uint32_t)index >= DHDR_NATIVE_SURFACE_COUNT) return 0;
+            NativeSurface *src = &n->surfaces[index];
+            if (!src->texture) return 0;
+            if (src->depth) depth[s] = src->texture; else colour[s] = src->texture;
+            scale = src->scale ? src->scale : 1;
+        }
+        constants.tex[3] |= scale << (s * 8);
+    }
+    if (n->converted[i].texture && (n->converted[i].w != w || n->converted[i].h != h)) {
+        glDeleteTextures(1, &n->converted[i].texture);
+        n->converted[i].texture = 0;
+    }
+    if (!n->converted[i].texture) {
+        glGenTextures(1, &n->converted[i].texture);
+        glBindTexture(GL_TEXTURE_2D, n->converted[i].texture);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, (GLsizei)w, (GLsizei)h);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        n->converted[i].w = w; n->converted[i].h = h;
+    }
+    GLuint base = v->base ? dhdr_tex_gl(v->base) : 0;
+    glBindBuffer(GL_UNIFORM_BUFFER, n->convert_constants);
+    glBufferData(GL_UNIFORM_BUFFER, sizeof constants, &constants, GL_STREAM_DRAW);   /* orphaned */
+    glBindBufferBase(GL_UNIFORM_BUFFER, 0, n->convert_constants);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, n->convert_inverse);
+    glUseProgram(n->convert_program);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, base ? base : dhdr_tex_dummy_texels());
+    for (int s = 0; s < 4; s++) {
+        glActiveTexture(GL_TEXTURE1 + s);
+        glBindTexture(GL_TEXTURE_2D, colour[s] ? colour[s] : dhdr_tex_dummy_rgba());
+        glActiveTexture(GL_TEXTURE5 + s);
+        glBindTexture(GL_TEXTURE_2D, depth[s] ? depth[s] : dhdr_tex_dummy_rgba());
+    }
+    glActiveTexture(GL_TEXTURE0);
+    glBindImageTexture(0, n->converted[i].texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glDispatchCompute((w + 7) / 8, (h + 7) / 8, 1);
+    glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+    *w_out = w; *h_out = h;
+    return n->converted[i].texture;
+}
+
+/* The Z surface a draw tests against (depth_key bit 3 says it has one, native_core.inc), or NULL. */
+static NativeSurface *draw_depth(DhdrNative *n, const DhdrCommand *k)
+{
+    if (k->depth < 0 || (uint32_t)k->depth >= DHDR_NATIVE_SURFACE_COUNT || !(k->depth_key & 8)) return NULL;
+    NativeSurface *d = &n->surfaces[k->depth];
+    return d->texture && d->depth ? d : NULL;
+}
+
+/* A blend on As (SA or ISA on either side): without dual-source blending, two draws. */
+static int blend_uses_as(uint32_t blend_key)
+{
+    uint32_t src = blend_key >> 1 & 31, dst = blend_key >> 6 & 31;
+    return (blend_key & 1) && (src == BLEND_SA || src == BLEND_ISA || dst == BLEND_SA || dst == BLEND_ISA);
+}
+
+/* The reversed triangles (render.rs's draw_passes, arenas.rs's reverse_triangles): the alpha-only
+   second draw of a GREATER-with-writes draw tests EQUAL against the Z its first draw left. Where
+   two of its triangles overlap at the same Z, the first draw kept the earlier one (a later one is
+   not GREATER), but EQUAL lets both through and the later one's alpha would win. Drawn in reverse
+   order, the earlier triangle is drawn last and its alpha is what stays, as in the first draw.
+
+   The reversed copies go after the picture's own vertices (or indices, for an indexed picture) in
+   the same buffer; `reversed_first[i]` is where command i's copy starts, or UINT32_MAX for none. */
+typedef struct Reversed {
+    uint32_t *first;       size_t first_cap;
+    DhdrVertex *vertices;  size_t vertex_cap, vertex_count;
+    uint32_t *indices;     size_t index_cap, index_count;
+    int valid;             /* `first` holds this picture's commands (0: out of memory, none reversed) */
+} Reversed;
+
+static int grow(void **buffer, size_t *cap, size_t want, size_t size)
+{
+    if (want <= *cap) return 1;
+    size_t grown = want + want / 2 + 64;
+    void *b = realloc(*buffer, grown * size);
+    if (!b) return 0;
+    *buffer = b; *cap = grown;
+    return 1;
+}
+
+static void reverse_draws(DhdrNative *n, const DhdrPicture *p, const uint32_t *indices, uint32_t index_count,
+                          Reversed *r)
+{
+    r->vertex_count = r->index_count = 0;
+    r->valid = grow((void **)&r->first, &r->first_cap, p->command_count ? p->command_count : 1, sizeof *r->first);
+    if (!r->valid) return;
+    uint32_t base = indices && index_count ? index_count : p->vertex_count;
+    for (uint32_t i = 0; i < p->command_count; i++) {
+        const DhdrCommand *k = &p->commands[i];
+        r->first[i] = UINT32_MAX;
+        if (k->kind != DHDR_CMD_DRAW || k->count <= 3 || k->count % 3 || !(k->color_mask & 8)) continue;
+        if ((k->depth_key & 7) != (4 | 3) || !blend_uses_as(k->blend_key)) continue;   /* GREATER, writes */
+        if ((uint64_t)k->first + k->count > base || !draw_depth(n, k)) continue;
+        if (indices && index_count) {
+            if (!grow((void **)&r->indices, &r->index_cap, r->index_count + k->count, sizeof *r->indices)) continue;
+            r->first[i] = base + (uint32_t)r->index_count;
+            for (uint32_t t = 0; t < k->count; t += 3)
+                memcpy(&r->indices[r->index_count + t], &indices[k->first + k->count - 3 - t], 3 * sizeof *indices);
+            r->index_count += k->count;
+        } else {
+            if (!grow((void **)&r->vertices, &r->vertex_cap, r->vertex_count + k->count, sizeof *r->vertices)) continue;
+            r->first[i] = base + (uint32_t)r->vertex_count;
+            for (uint32_t t = 0; t < k->count; t += 3)
+                memcpy(&r->vertices[r->vertex_count + t], &p->vertices[k->first + k->count - 3 - t],
+                       3 * sizeof *p->vertices);
+            r->vertex_count += k->count;
+        }
+    }
+}
+
 int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint32_t *indices, uint32_t index_count,
                                 DhdrPictureResult *out)
 {
     memset(out, 0, sizeof *out);
     if (!n || !p || !ensure_gl_objects(n)) return 0;
     int times = gl_times();
-    uint64_t t0 = times ? SDL_GetTicksNS() : 0, t1 = 0, t2 = 0, t3 = 0;
+    /* The phases are always timed (three clock reads a picture), for the slow field line. */
+    uint64_t t0 = SDL_GetTicksNS(), t1 = 0, t2 = 0, t3 = 0;
+    slow_field_check(t0);
+    uint64_t uploads0, upload_ns0, upload_bytes0, alloc_ns0, reused0;
+    dhdr_tex_upload_stats(&uploads0, &upload_ns0, &upload_bytes0);
+    dhdr_tex_upload_split(&alloc_ns0, &reused0);
+    g_cost.start = t0;
     uint64_t program_changes = 0, texture_binds = 0;
     /* Textured draws this renderer still cannot give a texture to, by what it would have
        sampled: a conversion, its own target (or a surface with nothing in it), or a decoded
        texture that would not upload. They come out flat, and these say which to do next. */
     uint64_t flat_convert = 0, flat_surface = 0, flat_other = 0;
-    ensure_buffer(GL_ARRAY_BUFFER, n->vbo, &n->vbo_bytes, (size_t)p->vertex_count * sizeof(DhdrVertex));
-    if (p->vertex_count) glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)((size_t)p->vertex_count * sizeof(DhdrVertex)),
-                                        p->vertices);
+    /* The last conversion run and its texture (run_convert), for a run of draws sampling it. */
+    int32_t last_convert = -1;
+    GLuint converted = 0;
+    uint32_t converted_w = 0, converted_h = 0;
+    uint64_t out_converts = 0;
+    static Reversed reversed;
+    reverse_draws(n, p, indices, index_count, &reversed);
+    size_t vertex_bytes = (size_t)p->vertex_count * sizeof(DhdrVertex);
+    ensure_buffer(GL_ARRAY_BUFFER, n->vbo, &n->vbo_bytes, vertex_bytes + reversed.vertex_count * sizeof(DhdrVertex));
+    if (p->vertex_count) glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)vertex_bytes, p->vertices);
+    if (reversed.vertex_count)
+        glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)vertex_bytes,
+                        (GLsizeiptr)(reversed.vertex_count * sizeof(DhdrVertex)), reversed.vertices);
     if (indices && index_count) {
-        ensure_buffer(GL_ELEMENT_ARRAY_BUFFER, n->ibo, &n->ibo_bytes, (size_t)index_count * sizeof(uint32_t));
-        glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, (GLsizeiptr)((size_t)index_count * sizeof(uint32_t)), indices);
+        size_t index_bytes = (size_t)index_count * sizeof(uint32_t);
+        ensure_buffer(GL_ELEMENT_ARRAY_BUFFER, n->ibo, &n->ibo_bytes, index_bytes + reversed.index_count * sizeof(uint32_t));
+        glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, (GLsizeiptr)index_bytes, indices);
+        if (reversed.index_count)
+            glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, (GLintptr)index_bytes,
+                            (GLsizeiptr)(reversed.index_count * sizeof(uint32_t)), reversed.indices);
     }
     glBindVertexArray(n->vao);
     glEnable(GL_SCISSOR_TEST);
@@ -1135,15 +1769,29 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
     glDisable(GL_BLEND);
     for (uint32_t i = 0; i < p->command_count; i++) {
         const DhdrCommand *k = &p->commands[i];
-        if (k->kind == DHDR_CMD_COPY || k->kind == DHDR_CMD_IMPORT) {
+        if (k->kind == DHDR_CMD_COPY || k->kind == DHDR_CMD_IMPORT || k->kind == DHDR_CMD_ALPHA_UPLOAD) {
             if (k->kind == DHDR_CMD_COPY) copy_surface(n, k, out);
-            else import_pixels(n, k, out);
-            /* Both bind framebuffers of their own and turn the scissor off. */
+            else if (k->kind == DHDR_CMD_IMPORT) import_pixels(n, k, out);
+            else {
+                alpha_upload(n, k);
+                /* It sets the depth test, the blend, the mask and the program its own way. */
+                held_depth.on = 0; held_depth.write = 0;
+                held_blend.on = 0;
+                held_mask = 15;
+                bound_program = 0;
+                bound_texture = 0;
+                glEnable(GL_SCISSOR_TEST);
+            }
+            /* All three bind framebuffers of their own and change the scissor, and may remake
+               the scratch texture a draw sampling its own target left bound. A conversion is run
+               again after them, as render.rs does. */
             bound_fbo = -1;
+            bound_texture = 0;
+            last_convert = -1;
             held_scissor[0] = -1;
             continue;
         }
-        if (k->kind != DHDR_CMD_DRAW || !k->count) continue;   /* ALPHA_UPLOAD is still a no-op */
+        if (k->kind != DHDR_CMD_DRAW || !k->count) continue;
         if (k->target < 0 || (uint32_t)k->target >= DHDR_NATIVE_SURFACE_COUNT) continue;
         NativeSurface *t = &n->surfaces[k->target];
         if (!t->texture || t->depth) continue;
@@ -1155,11 +1803,7 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
         /* The Z this draw tests against (depth_key bit 3 says it has one, native_core.inc), as
            this colour surface's depth attachment. A colour surface keeps the one it was last
            given, so a run of draws sharing a Z attaches it once. */
-        NativeSurface *z = NULL;
-        if (k->depth >= 0 && (uint32_t)k->depth < DHDR_NATIVE_SURFACE_COUNT && (k->depth_key & 8)) {
-            NativeSurface *d = &n->surfaces[k->depth];
-            if (d->texture && d->depth) z = d;
-        }
+        NativeSurface *z = draw_depth(n, k);
         GLuint want_z = z ? z->texture : 0;
         if (t->depth_attached != want_z) {
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, want_z, 0);
@@ -1187,11 +1831,20 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
         GLuint texture = 0, sampler = 0;
         uint32_t tw_texels = 1, th_texels = 1, source_scale = 1;
         if (k->texture_surface >= 0 && (uint32_t)k->texture_surface < DHDR_NATIVE_SURFACE_COUNT &&
-            k->texture_surface != k->target && !(flags & 2048u)) {
+            !(flags & 2048u)) {
             NativeSurface *src = &n->surfaces[k->texture_surface];
             if (src->texture && !src->depth) {
-                key = 0;   /* the float path: another surface's RGBA8, fetched texel by texel */
+                key = 0;   /* the float path: a surface's RGBA8, fetched texel by texel */
                 texture = src->texture;
+                if (k->texture_surface == k->target) {
+                    /* Its own target: reading and writing one texture at once is undefined, so
+                       the part it can reach is copied first (surfaces.rs's sample_target). */
+                    texture = sample_target(n, t, &k->constants, out);
+                    /* sample_target may have remade the scratch texture (a deleted name can come
+                       back for the new one, unbound) and bound its framebuffer. */
+                    bound_fbo = -1;
+                    bound_texture = 0;
+                }
                 tw_texels = src->width; th_texels = src->height;
                 source_scale = src->scale ? src->scale : 1;
             }
@@ -1204,7 +1857,24 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
                    (texture = dhdr_tex_gl(k->texture))) {
             dhdr_tex_size(k->texture, &tw_texels, &th_texels, NULL);
             if (flags & 32u) key |= PROGRAM_BILINEAR;
+        } else if (!(flags & 2048u) && k->texture_surface < 0 && k->convert >= 0) {
+            /* A conversion, run again for each run of draws (render.rs's last_convert rule: the
+               surfaces it reads may have been drawn into since). The float path samples it as
+               it samples a surface. */
+            if (k->convert != last_convert) {
+                converted = run_convert(n, p, k->convert, &converted_w, &converted_h);
+                last_convert = k->convert;
+                bound_program = 0;    /* the compute program, the units 0-8 and the image */
+                bound_texture = 0;
+                if (converted) out_converts++;
+            }
+            if (converted) {
+                key = 0;
+                texture = converted;
+                tw_texels = converted_w; th_texels = converted_h;
+            }
         }
+        if (k->convert < 0) last_convert = -1;
         if (!texture) {
             if (flags & 1u) {   /* what is still missing, so the next round knows which to do */
                 if (k->convert >= 0) flat_convert++;
@@ -1299,9 +1969,10 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
         int blends = (blend_key & 1) != 0;
         GLenum op = blends ? blend_op(blend_key >> 11 & 7) : GL_FUNC_ADD;
         if (blends && !op) continue;   /* operations 6 and 7 have no pipeline in the Rust path either */
-        int uses_as = blends && (src == BLEND_SA || src == BLEND_ISA || dst == BLEND_SA || dst == BLEND_ISA);
+        int uses_as = blend_uses_as(blend_key);
         DepthState zs = { z != NULL, z && (k->depth_key & 4), (uint32_t)(k->depth_key & 3) };
         BlendState bs = { blends, blend_factor(src), blend_factor(dst), op };
+        if (blends && (flags & 4096u)) bs = (BlendState){ 1, GL_DST_COLOR, GL_ONE, GL_FUNC_ADD };
         if (blends && (src == 14 || src == 15 || dst == 14 || dst == 15) &&
             (!held_fix_set || held_fix != k->blend_fix)) {
             float fix = (float)k->blend_fix / 128.0f;   /* all four channels (render.rs set_state) */
@@ -1326,9 +1997,9 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
                 out->draws++;
             }
             if (k->color_mask & 8) {   /* then the alpha channel alone, unblended */
-                /* No write, and EQUAL where the first pass wrote Z. render.rs also reverses the
-                   triangle order for GREATER with writes, so a later triangle at an equal Z loses
-                   as it did in the first pass; that is not done here yet. */
+                /* No write, and EQUAL where the first pass wrote Z; for GREATER with writes in
+                   reverse triangle order (reverse_draws), so a later triangle at an equal Z loses
+                   as it did in the first pass. */
                 DepthState second = { z != NULL, 0,
                                       z ? ((k->depth_key & 4) ? 4u : (uint32_t)(k->depth_key & 3)) : 0u };
                 BlendState none = { 0, GL_ONE, GL_ZERO, GL_FUNC_ADD };
@@ -1336,7 +2007,7 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
                 set_blend(&held_blend, none);
                 set_mask(&held_mask, 8);
                 set_alpha_div(d, 255.0f);
-                issue(indices, index_count, k->first, k->count);
+                issue(indices, index_count, reversed.valid && reversed.first[i] != UINT32_MAX ? reversed.first[i] : k->first, k->count);
                 out->draws++;
                 out->two_pass_draws++;
             }
@@ -1344,14 +2015,32 @@ int dhdr_native_picture_indexed(DhdrNative *n, const DhdrPicture *p, const uint3
     }
     glBindSampler(0, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    if (times) t1 = phase_end(times);
+    t1 = phase_end(times);
     /* Textures released on any thread since the last picture: their GL objects are this
        thread's to delete (textures_gl.h). */
     dhdr_tex_collect();
-    if (times) t2 = phase_end(times);
+    t2 = phase_end(times);
     int shown = p->movie_on ? scan_out_movie(n, p->movie_width, p->movie_height, p->movie) : scan_out(n, p);
+    t3 = phase_end(times);
+    {
+        uint64_t uploads, upload_ns, upload_bytes;
+        dhdr_tex_upload_stats(&uploads, &upload_ns, &upload_bytes);
+        g_cost.uploads = uploads - uploads0;
+        g_cost.upload_ns = upload_ns - upload_ns0;
+        g_cost.upload_bytes = upload_bytes - upload_bytes0;
+        uint64_t alloc_ns, reused;
+        dhdr_tex_upload_split(&alloc_ns, &reused);
+        g_cost.alloc_ns = alloc_ns - alloc_ns0;
+        g_cost.reused = reused - reused0;
+        g_cost.draws_ns = t1 - t0; g_cost.collect_ns = t2 - t1; g_cost.scan_ns = t3 - t2;
+        g_cost.draws = out->draws; g_cost.copies = out->copies; g_cost.imports = out->imports;
+        g_cost.converts = (uint32_t)out_converts;
+        g_cost.end = t3;
+        g_last = g_cost;
+        memset(&g_cost, 0, sizeof g_cost);
+        g_cost_fields++;
+    }
     if (times) {
-        t3 = phase_end(times);
         /* A movie frame is no scanout: its pictures are summed under the form in use anyway. */
         if (report_times(t1 - t0, t3 - t2, t2 - t1, out->draws, program_changes, texture_binds,
                          flat_convert, flat_surface, flat_other, scanout_names[n->scanout_mode]) &&
@@ -1371,11 +2060,21 @@ int dhdr_native_picture(DhdrNative *n, const DhdrPicture *p, DhdrPictureResult *
 
 /* ---- presentation (the display texture into the window, as render_gl.c's exact present) ---- */
 
+static int native_present_draw(DhdrNative *n, const DhdrPresentRect *r);
+
 int dhdr_native_present(DhdrNative *n, DhdrSurface *s, const DhdrPresentRect *r)
 {
     if (!n || !s || !r) return -1;
     if (!r->window_w || !r->window_h) return 0;
     if (!dhdr_gl_make_current(s)) return -1;
+    g_last.present_began = SDL_GetTicksNS();
+    int shown = native_present_draw(n, r);
+    g_last.present_ended = SDL_GetTicksNS();
+    return shown;
+}
+
+static int native_present_draw(DhdrNative *n, const DhdrPresentRect *r)
+{
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, (GLsizei)r->window_w, (GLsizei)r->window_h);
@@ -1423,9 +2122,112 @@ int dhdr_native_read_finish(DhdrNative *n, uint32_t *pixels)
     return 1;
 }
 
-/* ---- the Z probe (finding 097): not supported before step 3's depth surfaces ---- */
+/* ---- the Z probe (finding 097, zread.rs) ----
+
+   The game reads a small patch of its Z buffer every field to hide the lens flare behind the
+   scenery. After a picture, native_core asks for the patch (at most 64 x 64 GS pixels, each the
+   texel at the centre of its scaled block) from the Z surface just drawn; a compute pass copies
+   it into a buffer and a fence marks the end. A later picture takes the newest copy whose fence
+   has passed (never waiting), so the answer is a field or two late, as on every other target.
+   The words are depth32float bit patterns, which native_core turns into GS Z.
+
+   The Y flip: a surface texture holds the GS picture upside down (native_vertex), so GS row y is
+   texture row (height - 1 - y). */
+static const char *zread_source =
+    "#version 430 core\n"
+    "layout(local_size_x = 8, local_size_y = 8) in;\n"
+    "layout(binding = 0) uniform sampler2D zsource;\n"
+    "layout(std430, binding = 0) writeonly buffer ZOut { uint words[]; };\n"
+    "uniform uvec4 rect;\n"     /* x, y, w, h in GS pixels */
+    "uniform uint zscale;\n"
+    "void main() {\n"
+    "    uvec2 id = gl_GlobalInvocationID.xy;\n"
+    "    if (id.x >= rect.z || id.y >= rect.w) return;\n"
+    "    uvec2 p = (rect.xy + id) * zscale + zscale / 2u;\n"
+    "    int rows = textureSize(zsource, 0).y;\n"
+    "    float d = texelFetch(zsource, ivec2(int(p.x), rows - 1 - int(p.y)), 0).r;\n"
+    "    words[id.y * rect.z + id.x] = floatBitsToUint(d);\n"
+    "}\n";
+
+/* The probe's program, made once (prelink_programs makes it at start-up). */
+static int ensure_zread(DhdrNative *n)
+{
+    static int failed;
+    if (n->zread_program) return 1;
+    if (failed) return 0;
+    n->zread_program = link_program(NULL, NULL, NULL, zread_source);
+    if (!n->zread_program) { failed = 1; return 0; }
+    n->zread_rect = glGetUniformLocation(n->zread_program, "rect");
+    n->zread_scale = glGetUniformLocation(n->zread_program, "zscale");
+    return 1;
+}
 
 int dhdr_native_zread_start(DhdrNative *n, uint32_t index, const uint32_t rect[4], uint64_t tag)
-{ (void)n; (void)index; (void)rect; (void)tag; return 0; }
+{
+    if (!n || index >= DHDR_NATIVE_SURFACE_COUNT || !rect || !n->ready) return 0;
+    NativeSurface *s = &n->surfaces[index];
+    if (!s->texture || !s->depth) return 0;
+    uint32_t scale = s->scale ? s->scale : 1;
+    uint32_t cols = s->width / scale, rows = s->height / scale;
+    uint32_t x = rect[0], y = rect[1], w = rect[2], h = rect[3];
+    if (x >= cols || y >= rows) return 0;
+    if (w > ZREAD_MAX) w = ZREAD_MAX;
+    if (h > ZREAD_MAX) h = ZREAD_MAX;
+    if (w > cols - x) w = cols - x;
+    if (h > rows - y) h = rows - y;
+    if (!w || !h) return 0;
+    if (!ensure_zread(n)) return 0;
+    int slot = -1;
+    for (int i = 0; i < ZREAD_SLOTS && slot < 0; i++)
+        if (!n->zslots[i].fence) slot = i;
+    if (slot < 0) return 0;   /* three copies in flight: this field's probe is skipped */
+    if (!n->zslots[slot].buffer) {
+        glGenBuffers(1, &n->zslots[slot].buffer);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, n->zslots[slot].buffer);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, ZREAD_MAX * ZREAD_MAX * 4, NULL, GL_STREAM_READ);
+    }
+    glUseProgram(n->zread_program);
+    glUniform4ui(n->zread_rect, x, y, w, h);
+    glUniform1ui(n->zread_scale, scale);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s->texture);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, n->zslots[slot].buffer);
+    glDispatchCompute((w + 7) / 8, (h + 7) / 8, 1);
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, 0);
+    n->zslots[slot].fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    n->zslots[slot].rect[0] = x; n->zslots[slot].rect[1] = y;
+    n->zslots[slot].rect[2] = w; n->zslots[slot].rect[3] = h;
+    n->zslots[slot].tag = tag;
+    return 1;
+}
+
 int dhdr_native_zread_take(DhdrNative *n, uint32_t *out, uint32_t cap, uint32_t rect_out[4], uint64_t *tag_out)
-{ (void)n; (void)out; (void)cap; (void)rect_out; (void)tag_out; return 0; }
+{
+    if (!n || !n->ready) return 0;
+    int done[ZREAD_SLOTS] = { 0 }, newest = -1;
+    for (int i = 0; i < ZREAD_SLOTS; i++) {
+        if (!n->zslots[i].fence) continue;
+        GLenum state = glClientWaitSync(n->zslots[i].fence, 0, 0);
+        done[i] = state == GL_ALREADY_SIGNALED || state == GL_CONDITION_SATISFIED;
+        if (done[i] && (newest < 0 || n->zslots[i].tag > n->zslots[newest].tag)) newest = i;
+    }
+    if (newest < 0) return 0;
+    int taken = 0;
+    uint32_t count = n->zslots[newest].rect[2] * n->zslots[newest].rect[3];
+    if (out && count <= cap) {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, n->zslots[newest].buffer);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)count * 4, out);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        memcpy(rect_out, n->zslots[newest].rect, sizeof n->zslots[newest].rect);
+        *tag_out = n->zslots[newest].tag;
+        taken = 1;
+    }
+    /* The newest and every older finished copy are used up. */
+    for (int i = 0; i < ZREAD_SLOTS; i++)
+        if (done[i] && n->zslots[i].tag <= n->zslots[newest].tag) {
+            glDeleteSync(n->zslots[i].fence);
+            n->zslots[i].fence = 0;
+        }
+    return taken;
+}

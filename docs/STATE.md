@@ -542,9 +542,10 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   surface's framebuffer, the vertex stage maps WebGPU's [0, 1] clip Z onto OpenGL's [-1, 1]
   (`glClipControl` is core only in 4.5), a new depth surface clears to zero because the GS tests
   GREATER against it, and a draw blending on As is split in two, since this device offers no
-  dual-source blending. Left: sampling a surface or a conversion (such a draw still comes out
-  flat), the texture copies, the Z probe, and the reversed triangle order the alpha pass of a
-  GREATER-with-writes draw wants. PNG is still a refusal
+  dual-source blending. Since then (finding 145): sampling a surface (its own target through a
+  copy) and conversions, the texture copies and ALPHA_UPLOAD, the Z probe, and the reversed
+  triangle order the alpha pass of a GREATER-with-writes draw wants; nothing listed is left.
+  PNG was then still a refusal
   (`render_stubs.c`), so texture packs and the button icons do not load; the sharp font, which
   is no PNG, does.
 - **NX3, speed (measured, in progress).** `DHD_GL_TIMES` (render_native.c) prints the render
@@ -609,6 +610,19 @@ seven at 4.9 GB); with it a change under `port/switch/` is 61 hits and one miss,
   at scale 2 fell from 25-26 to 17-20 fields/s, `limit=cpu:gs` with gs 43-57 ms busy: at scale 2
   the native renderer is 37 ms a field, and the map shares its core with gs. The map was chosen
   from scale 1 (renderer 3-4 ms); it stays off by default.
+- **NX3, the long fields (measured; the renderer's part done but one).** Finding 145. Any
+  render-thread cycle over `DHD_SLOW_FIELD_MS` (50) logs where it went, ending in the culprit.
+  On hardware the 124-242 ms fields are the **CPU threads** (the render thread waited that long
+  for a field, its picture under 1 ms). The renderer's own were program links inside a field
+  (every program is now linked and drawn with at start-up, 27 in 1.56 s;
+  `DHD_SWITCH_PRELINK = 0` undoes it) and texture uploads at a race's load. Released textures'
+  GL objects are pooled and the pixels go through an unpack ring (`DHD_SWITCH_UPLOAD = direct`
+  undoes it). Measured, same track, against the main build of that day (whose CPU side differed
+  and which ran with the profiler on): race 41.6 -> 43.3 fields/s, max 236 -> 191 ms. Left: four
+  fields of 60-102 ms in a five-minute session, each 2-10 MiB of new textures at a race's load,
+  which only an upload thread with a shared GL context would take off the render thread. The
+  one approximated blend the game uses, `(Cd - 0) * As + Cd`, is now exact on Switch (flag
+  4096, DstColor, One); the player reports particles, smoke and power-ups drawn properly.
 - **EXIT GAME's crash (fixed).** Atmosphère's crash report: SDL's main thread in
   `SWITCH_PollTouch -> hidGetTouchScreenStates -> diagAbortWithResult` (2345-0008).
   `gs_pump_messages` calls `exit(0)` from the game thread with every other thread still running,

@@ -40,6 +40,10 @@ void dhdr_tex_collect(void);
 /* What the uploads have cost so far (DHD_GL_TIMES): how many, their nanoseconds and their bytes. */
 void dhdr_tex_upload_stats(uint64_t *count, uint64_t *ns, uint64_t *bytes);
 
+/* Of that: the nanoseconds spent making new GL textures, and the uploads that reused a pooled
+   one (a released texture's GL object of the same kind and size) instead. */
+void dhdr_tex_upload_split(uint64_t *alloc_ns, uint64_t *reused);
+
 /* Every GL object textures.c owns (the dead list drained first), for surface teardown. */
 void dhdr_tex_shutdown(void);
 
