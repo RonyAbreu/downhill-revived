@@ -85,7 +85,7 @@ def generate(destination, early_flags=True):
             'u->mac=m;u->status=(u->status&~15u)|st|(st<<6);u->lazy_valid=0;}',
             'else if(up->flags==2){u->clip=u->clip_next=((u->clip<<6)|up->clip_bits)&0xffffff;}',
             'up->flags=0;commit_upper(u,up,0);}',
-            'static inline __attribute__((always_inline)) unsigned native_clip_impl(Vu *u, unsigned resume, int sticky_complete, ps2_q128 *data) {','unsigned count=0; int target=-1,bad=0; Upper up;','goto L1948;']
+            'static inline __attribute__((always_inline)) unsigned native_clip_impl(Vu *restrict u, unsigned resume, int sticky_complete, ps2_q128 *data) {','unsigned count=0; int target=-1,bad=0; Upper up;','goto L1948;']
     def emit(pc):
         lo,hi=pairs[pc]
         out=[f'VU1(u); {stalls[pc]} apply_flags(u); update_q(u);',
@@ -127,8 +127,19 @@ def generate(destination, early_flags=True):
             '   Return drains flags/Q; the caller again advances 64 cycles before',
             '   interpreted/AOT code can observe the frame. Keep expired times in',
             '   the caller instead of copying the ready arrays and empty queue.',
-            '   The code-word guard and the assertions above bound this proof. */',
-            'Vu local;',
+            '   The code-word guard and the assertions above bound this proof.',
+            '   The frame keeps its ready times from call to call (clearing their',
+            '   512 bytes was about a fifth of this routine): each is at most',
+            '   the cycle it ended at + 4 (an FMAC result), so while the cycle of',
+            '   the caller has reached that bound every one has expired, as zeroed',
+            '   ones had. That cycle only grows within a run, and a run starts',
+            '   64 past the last (run_state), so the clear is left to the rare call',
+            '   that restarts the cycle at 0 or meets a frame that gave up early.',
+            '   restrict restates that the frame is private, as a local was. */',
+            'static _Thread_local Vu frame; static _Thread_local uint32_t frame_expired;',
+            'if (u->cycle < frame_expired) memset(frame.component_ready, 0, sizeof frame.component_ready);',
+            'Vu *restrict const local_ = &frame;',
+            '#define local (*local_)',
             'local.c = u->c; local.cycle = u->cycle; local.unit = 1;',
             'local.code_mask = u->code_mask; local.data_mask = u->data_mask;',
             'local.top = u->top; local.itop = u->itop; local.kick = u->kick; local.opaque = u->opaque;',
@@ -138,7 +149,6 @@ def generate(destination, early_flags=True):
             'local.vi_previous_reg = local.vi_previous_value = local.vi_written_at = local.vu1_used = 0;',
             'local.lazy_sign = local.lazy_zero = _mm_setzero_si128();',
             'local.lazy_valid = local.lazy_used = 0;',
-            'memset(local.component_ready, 0, sizeof local.component_ready);',
             'ps2_q128 *data = u->c->vu0_mem; if (!data) __builtin_unreachable();',
             'unsigned count = (local.status & 0xc0) == 0xc0 ? native_clip_impl(&local, resume, 1, data)',
             '                                               : native_clip_impl(&local, resume, 0, data);',
@@ -148,5 +158,7 @@ def generate(destination, early_flags=True):
             'u->n_flags = local.n_flags; u->flag_head = local.flag_head;',
             'u->vi_previous_reg = local.vi_previous_reg; u->vi_previous_value = local.vi_previous_value; u->vi_written_at = local.vi_written_at;',
             'u->lazy_sign = local.lazy_sign; u->lazy_zero = local.lazy_zero; u->lazy_valid = local.lazy_valid; u->lazy_used = local.lazy_used;',
+            'frame_expired = local.cycle + 4;',
+            '#undef local',
             'return count;','}']
     destination.write_text('\n'.join(lines)+'\n')
