@@ -10,6 +10,10 @@ build image, or name another one with DHD_ADDR2LINE. By default it runs addr2lin
 For each thread: its samples, the share in kernel waits (the svc stubs a waiting thread sits
 in), then the top functions by self samples (the innermost frame, inlined ones included) and by
 the function the sample is in once inlining is undone (the outermost frame at that address).
+
+Then each window (finding 145): a slow field the renderer logged with `[profile window N]`, what
+every thread did over that field alone -- its top functions, and for a waiting sample the calls
+it waits under. `--windows` prints only those.
 """
 import argparse
 import collections
@@ -23,6 +27,7 @@ WAITS = ('svcWait', 'svcArbitrate', 'svcSleepThread', 'svcReplyAndReceive', 'svc
 
 def load(path):
     threads, rows, pairs, waits, header = {}, [], [], [], ''
+    windows = {}   # id -> (ms, samples, [(thread, pc, lr, up1, up2, count)])
     for line in Path(path).read_text().splitlines():
         if line.startswith('#'):
             header = line
@@ -34,11 +39,15 @@ def load(path):
             rows.append(('self', parts[1], int(parts[2], 16), int(parts[4])))
             rows.append(('caller', parts[1], int(parts[3], 16), int(parts[4])))
             pairs.append((parts[1], int(parts[2], 16), int(parts[3], 16), int(parts[4])))
+        elif parts[0] == 'window':   # id, ms, samples
+            windows[int(parts[1])] = (float(parts[2]), int(parts[3]), [])
+        elif parts[0] == 'ws':   # window, thread, PC, LR, up1, up2, count
+            windows[int(parts[1])][2].append((parts[2], *(int(x, 16) for x in parts[3:7]), int(parts[7])))
         elif parts[0] == 'wait':   # thread, count, return addresses (innermost first)
             waits.append((parts[1], int(parts[2]), [int(x, 16) for x in parts[3:]]))
         elif parts[0] in ('self', 'caller'):   # the first form: PC and LR counted apart
             rows.append((parts[0], parts[1], int(parts[2], 16), int(parts[3])))
-    return header, threads, rows, pairs, waits
+    return header, threads, rows, pairs, waits, windows
 
 
 def symbolize(elf, addresses):
@@ -75,11 +84,47 @@ def main():
     ap.add_argument('elf')
     ap.add_argument('--top', type=int, default=40)
     ap.add_argument('--callers', type=int, default=20, help='top self functions to list callers for')
+    ap.add_argument('--windows', action='store_true', help='only the slow-field windows')
     args = ap.parse_args()
-    header, threads, rows, pairs, waits = load(args.profile)
+    header, threads, rows, pairs, waits, windows = load(args.profile)
     frames = symbolize(args.elf, {a for _, _, a, _ in rows if a < 0xFFFFFFF} |
-                       {a for _, _, stack in waits for a in stack if 0 < a < 0xFFFFFFF})
+                       {a for _, _, stack in waits for a in stack if 0 < a < 0xFFFFFFF} |
+                       {a for _, _, entries in windows.values() for e in entries for a in e[1:5] if 0 < a < 0xFFFFFFF})
     print(header)
+    if not args.windows:
+        report_threads(args, threads, rows, pairs, waits, frames)
+    report_windows(windows, frames)
+
+
+def name_of(frames, a, outer=False):
+    f = frames.get(a, [('?? (outside the module)', '??')])
+    return f[-1][0] if outer else f[0][0]
+
+
+def report_windows(windows, frames, top=6):
+    """Each slow field's window: per thread, where its samples were."""
+    for wid, (ms, samples, entries) in sorted(windows.items()):
+        print(f'\n== window {wid}: {ms:.1f} ms, {samples} samples')
+        by_thread = collections.defaultdict(list)
+        for t, pc, lr, up1, up2, c in entries:
+            by_thread[t].append((pc, lr, up1, up2, c))
+        for t, items in sorted(by_thread.items(), key=lambda kv: -sum(i[4] for i in kv[1])):
+            total = sum(i[4] for i in items) or 1
+            work, waiting = collections.Counter(), collections.Counter()
+            for pc, lr, up1, up2, c in items:
+                name = name_of(frames, pc)
+                if any(name.startswith(w) for w in WAITS):
+                    chain = ' <- '.join(name_of(frames, a, True) for a in (lr, up1, up2) if a)
+                    waiting[f'{name} <- {chain}'] += c
+                else:
+                    work[f'{name} <- {name_of(frames, lr, True)}'] += c
+            print(f'-- {t}: {total} samples, {100 * sum(waiting.values()) / total:.0f}% waiting')
+            for label, counter in (('run', work), ('wait', waiting)):
+                for what, c in counter.most_common(top):
+                    print(f'   {label} {100 * c / total:5.1f}%  {what}')
+
+
+def report_threads(args, threads, rows, pairs, waits, frames):
     for thread, (samples, failed) in threads.items():
         mine = [(k, a, c) for k, t, a, c in rows if t == thread]
         self_rows = [(a, c) for k, a, c in mine if k == 'self']
