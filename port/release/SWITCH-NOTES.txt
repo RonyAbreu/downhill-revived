@@ -59,16 +59,15 @@ What works
 ----------
 
 The game and its menus, the opening movies, sound, the pads, memory cards (saves go in a
-saves/ folder beside dhd.nro), rumble, and EXIT GAME back to the Homebrew Menu.
+saves/ folder beside dhd.nro), rumble, and EXIT GAME back to the Homebrew Menu, from which
+the game can be started again.
 
 
 Known problems
 --------------
 
-* Starting the game a second time from the Homebrew Menu, right after EXIT GAME, can
-  crash. Until that is fixed: after EXIT GAME, go back to the HOME menu and start the
-  Homebrew Menu again (holding R on a game) before you launch Downhill Switch again.
-* Your rider's shadow can show flat (one plain colour) for part of a race, then come back.
+* Your rider's shadow has been seen flat (one plain colour) for part of a race, then
+  back to normal. It does not happen every time.
 * Races do not reach 60 frames a second: the Switch's three cores are nearly full.
   The first fields after a race starts can stutter while the track loads.
 * Online play is off on the Switch, as it is on phones.
