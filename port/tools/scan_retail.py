@@ -38,10 +38,19 @@ SOURCE = [
     (0x298B45, 283, 'src/unsorted/0021F400.c: IOP module paths (cdrom0:\\MOD\\...), from the NULs before them'),
     (0x2995B4, 2052, 'src/unsorted/00234F38.c: the CRC-32 table, computed by clang from the loop'),
 ]
-# Public tables of a standard that the game's libraries and the port's both carry, with the zero
-# fill the run can take in on either side. The bytes of a linked library are allowed already
-# (package_release.game_data_runs), but there the linker's padding around the table differs.
+# Public tables of a standard, or of a free library, that the game's libraries and the port's both
+# carry, with the zero fill the run can take in on either side. The bytes of a linked library are
+# allowed already (package_release.game_data_runs), but there the linker's padding around the table
+# differs, and a statically linked C library (the Switch's newlib) is not given to it.
 PUBLIC = [
+    (0x2994B5, 67, "DEFLATE's length base table (RFC 1951; 3, 4, 5 ... 258, 0, 0 as 16-bit words, 62 bytes "
+                   "at 0x2994B8: zlib's inftrees.c lbase) of the game's zlib, with the zero fill before it; "
+                   "the Switch build's zlib (devkitPro's portlibs libz.a, under libpng, finding 144) has the "
+                   "same"),
+    (0x29A968, 920, "fdlibm's float argument reduction tables (e_rem_pio2f.c, under sinf/cosf/tanf) of the "
+                    "game's libm: two_over_pi, 2/pi eight bits per 32-bit word (198 words, 792 bytes), then "
+                    "npio2_hw, the high words of n*pi/2 for n = 1 ... 32 (128 bytes at 0x29AC80); newlib's "
+                    "libm, linked statically into the Switch build (devkitA64), has both"),
     (0x299535, 71, "DEFLATE's distance base table (RFC 1951; 1, 2, 3, 4, 5, 7 ... 24577 as 16-bit words, "
                    "60 bytes at 0x299538) of the game's zlib; the png crate's inflater (texture packs, "
                    "finding 057) has the same table"),
