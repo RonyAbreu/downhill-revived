@@ -83,6 +83,9 @@ static struct {
     SDL_Mutex *lock;
     SDL_Condition *wake;
     SDL_Condition *done;               /* a loader finished an entry (READY or FAILED) */
+    SDL_Thread *loaders[PACK_LOADERS]; /* kept for texpack_halt (the Switch's exit) */
+    int quit;                          /* under lock: the loaders end (texpack_halt) */
+    atomic_int loaders_ended;
     int64_t wait_us;                   /* waiting left this field (set at vsync, GS worker spends it) */
     uint64_t waits, waited_us, wait_misses;
     TexPackEntry **queue;              /* a ring one longer than the index: each entry is queued once at most */
@@ -322,7 +325,12 @@ static int SDLCALL pack_loader(void *argument)
     SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_LOW);
     for (;;) {
         SDL_LockMutex(pack.lock);
-        while (pack.head == pack.tail) SDL_WaitCondition(pack.wake, pack.lock);
+        while (pack.head == pack.tail && !pack.quit) SDL_WaitCondition(pack.wake, pack.lock);
+        if (pack.quit) {
+            SDL_UnlockMutex(pack.lock);
+            atomic_fetch_add(&pack.loaders_ended, 1);
+            return 0;
+        }
         TexPackEntry *e = pack.queue[pack.head];
         pack.head = (pack.head + 1) % (pack.count + 1);
         SDL_UnlockMutex(pack.lock);
@@ -341,6 +349,23 @@ static int SDLCALL pack_loader(void *argument)
         SDL_BroadcastCondition(pack.done);
         SDL_UnlockMutex(pack.lock);
     }
+}
+
+void texpack_halt(unsigned ms)
+{
+    if (!pack.lock) return;
+    SDL_LockMutex(pack.lock);
+    pack.quit = 1;
+    SDL_BroadcastCondition(pack.wake);
+    SDL_UnlockMutex(pack.lock);
+    for (unsigned waited = 0; waited <= ms && atomic_load(&pack.loaders_ended) < PACK_LOADERS; waited++)
+        SDL_Delay(1);
+    if (atomic_load(&pack.loaders_ended) < PACK_LOADERS) {
+        fprintf(stderr, "textures: a loader is still loading at the exit\n");
+        return;
+    }
+    for (unsigned i = 0; i < PACK_LOADERS; i++)
+        if (pack.loaders[i]) SDL_WaitThread(pack.loaders[i], NULL), pack.loaders[i] = NULL;
 }
 
 /* ---- opening ---- */
@@ -393,7 +418,7 @@ int texpack_open(const ReplaceDevice *device, uint64_t video_memory)
     pack.lock = SDL_CreateMutex();
     pack.wake = SDL_CreateCondition();
     pack.done = SDL_CreateCondition();
-    for (unsigned i = 0; i < PACK_LOADERS; i++) SDL_DetachThread(SDL_CreateThread(pack_loader, "texpack", NULL));
+    for (unsigned i = 0; i < PACK_LOADERS; i++) pack.loaders[i] = SDL_CreateThread(pack_loader, "texpack", NULL);
     const char *log = host_getenv("DHD_TEXTURE_PACK_LOG");
     if (log && *log && (pack.log = fopen(log, "w")))
         fputs("field,psm,width,height,name,found,with_mips\n", pack.log);

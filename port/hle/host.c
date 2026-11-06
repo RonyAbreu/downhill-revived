@@ -614,14 +614,21 @@ static uint32_t freeze_word(uint32_t ee)
    libnx returns to the Homebrew Menu, which runs in this same process (port/host/switch_main.c);
    elsewhere it simply lasts as long as the process. */
 static SDL_Semaphore *freeze_stop;
+static SDL_Thread *freeze_thread;   /* kept, not detached: joined by host_freeze_watch_stop */
 static int freeze_ended;
 
+/* Joined once it has ended: on the Switch a thread nobody joins keeps its kernel thread (libnx
+   has no pthread_detach), which the exit's census lists (finding 170). */
 void host_freeze_watch_stop(unsigned ms)
 {
     if (!freeze_stop) return;
     SDL_SignalSemaphore(freeze_stop);
     for (unsigned waited = 0; waited <= ms && !__atomic_load_n(&freeze_ended, __ATOMIC_ACQUIRE); waited++)
         SDL_Delay(1);
+    if (freeze_thread && __atomic_load_n(&freeze_ended, __ATOMIC_ACQUIRE)) {
+        SDL_WaitThread(freeze_thread, NULL);
+        freeze_thread = NULL;
+    }
 }
 
 static int SDLCALL freeze_watch(void *unused)
@@ -631,6 +638,7 @@ static int SDLCALL freeze_watch(void *unused)
     unsigned still = 0;
     int armed = 0;
     (void)unused;
+    host_thread_name("freeze watch");
     for (;;) {
         if (SDL_WaitSemaphoreTimeout(freeze_stop, 1000)) {   /* told to end (a second's wait otherwise) */
             __atomic_store_n(&freeze_ended, 1, __ATOMIC_RELEASE);
@@ -851,7 +859,7 @@ void host_init(void)
         SDL_WaitThread(SDL_CreateThread(watch_arm, "watch", NULL), NULL);
     if (dump) SDL_DetachThread(SDL_CreateThread(watchdog, "watchdog", (void *)(uintptr_t)atoi(dump)));
     freeze_stop = SDL_CreateSemaphore(0);
-    if (freeze_stop) SDL_DetachThread(SDL_CreateThread(freeze_watch, "freeze watch", NULL));
+    if (freeze_stop) freeze_thread = SDL_CreateThread(freeze_watch, "freeze watch", NULL);
 }
 
 #ifdef __SWITCH__

@@ -79,9 +79,12 @@ static int applet_mode_refused(void)
    the Homebrew Menu, loaded into this same process. Every thread of ours has to be gone by
    then -- the crash reports of the next try were sphaira's (the menu), one of them a thread with
    our worker's stack size running code that was no longer mapped. The game thread ends itself
-   (switch_quit); the main thread, which pumps SDL's events, exits (so nothing reads HID
-   afterwards); the exit handlers join the VU and GS workers (graphics_shutdown) and the clock
-   keeper; the last one here ends the render thread (gs_native_halt) and SDL's audio thread.
+   (switch_quit) and the main thread, which pumps SDL's events, joins it and exits (so nothing
+   reads HID afterwards); the exit handlers join the VU and GS workers (graphics_shutdown) and the
+   clock keeper; the last one here ends and joins the texture pack's loaders, any job thread, the
+   render thread (gs_native_halt), the freeze watch and SDL's audio thread. Joined, not merely
+   ended: libnx has no pthread_detach, and a thread nobody joins keeps its kernel thread and its
+   stack's mapping into the menu's turn (finding 170).
    DHD_SWITCH_EXIT = kernel keeps the svcExitProcess ending, for comparing. */
 static volatile int quit_asked;
 
@@ -105,11 +108,35 @@ static void switch_exit_now(void)
     int gs_native_halt(unsigned ms);   /* port/gs/native_core.inc */
     void host_freeze_watch_stop(unsigned ms);   /* port/hle/host.c: a thread waking every second */
     void switch_profile_stop(const char *dir);   /* port/switch/profile.c */
+    void texpack_halt(unsigned ms);   /* port/gs/texpack.c: its loaders */
+    int host_jobs_join(unsigned ms);   /* port/host/host_sdl.c: host_thread_detach's jobs */
     switch_profile_stop(dir);
+    texpack_halt(1000);   /* before the render thread: a loader may be making a texture */
+    if (host_jobs_join(1000)) fprintf(stderr, "switch: a job thread is still running at the exit\n");
     int halted = gs_native_halt(1000);
     host_freeze_watch_stop(1500);
-    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    /* the clock keeper is an SDL thread: joined before SDL_Quit, which leaves every SDL_Thread
+       invalid and SDL_WaitThread a no-op (the census then still listed "clocks") */
     switch_shutdown();
+    if (halted) {
+        /* SDL's video too: its EGL display terminated, which ends Mesa's nouveau device and with it
+           nvdrv. Left open, nvdrv keeps the 8 MiB transfer memory nvInitialize gave it, and those
+           heap pages stay inaccessible after the return: the next program the loader starts here
+           with the same heap -- dhd.nro again -- faulted zeroing its own transfer memory at the
+           same address (finding 170). */
+        SDL_Quit();
+        int closed = 0;
+        while (serviceIsActive(nvGetServiceSession()) && closed < 16) nvExit(), closed++;
+        if (closed) fprintf(stderr, "switch: nvdrv was still open after SDL_Quit (closed %d time%s)\n",
+                            closed, closed == 1 ? "" : "s");
+    } else {
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);   /* the render thread may still be drawing: video stays */
+    }
+    /* every thread that could touch guest memory is gone: its stack region mappings go back */
+    void host64_switch_memory_release(void);   /* port/host64/guest_memory_switch.c */
+    if (halted) host64_switch_memory_release();
+    void host64_switch_heap_report(void);   /* what is left held in the heap the next program gets */
+    host64_switch_heap_report();
     int switch_thread_census(unsigned ms);   /* port/switch/clocks.c */
     switch_thread_census(1000);
     const char *how = getenv("DHD_SWITCH_EXIT");

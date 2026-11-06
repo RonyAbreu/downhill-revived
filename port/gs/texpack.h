@@ -25,6 +25,10 @@ TexPackEntry *texpack_find(const Gs *g, unsigned ctxt);
    (once). It stays valid for at least 8 fields after the last call that returned it. */
 void *texpack_view(TexPackEntry *e, uint64_t field);
 
+/* The loaders told to end, and joined once they have, waiting up to ms (the Switch's exit, where
+   no thread may outlive the return to the Homebrew Menu: finding 170). Safe without a pack. */
+void texpack_halt(unsigned ms);
+
 /* Once a field (GS worker): replacements over the memory budget that no recent field drew are
    released. */
 void texpack_field(uint64_t field);
