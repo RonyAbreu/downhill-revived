@@ -130,16 +130,56 @@ void host_wait_wall(double seconds)
 }
 
 /* ---- threads: a fire-and-forget job (online_menu.c, the async services) ---- */
+/* On the Switch a job is not detached but kept, and joined once it has finished (at the next job,
+   or at the exit: host_jobs_join): libnx has no pthread_detach, so a detached thread's kernel
+   thread outlives it, into the Homebrew Menu that runs in this same process next (finding 146). */
+#ifdef __SWITCH__
+enum { JOBS_MAX = 8 };
+static struct {
+    SDL_Thread *thread;
+    SDL_AtomicInt done;
+} jobs[JOBS_MAX];
+
+static void jobs_reap(void)
+{
+    for (int i = 0; i < JOBS_MAX; i++)
+        if (jobs[i].thread && SDL_GetAtomicInt(&jobs[i].done)) {
+            SDL_WaitThread(jobs[i].thread, NULL);
+            jobs[i].thread = NULL;
+        }
+}
+
+/* The Switch's exit: waits up to ms for the jobs still running, then joins the finished ones;
+   returns how many are still running. */
+int host_jobs_join(unsigned ms)
+{
+    int running = 0;
+    for (unsigned waited = 0;; waited++) {
+        running = 0;
+        for (int i = 0; i < JOBS_MAX; i++) running += jobs[i].thread && !SDL_GetAtomicInt(&jobs[i].done);
+        if (!running || waited >= ms) break;
+        SDL_Delay(1);
+    }
+    jobs_reap();
+    return running;
+}
+#endif
+
 typedef struct {
     void (*fn)(void *);
     void *arg;
+    SDL_AtomicInt *done;   /* the Switch's: set when fn has returned */
 } DetachedStart;
 
 static int detached_run(void *p)
 {
     DetachedStart start = *(DetachedStart *)p;
     free(p);
+#ifdef __SWITCH__
+    host_thread_name("job");
+#endif
     start.fn(start.arg);
+    if (start.done) SDL_SetAtomicInt(start.done, 1);
     return 0;
 }
 
@@ -150,12 +190,28 @@ int host_thread_detach(void (*fn)(void *), void *arg)
     if (!start) return 0;
     start->fn = fn;
     start->arg = arg;
+    start->done = NULL;
+#ifdef __SWITCH__
+    jobs_reap();
+    int slot = 0;
+    while (slot < JOBS_MAX && jobs[slot].thread) slot++;
+    if (slot == JOBS_MAX) {
+        free(start);
+        return 0;
+    }
+    SDL_SetAtomicInt(&jobs[slot].done, 0);
+    start->done = &jobs[slot].done;
+#endif
     t = SDL_CreateThread(detached_run, "job", start);
     if (!t) {
         free(start);
         return 0;
     }
+#ifdef __SWITCH__
+    jobs[slot].thread = t;
+#else
     SDL_DetachThread(t);
+#endif
     return 1;
 }
 

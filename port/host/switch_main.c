@@ -77,9 +77,12 @@ static int applet_mode_refused(void)
    the Homebrew Menu, loaded into this same process. Every thread of ours has to be gone by
    then -- the crash reports of the next try were sphaira's (the menu), one of them a thread with
    our worker's stack size running code that was no longer mapped. The game thread ends itself
-   (switch_quit); the main thread, which pumps SDL's events, exits (so nothing reads HID
-   afterwards); the exit handlers join the VU and GS workers (graphics_shutdown) and the clock
-   keeper; the last one here ends the render thread (gs_native_halt) and SDL's audio thread.
+   (switch_quit) and the main thread, which pumps SDL's events, joins it and exits (so nothing
+   reads HID afterwards); the exit handlers join the VU and GS workers (graphics_shutdown) and the
+   clock keeper; the last one here ends and joins the texture pack's loaders, any job thread, the
+   render thread (gs_native_halt), the freeze watch and SDL's audio thread. Joined, not merely
+   ended: libnx has no pthread_detach, and a thread nobody joins keeps its kernel thread and its
+   stack's mapping into the menu's turn (finding 146).
    DHD_SWITCH_EXIT = kernel keeps the svcExitProcess ending, for comparing. */
 static volatile int quit_asked;
 
@@ -103,7 +106,11 @@ static void switch_exit_now(void)
     int gs_native_halt(unsigned ms);   /* port/gs/native_core.inc */
     void host_freeze_watch_stop(unsigned ms);   /* port/hle/host.c: a thread waking every second */
     void switch_profile_stop(const char *dir);   /* port/switch/profile.c */
+    void texpack_halt(unsigned ms);   /* port/gs/texpack.c: its loaders */
+    int host_jobs_join(unsigned ms);   /* port/host/host_sdl.c: host_thread_detach's jobs */
     switch_profile_stop(dir);
+    texpack_halt(1000);   /* before the render thread: a loader may be making a texture */
+    if (host_jobs_join(1000)) fprintf(stderr, "switch: a job thread is still running at the exit\n");
     int halted = gs_native_halt(1000);
     host_freeze_watch_stop(1500);
     SDL_QuitSubSystem(SDL_INIT_AUDIO);

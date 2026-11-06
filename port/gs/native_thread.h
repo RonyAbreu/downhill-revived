@@ -70,14 +70,33 @@ static inline void native_cond_broadcast(NativeCond *c) { SDL_BroadcastCondition
 static inline void native_cond_wait(NativeCond *c, NativeMutex *m) { SDL_WaitCondition(*c, *m); }
 
 /* The render thread, detached (it runs until the process ends). It raises its own priority
-   (native_thread) so a picture is not held up by the EE's threads. 1 when it started. */
+   (native_thread) so a picture is not held up by the EE's threads. 1 when it started.
+
+   On the Switch it is kept instead, and joined at the exit (native_thread_join): libnx has no
+   pthread_detach, so a detached thread's kernel object and stack mapping outlive it, and the
+   Homebrew Menu then runs in this same process with them still there (finding 146). */
+#ifdef __SWITCH__
+static SDL_Thread *native_thread_handle;
+#endif
 static inline int native_thread_start(SDL_ThreadFunction proc, void *argument)
 {
     SDL_Thread *thread = SDL_CreateThread(proc, "native", argument);
     if (!thread) return 0;
+#ifdef __SWITCH__
+    native_thread_handle = thread;
+#else
     SDL_DetachThread(thread);
+#endif
     return 1;
 }
+#ifdef __SWITCH__
+/* The render thread's end, once it has returned: its handle closed. */
+static inline void native_thread_join(void)
+{
+    if (native_thread_handle) SDL_WaitThread(native_thread_handle, NULL);
+    native_thread_handle = NULL;
+}
+#endif
 
 static inline void native_sleep_ns(uint64_t ns) { SDL_DelayNS(ns); }
 static inline void native_cpu_relax(void) { SDL_CPUPauseInstruction(); }

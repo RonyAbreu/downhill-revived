@@ -2801,7 +2801,10 @@ int gs_native_halt(unsigned ms)
     native_cond_broadcast(&n->queue_changed);
     native_mutex_unlock(&n->queue_lock);
     for (unsigned waited = 0; waited <= ms; waited++) {
-        if (__atomic_load_n(&n->ended, __ATOMIC_ACQUIRE)) return 1;
+        if (__atomic_load_n(&n->ended, __ATOMIC_ACQUIRE)) {
+            native_thread_join();   /* returned: its handle closed, so it leaves the thread list */
+            return 1;
+        }
         SDL_Delay(1);
     }
     return 0;

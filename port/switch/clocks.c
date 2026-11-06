@@ -60,9 +60,14 @@ static int clock_set(Clock *c, uint32_t hz)
 
 /* Docking, the HOME menu and sleep all put the clocks back, and there is no one event for the
    three, so they are simply written again every two seconds. */
+static void switch_thread_named(const char *name);
+
 static int keep_clocks(void *unused)
 {
     (void)unused;
+    /* named for the exit's census only: switch_thread_core would decide DHD_SWITCH_CORES here,
+       before switch_main.c has read it from dhd.ini */
+    switch_thread_named("clocks");
     while (!SDL_GetAtomicInt(&g_stop)) {
         for (int i = 0; i < 20 && !SDL_GetAtomicInt(&g_stop); i++) SDL_Delay(100);
         if (SDL_GetAtomicInt(&g_stop)) break;
@@ -168,16 +173,21 @@ static int core_list(int *cores, int max)
     return n;
 }
 
-/* Every named thread's kernel id, for the census at exit (switch_thread_census). */
-static struct { const char *name; u64 id; } named_threads[16];
+/* Every named thread's kernel id, for the census at exit (switch_thread_census). A ring: a movie
+   thread is named again at every movie, and the kernel's thread ids are never reused within a
+   boot, so the oldest entries are the ones that can go. */
+enum { NAMED_MAX = 64 };
+static struct { const char *name; u64 id; } named_threads[NAMED_MAX];
 static int named_count;
 
 static void switch_thread_named(const char *name)
 {
     u64 id;
     if (!name || R_FAILED(svcGetThreadId(&id, CUR_THREAD_HANDLE))) return;
-    int i = __atomic_fetch_add(&named_count, 1, __ATOMIC_ACQ_REL);
-    if (i < 16) { named_threads[i].name = name; named_threads[i].id = id; }
+    int i = __atomic_fetch_add(&named_count, 1, __ATOMIC_ACQ_REL) % NAMED_MAX;
+    named_threads[i].id = 0;
+    __atomic_store_n(&named_threads[i].name, name, __ATOMIC_RELEASE);
+    __atomic_store_n(&named_threads[i].id, id, __ATOMIC_RELEASE);
 }
 
 /* At the return to the loader (switch_main.c): which threads of this process are still there
@@ -213,8 +223,8 @@ int switch_thread_census(unsigned ms)
     for (s32 i = 0; i < count && i < 64 && at < (int)sizeof line - 32; i++) {
         if (ids[i] == self) continue;
         const char *name = NULL;
-        for (int k = 0; k < named_count && k < 16; k++)
-            if (named_threads[k].id == ids[i]) name = named_threads[k].name;
+        for (int k = 0; k < NAMED_MAX; k++)
+            if (__atomic_load_n(&named_threads[k].id, __ATOMIC_ACQUIRE) == ids[i]) name = named_threads[k].name;
         at += name ? snprintf(line + at, sizeof line - at, " %s", name)
                    : snprintf(line + at, sizeof line - at, " #%llu", (unsigned long long)ids[i]);
         left++;
