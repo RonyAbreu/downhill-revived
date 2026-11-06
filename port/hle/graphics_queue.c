@@ -58,11 +58,39 @@ static double spin_seconds = -1;  /* DHD_SPIN_US, read at the first long wait (i
    barriers also order each publication before the subsequent waiter check. */
 static uint32_t position(_Atomic uint32_t *p) { return atomic_load_explicit(p, memory_order_acquire); }
 
+#if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+static SDL_Semaphore *gs_available, *gs_retired;  /* gs_queue.inc's, named here for signal_flag */
+#endif
+
+/* Whether each event has been signalled since its sleeper last got ready to sleep (idle_wait
+   clears it then, before it announces the sleep and looks again). One per semaphore, each on
+   its own line: two semaphores sharing one would let a wake meant for one be skipped. */
+QUEUE_COUNTER(available_signalled);
+QUEUE_COUNTER(retired_signalled);
+QUEUE_COUNTER(gs_available_signalled);
+QUEUE_COUNTER(gs_retired_signalled);
+
+static _Atomic uint32_t *signal_flag(SDL_Semaphore *event)
+{
+    if (event == available) return &available_signalled;
+    if (event == retired) return &retired_signalled;
+#if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
+    if (event == gs_available) return &gs_available_signalled;
+#endif
+    return &gs_retired_signalled;
+}
+
 /* An auto-reset event: wakes the sleeper, or makes its next wait return at once. Set only while
-   it is clear, so a burst of packets leaves one wakeup, not one per packet. */
+   it is clear, so a burst of packets leaves one wakeup, not one per packet. The flag, not
+   SDL_GetSemaphoreValue, says whether it is clear: on the Switch a semaphore is newlib's, a mutex
+   and a condition variable, and reading its value takes that mutex, which the sleeper's own
+   sem_wait holds too. The VU and GS threads lost 5-7% of their time to that lock there (finding
+   144, NX3). A wake skipped because the flag was still set is never lost: the sleeper clears the
+   flag before it announces itself and looks at the position again, and the waker published the
+   position before it looked at the announcement. */
 static void wake(SDL_Semaphore *event)
 {
-    if (!SDL_GetSemaphoreValue(event)) SDL_SignalSemaphore(event);
+    if (!atomic_exchange(signal_flag(event), 1)) SDL_SignalSemaphore(event);
 }
 
 #include "graphics_timeline.h"
@@ -76,7 +104,21 @@ static void idle_wait(_Atomic uint32_t *p, uint32_t at, _Atomic uint32_t *flag, 
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
     int64_t spin_start = tl_begin();
 #endif
-    unsigned limit = budget ? (adaptive_waits ? *budget : 4096) : 512;
+    /* DHD_QUEUE_SPINS: the producer's spin before it sleeps (default 512, the Switch's 0). On the
+       Switch the game thread spent 7% of its samples here (finding 144, NX3), on three cores that
+       the VU and GS threads also want; sleeping at once measured 40.9 -> 45.0 fields/s in a race
+       and 41.6 -> 49.7 in the menus at scale 2. */
+    static int producer_spins = -1;
+    if (producer_spins < 0) {
+        const char *s = getenv("DHD_QUEUE_SPINS");
+#ifdef __SWITCH__
+        producer_spins = s && *s ? atoi(s) : 0;
+#else
+        producer_spins = s && *s ? atoi(s) : 512;
+#endif
+        if (producer_spins < 0) producer_spins = 0;
+    }
+    unsigned limit = budget ? (adaptive_waits ? *budget : 4096) : (unsigned)producer_spins;
     for (unsigned spin = 0; spin < limit; spin++) {
         if (position(p) != at) {
             if (budget && adaptive_waits) {
@@ -121,6 +163,7 @@ static void idle_wait(_Atomic uint32_t *p, uint32_t at, _Atomic uint32_t *flag, 
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
     tl_add(TL_EE_SPIN + 2 * tl_role, spin_start);
 #endif
+    atomic_exchange(signal_flag(event), 0);   /* before the announcement: see wake */
     atomic_fetch_add(flag, 1);
     if (position(p) == at) {
 #ifndef GRAPHICS_QUEUE_TEST

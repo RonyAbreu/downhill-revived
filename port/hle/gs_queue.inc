@@ -13,7 +13,7 @@ typedef struct {
 } GsPacket;
 static uint8_t *gs_ring;
 static SDL_Thread *gs_worker;
-static SDL_Semaphore *gs_available, *gs_retired;
+/* gs_available, gs_retired: declared in graphics_queue.c, before wake (signal_flag) */
 QUEUE_COUNTER(gs_written);
 QUEUE_COUNTER(gs_consumed);
 QUEUE_COUNTER(gs_stopping);
