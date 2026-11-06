@@ -130,6 +130,41 @@ int dhd_settings_save(const char *path, const char *key, const char *value)
     return rename(temp, path) == 0;
 }
 
+/* ---- keyboard and controller bindings (0.7.12, finding 157): the defaults only, for now ----
+   The bindings' rules (dhd.ini keyboard, pad1, pad2; an input another button had moves; no
+   player left without Cross, Triangle, START or a d-pad direction) live in the Rust crate's
+   controls.rs. Until they are written again in C, the Switch plays with the default layouts
+   (control_defaults, the game's own before rebinding), says so once for a value it can't use,
+   and REVIVED SETTINGS > Controls refuses a change with that reason. */
+#include "../hle/controls_table.h"
+
+void dhd_controls_layouts(const char *keyboard, const char *pad1, const char *pad2, DhdControlsLayout out[3],
+                          DhdSettingsUnknown problem)
+{
+    const char *values[3] = {keyboard, pad1, pad2};
+    for (int d = 0; d < CONTROL_DEVICES; d++) {
+        memcpy(&out[d], &control_defaults[d], sizeof out[d]);
+        if (problem && values[d] && *values[d]) problem(control_devices[d].key);
+    }
+}
+
+int dhd_controls_edit(const char *keyboard, const char *pad1, const char *pad2, int device, int edit, int target, int slot,
+                      int input, int kind, char *value, size_t value_size, char *message, size_t message_size)
+{
+    (void)keyboard; (void)pad1; (void)pad2; (void)device; (void)edit; (void)target; (void)slot; (void)input; (void)kind;
+    if (value_size) value[0] = 0;
+    if (message_size) snprintf(message, message_size, "Rebinding is not on the Switch yet");
+    return CONTROL_REFUSED;
+}
+
+/* The install id is only for the online hello, and online is off here. */
+int dhd_settings_install_id(const char *path, char *out, size_t size)
+{
+    (void)path;
+    if (size) out[0] = 0;
+    return 0;
+}
+
 /* ---- online and Discord: off on the Switch ---- */
 int dhd_disc_check(const char *iso, const char *cache, uint8_t digest[32], char *note, size_t size)
 {
